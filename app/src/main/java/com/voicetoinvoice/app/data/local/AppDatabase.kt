@@ -22,9 +22,10 @@ import kotlinx.coroutines.launch
         StockInRecord::class,
         UnmatchedQueueItem::class,
         SyncQueueItem::class,
-        SttJobRecord::class
+        SttJobRecord::class,
+        SupplierRecord::class
     ],
-    version = 8, // Bumped: Made unmatched_queue.shopId nullable in v8
+    version = 10, // Bumped: Added suppliers table and supplierId column to stock_in in v10
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -38,6 +39,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun unmatchedQueueDao(): UnmatchedQueueDao
     abstract fun syncQueueDao(): SyncQueueDao
     abstract fun sttJobDao(): SttJobDao
+    abstract fun supplierDao(): SupplierDao
 
     companion object {
         @Volatile
@@ -154,6 +156,39 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        // V9: Added lowStockThreshold REAL column to catalog_items
+        private val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("ALTER TABLE catalog_items ADD COLUMN lowStockThreshold REAL DEFAULT NULL")
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+
+        // V10: Added suppliers table and supplierId column to stock_in
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("""
+                        CREATE TABLE IF NOT EXISTS `suppliers` (
+                            `id` TEXT NOT NULL PRIMARY KEY,
+                            `shopId` TEXT NOT NULL,
+                            `name` TEXT NOT NULL,
+                            `phone` TEXT,
+                            `balanceOwed` REAL NOT NULL DEFAULT 0.0,
+                            `updatedAt` INTEGER NOT NULL,
+                            `synced` INTEGER NOT NULL DEFAULT 0
+                        )
+                    """.trimIndent())
+                    db.execSQL("ALTER TABLE stock_in ADD COLUMN supplierId TEXT")
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildDatabase(context).also { INSTANCE = it }
@@ -166,7 +201,7 @@ abstract class AppDatabase : RoomDatabase() {
                 AppDatabase::class.java,
                 "voice_to_invoice_db"
             )
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10)
             .fallbackToDestructiveMigration()
             .addCallback(object : Callback() {
                 override fun onCreate(db: SupportSQLiteDatabase) {

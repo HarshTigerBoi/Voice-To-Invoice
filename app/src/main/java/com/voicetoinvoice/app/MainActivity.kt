@@ -60,7 +60,7 @@ class MainActivity : ComponentActivity() {
 }
 
 enum class Screen {
-    ONBOARDING, HOME, CATALOG, UDHAAR, PRICE_UPDATE, STOCK_IN, SUMMARY, SETTINGS, DIAGNOSTIC_LOGS
+    ONBOARDING, HOME, CATALOG, UDHAAR, SUPPLIER, PRICE_UPDATE, STOCK_IN, SUMMARY, SETTINGS, DIAGNOSTIC_LOGS
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -70,6 +70,10 @@ fun MainAppScreen(database: AppDatabase) {
     var currentScreen by remember { mutableStateOf(Screen.HOME) }
 
     val catalogState by database.catalogDao().getActiveCatalog().collectAsState(initial = emptyList())
+    val stockLevelsState by database.catalogDao().getStockLevels().collectAsState(initial = emptyList())
+    val stockLevelsMap = remember(stockLevelsState) { stockLevelsState.associate { it.itemId to it.onHand } }
+
+    val suppliersState by database.supplierDao().getAllSuppliers().collectAsState(initial = emptyList())
 
     // Compute today's midnight timestamp so queries are scoped to today only
     val todayMidnight = remember {
@@ -83,12 +87,34 @@ fun MainAppScreen(database: AppDatabase) {
 
     val todayTransactionsState by database.transactionDao().getTodayTransactions(todayMidnight).collectAsState(initial = emptyList())
     val todayTotalState by database.transactionDao().getTodayTotalSales(todayMidnight).collectAsState(initial = 0.0)
+
+    var summaryRangeMode by remember { mutableStateOf(com.voicetoinvoice.app.ui.screens.summary.RangeMode.DAY) }
+    val summaryRangeBounds = remember(summaryRangeMode, todayMidnight) {
+        val cal = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            when (summaryRangeMode) {
+                com.voicetoinvoice.app.ui.screens.summary.RangeMode.WEEK -> add(Calendar.DAY_OF_YEAR, -7)
+                com.voicetoinvoice.app.ui.screens.summary.RangeMode.MONTH -> add(Calendar.DAY_OF_YEAR, -30)
+                com.voicetoinvoice.app.ui.screens.summary.RangeMode.DAY -> {}
+            }
+        }
+        cal.timeInMillis to (todayMidnight + 24 * 60 * 60 * 1000)
+    }
+    val rangeTransactionsState by remember(summaryRangeBounds) {
+        database.transactionDao().getTransactionsBetween(summaryRangeBounds.first, summaryRangeBounds.second)
+    }.collectAsState(initial = emptyList())
+    val itemCostState by database.stockInDao().getLatestCostPricePerItem().collectAsState(initial = emptyList())
+    val costPriceMap = remember(itemCostState) { itemCostState.associate { it.itemId to it.costPrice } }
+
     val creditsState by database.creditDao().getAllCredits().collectAsState(initial = emptyList())
     val unmatchedState by database.unmatchedQueueDao().getPendingItems().collectAsState(initial = emptyList())
     val sttJobsState by database.sttJobDao().getAllJobsTraceLogsFlow().collectAsState(initial = emptyList())
 
     val scope = rememberCoroutineScope()
-    val syncEngine = remember { SyncEngine(database.transactionDao(), database.stockInDao(), database.catalogDao(), database.creditDao(), database.sttJobDao()) }
+    val syncEngine = remember { SyncEngine(database.transactionDao(), database.stockInDao(), database.catalogDao(), database.creditDao(), database.sttJobDao(), database.supplierDao()) }
 
     fun sendWhatsAppReminder(credit: com.voicetoinvoice.app.data.local.entity.CreditRecord) {
         val message = "नमस्ते ${credit.customerName} जी, आपका ₹${credit.amount.toInt()} का बकाया (Udhaar) बाकी है। कृपया भुगतान करें। धन्यवाद!"
@@ -156,6 +182,7 @@ fun MainAppScreen(database: AppDatabase) {
                         todayTotalSales = todayTotalState ?: 0.0,
                         catalog = catalogState,
                         onNavigateToUdhaar = { currentScreen = Screen.UDHAAR },
+                        onNavigateToSuppliers = { currentScreen = Screen.SUPPLIER },
                         onNavigateToPriceUpdate = { currentScreen = Screen.PRICE_UPDATE },
                         onNavigateToLogs = { currentScreen = Screen.DIAGNOSTIC_LOGS },
                         onNavigateToSummary = { currentScreen = Screen.SUMMARY },
@@ -201,10 +228,16 @@ fun MainAppScreen(database: AppDatabase) {
                 Screen.CATALOG -> {
                     CatalogManagementScreen(
                         catalog = catalogState,
+                        stockLevels = stockLevelsMap,
                         onAddItem = { name, unitId, price ->
                             scope.launch {
                                 database.catalogDao().insertOrUpdate(CatalogItem(name = name, unitId = unitId, price = price))
                                 syncEngine.syncAllUnsynced()
+                            }
+                        },
+                        onSetThreshold = { item, threshold ->
+                            scope.launch {
+                                database.catalogDao().updateLowStockThreshold(item.id, threshold)
                             }
                         },
                         onNavigateBack = { currentScreen = Screen.HOME }
@@ -231,6 +264,24 @@ fun MainAppScreen(database: AppDatabase) {
                         onNavigateBack = { currentScreen = Screen.HOME }
                     )
                 }
+                Screen.SUPPLIER -> {
+                    com.voicetoinvoice.app.ui.screens.supplier.SupplierScreen(
+                        suppliers = suppliersState,
+                        onAddSupplier = { name, phone ->
+                            scope.launch {
+                                database.supplierDao().insertOrUpdate(com.voicetoinvoice.app.data.local.entity.SupplierRecord(name = name, phone = phone))
+                                syncEngine.syncAllUnsynced()
+                            }
+                        },
+                        onSettleBalance = { supplier ->
+                            scope.launch {
+                                database.supplierDao().settleBalance(supplier.id)
+                                syncEngine.syncAllUnsynced()
+                            }
+                        },
+                        onNavigateBack = { currentScreen = Screen.HOME }
+                    )
+                }
                 Screen.PRICE_UPDATE -> {
                     PriceUpdateScreen(
                         catalog = catalogState,
@@ -246,9 +297,22 @@ fun MainAppScreen(database: AppDatabase) {
                 Screen.STOCK_IN -> {
                     StockInScreen(
                         catalog = catalogState,
-                        onAddStockIn = { item, qty, cost, supplier ->
+                        suppliers = suppliersState,
+                        onAddStockIn = { item, qty, cost, supplier, supplierId ->
                             scope.launch {
-                                database.stockInDao().insert(com.voicetoinvoice.app.data.local.entity.StockInRecord(itemId = item.id, itemName = item.name, quantity = qty, costPrice = cost, supplier = supplier))
+                                database.stockInDao().insert(
+                                    com.voicetoinvoice.app.data.local.entity.StockInRecord(
+                                        itemId = item.id,
+                                        itemName = item.name,
+                                        quantity = qty,
+                                        costPrice = cost,
+                                        supplier = supplier,
+                                        supplierId = supplierId
+                                    )
+                                )
+                                if (supplierId != null) {
+                                    database.supplierDao().addToBalance(supplierId, cost)
+                                }
                                 syncEngine.syncAllUnsynced()
                             }
                         },
@@ -257,7 +321,10 @@ fun MainAppScreen(database: AppDatabase) {
                 }
                 Screen.SUMMARY -> {
                     DailySummaryScreen(
-                        todayTransactions = todayTransactionsState,
+                        rangeTransactions = rangeTransactionsState,
+                        rangeMode = summaryRangeMode,
+                        onRangeModeChange = { summaryRangeMode = it },
+                        costPriceByItemId = costPriceMap,
                         onUpdateTxPrice = { tx, newUnitPrice ->
                             scope.launch {
                                 val newTotal = newUnitPrice * tx.quantity

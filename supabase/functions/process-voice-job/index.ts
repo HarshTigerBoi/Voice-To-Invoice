@@ -105,22 +105,31 @@ function combinatorialFuzzySegmenter(
   for (const token of tokens) {
     const lowerT = token.toLowerCase()
 
-    // 1. Direct single-token fuzzy check against Numbers, Units, Catalog
+    // 1. Direct single-token check against Numbers, Units, Catalog — cost-based,
+    // not first-match-wins. Checking numbers unconditionally first used to mean
+    // a token like "लो" (STT clipping the leading "कि" off "किलो" in fast speech,
+    // e.g. "एक किलो" -> "एकलो" -> heard as "एक लो") got corrected to the number
+    // "दो" (edit distance 1) before ever being compared against unit words —
+    // even though "लो" is exactly the trailing remnant of "किलो" (an elision,
+    // not a typo). Scoring every candidate and taking the cheapest lets an
+    // elided-unit reading (cost 0.5) beat a technically-closer-by-raw-distance
+    // number misread (cost 1). See ISSUE-019 in Docs/audit.md.
     const numMatch = fuzzyMatchVocab(lowerT, CANONICAL_NUMBERS, 1)
-    if (numMatch) {
-      resolvedTokens.push(numMatch.canonical)
-      continue
-    }
-
     const unitMatch = fuzzyMatchVocab(lowerT, CANONICAL_UNITS, 1)
-    if (unitMatch) {
-      resolvedTokens.push(unitMatch.canonical)
-      continue
-    }
-
+    const unitElision = lowerT.length >= 2
+      ? CANONICAL_UNITS.find(u => u.length > lowerT.length && u.endsWith(lowerT))
+      : undefined
     const catMatch = fuzzyMatchVocab(lowerT, catalogVocab, 1)
-    if (catMatch) {
-      resolvedTokens.push(catMatch.canonical)
+
+    const singleTokenCandidates: { canonical: string, cost: number }[] = []
+    if (numMatch) singleTokenCandidates.push({ canonical: numMatch.canonical, cost: numMatch.dist })
+    if (unitElision) singleTokenCandidates.push({ canonical: unitElision, cost: 0.5 })
+    if (unitMatch) singleTokenCandidates.push({ canonical: unitMatch.canonical, cost: unitMatch.dist })
+    if (catMatch) singleTokenCandidates.push({ canonical: catMatch.canonical, cost: catMatch.dist })
+
+    if (singleTokenCandidates.length > 0) {
+      const best = singleTokenCandidates.reduce((a, b) => (b.cost < a.cost ? b : a))
+      resolvedTokens.push(best.canonical)
       continue
     }
 
@@ -532,37 +541,44 @@ async function processVoiceJob(args: {
         let currentQty = 1.0
         let currentUnit = "PACKET"
         let currentItemTokens: string[] = []
+        // Mirrors OrderingSegmenter.kt's ambiguousDoubleQty tracking: the Kotlin
+        // client already flags "two quantities in a row with no item between
+        // them" instead of silently overwriting the first one; this was the
+        // one client/server behavior gap, so port it here too (ISSUE-019).
+        let hasPendingQty = false
+        let ambiguousDoubleQty = false
+
+        const flushSegment = () => {
+          if (currentItemTokens.length > 0) {
+            const rawName = currentItemTokens.join(" ").trim()
+            step3Segments.push({
+              rawSegmentText: `${currentQty} ${currentUnit} ${rawName}`,
+              quantity: currentQty,
+              unit: currentUnit,
+              itemTokens: [rawName],
+              isSanityFlagged: ambiguousDoubleQty
+            })
+          }
+          currentItemTokens = []
+          currentUnit = "PACKET"
+          hasPendingQty = false
+          ambiguousDoubleQty = false
+        }
 
         for (let i = 0; i < tokens.length; i++) {
           const token = tokens[i].toLowerCase()
-          if (numberMap[token] !== undefined) {
+          const numericVal = numberMap[token] !== undefined
+            ? numberMap[token]
+            : (/^\d+(\.\d+)?$/.test(token) ? parseFloat(token) : null)
+
+          if (numericVal !== null) {
             if (currentItemTokens.length > 0) {
-              const rawName = currentItemTokens.join(" ").trim()
-              step3Segments.push({
-                rawSegmentText: `${currentQty} ${currentUnit} ${rawName}`,
-                quantity: currentQty,
-                unit: currentUnit,
-                itemTokens: [rawName],
-                isSanityFlagged: false
-              })
-              currentItemTokens = []
-              currentUnit = "PACKET"
+              flushSegment()
+            } else if (hasPendingQty) {
+              ambiguousDoubleQty = true
             }
-            currentQty = numberMap[token]
-          } else if (/\d+/.test(token)) {
-            if (currentItemTokens.length > 0) {
-              const rawName = currentItemTokens.join(" ").trim()
-              step3Segments.push({
-                rawSegmentText: `${currentQty} ${currentUnit} ${rawName}`,
-                quantity: currentQty,
-                unit: currentUnit,
-                itemTokens: [rawName],
-                isSanityFlagged: false
-              })
-              currentItemTokens = []
-              currentUnit = "PACKET"
-            }
-            currentQty = parseFloat(token) || 1.0
+            currentQty = numericVal
+            hasPendingQty = true
           } else if (["किलो", "kg", "kilo"].includes(token)) {
             currentUnit = "KG"
           } else if (["ग्राम", "gm", "g"].includes(token)) {
@@ -576,16 +592,7 @@ async function processVoiceJob(args: {
           }
         }
 
-        if (currentItemTokens.length > 0) {
-          const rawName = currentItemTokens.join(" ").trim()
-          step3Segments.push({
-            rawSegmentText: `${currentQty} ${currentUnit} ${rawName}`,
-            quantity: currentQty,
-            unit: currentUnit,
-            itemTokens: [rawName],
-            isSanityFlagged: false
-          })
-        }
+        flushSegment()
         console.log(`Step 3 Segmenter extracted ${step3Segments.length} segments from transcript: "${transcript}"`)
       }
     } catch (segErr) {
@@ -711,7 +718,20 @@ Output ONLY valid JSON formatted as:
       parsedRawItems = step3Segments.map(seg => {
         const rawN = seg.itemTokens.join(" ").trim()
         const normN = nameMap[rawN] || (rawN.charAt(0).toUpperCase() + rawN.slice(1))
-        return { item_name: normN, quantity: seg.quantity, unit: seg.unit, price: 0.0, confidence: 0.85, matched_catalog: true }
+        // This path only runs when Grok's own multi-item interpretation was
+        // unavailable, so there's no AI double-check behind it — never
+        // self-report a confidence here. Leave it unset so the catalog-match
+        // step below (which knows whether this item is actually recognized)
+        // computes the real number, and cap it hard if the segmenter itself
+        // already flagged this as an ambiguous double-quantity read.
+        return {
+          item_name: normN,
+          quantity: seg.quantity,
+          unit: seg.unit,
+          price: 0.0,
+          confidence: seg.isSanityFlagged ? 0.3 : undefined,
+          matched_catalog: false
+        }
       })
     }
 
@@ -729,7 +749,14 @@ Output ONLY valid JSON formatted as:
       const priceAtSale = matched ? matched.price : (rawItem.price || 0.0)
       const total = qty * priceAtSale
       const isCatalogMatched = matched !== undefined
-      const confidence = rawItem.confidence || (isCatalogMatched ? 0.95 : 0.60)
+      // Never let a self-reported confidence exceed the documented floor for
+      // unmatched items (see Docs/audit.md §1) — otherwise the LLM reporting
+      // high confidence for an item it just told us isn't in the catalog
+      // (a real observed case: "Chaandi" at 0.85 with matched_catalog:false)
+      // silently defeats the review-queue safety net.
+      const confidence = isCatalogMatched
+        ? (rawItem.confidence || 0.95)
+        : Math.min(rawItem.confidence || 0.60, 0.60)
 
       return {
         item_name: matched ? matched.name : rawName,

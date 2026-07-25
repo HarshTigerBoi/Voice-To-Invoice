@@ -1,5 +1,7 @@
 package com.voicetoinvoice.app.domain.parser
 
+import kotlin.math.min
+
 data class RawItemSegment(
     val quantity: Double,
     val unit: String?,
@@ -12,6 +14,230 @@ data class SegmentResult(
     val segments: List<RawItemSegment>,
     val carryoverQty: Double? = null
 )
+
+private enum class TokenType { NUM, UNIT, ITEM }
+
+private data class Candidate(
+    val type: TokenType,
+    val cost: Double,
+    val numericValue: Double? = null,
+    val canonicalUnit: String? = null
+)
+
+private data class DecodedToken(
+    val type: TokenType,
+    val rawToken: String,
+    val numericValue: Double? = null,
+    val canonicalUnit: String? = null
+)
+
+/**
+ * Grammar-aware lattice decoder for shopkeeper voice orders.
+ *
+ * A shopkeeper utterance almost always follows [QUANTITY] [UNIT] [ITEM], repeated.
+ * STT commonly clips the leading syllable of a unit word in fast connected speech
+ * (e.g. "एक किलो" -> "एकलो" -> STT hears "एक लो"), and a naive per-token classifier
+ * will match the orphaned fragment "लो" against the nearest NUMBER word ("दो", edit
+ * distance 1) purely because that's textually closer than the full unit word "किलो"
+ * (edit distance 2+). That greedy choice discards the real quantity and invents a
+ * second one.
+ *
+ * Instead of classifying each token in isolation, this decoder scores every
+ * plausible (NUM/UNIT/ITEM) reading of every token and runs a Viterbi decode over
+ * the whole sequence using the shopkeeper grammar as a transition prior — so a
+ * cheap "elided unit" reading of an ambiguous token can beat a technically-closer
+ * but grammatically nonsensical "second number in a row" reading.
+ */
+private object GrammarLatticeDecoder {
+
+    // Emission costs: lower = more confident. Exact matches always win; these
+    // constants only apply to tokens that DON'T exactly match anything, so a
+    // clean, unambiguous transcript decodes identically to plain lookup.
+    private const val EXACT_COST = 0.0
+    private const val ELISION_COST = 0.5 // token is the trailing remnant of a canonical unit word
+    private const val FUZZY_COST = 1.0   // token is 1 edit away from a canonical number/unit word
+    private const val ITEM_BASELINE_COST = 1.2
+
+    // Transition costs encode the [NUM][UNIT][ITEM] grammar. NUM->NUM is
+    // heavily penalized: shopkeepers essentially never say two bare numbers
+    // back-to-back for a single item, so when it's the only path left it's
+    // both correct to pick, cheap enough for closing a genuinely double-quantity
+    // utterance, and expensive enough to lose to a plausible unit/item reading.
+    private fun transitionCost(prev: TokenType?, curr: TokenType): Double {
+        if (prev == null) {
+            return when (curr) {
+                TokenType.NUM -> 0.0
+                TokenType.ITEM -> 0.3
+                TokenType.UNIT -> 1.0
+            }
+        }
+        return when (prev) {
+            TokenType.NUM -> when (curr) {
+                TokenType.UNIT -> 0.0
+                TokenType.ITEM -> 0.3
+                TokenType.NUM -> 4.0
+            }
+            TokenType.UNIT -> when (curr) {
+                TokenType.ITEM -> 0.0
+                TokenType.NUM -> 2.0
+                TokenType.UNIT -> 3.0
+            }
+            TokenType.ITEM -> when (curr) {
+                TokenType.NUM -> 0.0
+                TokenType.UNIT -> 1.5
+                TokenType.ITEM -> 0.2
+            }
+        }
+    }
+
+    private fun editDistance(a: String, b: String): Int {
+        val dp = Array(a.length + 1) { IntArray(b.length + 1) }
+        for (i in 0..a.length) dp[i][0] = i
+        for (j in 0..b.length) dp[0][j] = j
+        for (i in 1..a.length) {
+            for (j in 1..b.length) {
+                dp[i][j] = if (a[i - 1] == b[j - 1]) {
+                    dp[i - 1][j - 1]
+                } else {
+                    1 + minOf(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+                }
+            }
+        }
+        return dp[a.length][b.length]
+    }
+
+    private fun numCandidate(token: String): Candidate? {
+        OrderingSegmenter.HINDI_NUMBER_MAP[token]?.let {
+            return Candidate(TokenType.NUM, EXACT_COST, numericValue = it)
+        }
+        token.toDoubleOrNull()?.let {
+            return Candidate(TokenType.NUM, EXACT_COST, numericValue = it)
+        }
+        if (token.length < 2) return null
+        var bestDist = Int.MAX_VALUE
+        var bestValue: Double? = null
+        for ((word, value) in OrderingSegmenter.HINDI_NUMBER_MAP) {
+            if (word.length < 2) continue
+            val dist = editDistance(token, word)
+            if (dist < bestDist) {
+                bestDist = dist
+                bestValue = value
+            }
+        }
+        return if (bestDist == 1 && bestValue != null) {
+            Candidate(TokenType.NUM, FUZZY_COST, numericValue = bestValue)
+        } else null
+    }
+
+    private fun unitCandidate(token: String): Candidate? {
+        if (OrderingSegmenter.UNIT_SET.contains(token)) {
+            return Candidate(TokenType.UNIT, EXACT_COST, canonicalUnit = token)
+        }
+        if (token.length >= 2) {
+            // Elision: STT dropped the leading syllable(s) of the unit word
+            // (e.g. "किलो" -> "लो", "पैकेट" -> "केट").
+            val elided = OrderingSegmenter.UNIT_SET.firstOrNull { it.length > token.length && it.endsWith(token) }
+            if (elided != null) {
+                return Candidate(TokenType.UNIT, ELISION_COST, canonicalUnit = elided)
+            }
+            var bestDist = Int.MAX_VALUE
+            var bestUnit: String? = null
+            for (unit in OrderingSegmenter.UNIT_SET) {
+                val dist = editDistance(token, unit)
+                if (dist < bestDist) {
+                    bestDist = dist
+                    bestUnit = unit
+                }
+            }
+            if (bestDist == 1 && bestUnit != null) {
+                return Candidate(TokenType.UNIT, FUZZY_COST, canonicalUnit = bestUnit)
+            }
+        }
+        return null
+    }
+
+    /** Decodes the full token sequence via Viterbi, returning the winning type
+     *  for each token plus the ambiguity gap at the single tightest decision
+     *  point (small gap = a genuinely close call the caller should flag). */
+    fun decode(tokens: List<String>): Pair<List<DecodedToken>, Double> {
+        if (tokens.isEmpty()) return emptyList<DecodedToken>() to Double.MAX_VALUE
+
+        val candidatesPerToken = tokens.map { raw ->
+            val lower = raw.lowercase()
+            val candidates = mutableListOf<Candidate>()
+            numCandidate(lower)?.let { candidates.add(it) }
+            unitCandidate(lower)?.let { candidates.add(it) }
+            // An exact vocabulary match is unambiguous by definition — don't offer
+            // an ITEM escape hatch that would let the decoder "cheat" a cheaper
+            // global path by relabeling a literal number/unit word as a fake item
+            // name just to dodge a transition penalty (e.g. avoiding UNIT->NUM by
+            // pretending "किलो" is the item being purchased).
+            val hasExactMatch = candidates.any { it.cost == EXACT_COST }
+            if (!hasExactMatch) {
+                candidates.add(Candidate(TokenType.ITEM, ITEM_BASELINE_COST))
+            }
+            candidates
+        }
+
+        // dp[i][type] = cheapest total cost of a path ending in `type` at token i
+        val dp = Array(tokens.size) { mutableMapOf<TokenType, Double>() }
+        val backPointer = Array(tokens.size) { mutableMapOf<TokenType, TokenType?>() }
+        var minGap = Double.MAX_VALUE
+
+        for (i in tokens.indices) {
+            val costsHere = mutableMapOf<TokenType, Double>()
+            for (cand in candidatesPerToken[i]) {
+                var best = Double.MAX_VALUE
+                var bestPrev: TokenType? = null
+                if (i == 0) {
+                    best = cand.cost + transitionCost(null, cand.type)
+                    bestPrev = null
+                } else {
+                    for ((prevType, prevCost) in dp[i - 1]) {
+                        val total = prevCost + transitionCost(prevType, cand.type) + cand.cost
+                        if (total < best) {
+                            best = total
+                            bestPrev = prevType
+                        }
+                    }
+                }
+                // Keep the cheapest way to reach this (token, type) combination.
+                val existing = costsHere[cand.type]
+                if (existing == null || best < existing) {
+                    costsHere[cand.type] = best
+                    backPointer[i][cand.type] = bestPrev
+                }
+            }
+            dp[i] = costsHere
+
+            val sorted = costsHere.values.sorted()
+            if (sorted.size >= 2) {
+                minGap = min(minGap, sorted[1] - sorted[0])
+            }
+        }
+
+        // Backtrack from the cheapest final state.
+        val lastCosts = dp[tokens.size - 1]
+        var currentType = lastCosts.entries.minByOrNull { it.value }?.key ?: TokenType.ITEM
+        val typeSequence = arrayOfNulls<TokenType>(tokens.size)
+        for (i in tokens.indices.reversed()) {
+            typeSequence[i] = currentType
+            currentType = backPointer[i][currentType] ?: TokenType.ITEM
+        }
+
+        val decoded = tokens.indices.map { i ->
+            val type = typeSequence[i]!!
+            val chosen = candidatesPerToken[i].firstOrNull { it.type == type }
+            DecodedToken(
+                type = type,
+                rawToken = tokens[i],
+                numericValue = chosen?.numericValue,
+                canonicalUnit = chosen?.canonicalUnit
+            )
+        }
+        return decoded to minGap
+    }
+}
 
 class OrderingSegmenter {
 
@@ -62,6 +288,12 @@ class OrderingSegmenter {
             "piece", "pieces", "pcs", "नग",
             "dozen", "dozens", "दर्जन"
         )
+
+        // Ambiguity gap below this threshold means the lattice decoder had a
+        // genuinely close call somewhere in the utterance (e.g. a token almost
+        // equally plausible as a unit or a number) — worth surfacing as a
+        // sanity flag even when a structural double-quantity wasn't detected.
+        private const val LOW_CONFIDENCE_GAP_THRESHOLD = 0.15
     }
 
     fun segmentTranscript(transcript: String, pendingCarryoverQty: Double? = null): SegmentResult {
@@ -75,12 +307,17 @@ class OrderingSegmenter {
         }
 
         val tokens = cleanText.split(Regex("\\s+")).filter { it.isNotBlank() }
+        val lowerTokens = tokens.map { it.lowercase() }
+        val (decoded, ambiguityGap) = GrammarLatticeDecoder.decode(lowerTokens)
+        // Recover original casing/text for item tokens & rawSegmentText while
+        // keeping the decoder's type/number/unit decisions.
+        val decodedWithOriginalText = decoded.mapIndexed { i, dt -> dt.copy(rawToken = tokens[i]) }
+
         var currentQty: Double? = pendingCarryoverQty
         var currentUnit: String? = null
         var currentItemTokens = mutableListOf<String>()
         var currentSegmentTokens = mutableListOf<String>()
-        var collectingItemName = false
-        var ambiguousDoubleQty = false
+        var ambiguousDoubleQty = ambiguityGap < LOW_CONFIDENCE_GAP_THRESHOLD
         val segments = mutableListOf<RawItemSegment>()
 
         fun closeSegment() {
@@ -103,29 +340,24 @@ class OrderingSegmenter {
             ambiguousDoubleQty = false
         }
 
-        for (token in tokens) {
-            val lower = token.lowercase()
-            val parsedNum = parseQuantityValue(lower)
-
-            when {
-                parsedNum != null -> {
-                    if (collectingItemName) {
+        for (dt in decodedWithOriginalText) {
+            when (dt.type) {
+                TokenType.NUM -> {
+                    if (currentItemTokens.isNotEmpty()) {
                         closeSegment() // Trailing quantity -> belongs to NEXT item
                     } else if (currentQty != null) {
                         ambiguousDoubleQty = true // Two quantities in a row without item -> flag ambiguity
                     }
-                    currentQty = parsedNum
-                    currentSegmentTokens.add(token)
-                    collectingItemName = false
+                    currentQty = dt.numericValue ?: 1.0
+                    currentSegmentTokens.add(dt.rawToken)
                 }
-                isUnitWord(lower) -> {
-                    currentUnit = normalizeUnit(lower)
-                    currentSegmentTokens.add(token)
+                TokenType.UNIT -> {
+                    currentUnit = normalizeUnit(dt.canonicalUnit ?: dt.rawToken)
+                    currentSegmentTokens.add(dt.rawToken)
                 }
-                else -> {
-                    currentItemTokens.add(token)
-                    currentSegmentTokens.add(token)
-                    collectingItemName = true
+                TokenType.ITEM -> {
+                    currentItemTokens.add(dt.rawToken)
+                    currentSegmentTokens.add(dt.rawToken)
                 }
             }
         }
@@ -136,20 +368,6 @@ class OrderingSegmenter {
         }
 
         return SegmentResult(segments, carryover)
-    }
-
-    private fun isQuantityWord(token: String): Boolean {
-        return HINDI_NUMBER_MAP.containsKey(token.lowercase()) || token.toDoubleOrNull() != null
-    }
-
-    private fun parseQuantityValue(token: String): Double? {
-        val lower = token.lowercase()
-        return token.toDoubleOrNull() ?: HINDI_NUMBER_MAP[lower]
-    }
-
-    private fun isUnitWord(token: String): Boolean {
-        val lower = token.lowercase()
-        return UNIT_SET.contains(lower)
     }
 
     private fun normalizeUnit(unitStr: String): String {

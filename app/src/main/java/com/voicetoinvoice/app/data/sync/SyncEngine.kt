@@ -5,6 +5,7 @@ import com.voicetoinvoice.app.data.local.dao.*
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
 import com.voicetoinvoice.app.data.local.entity.CreditRecord
 import com.voicetoinvoice.app.data.local.entity.StockInRecord
+import com.voicetoinvoice.app.data.local.entity.SupplierRecord
 import com.voicetoinvoice.app.network.CloudSyncManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -15,6 +16,7 @@ class SyncEngine(
     private val catalogDao: CatalogDao,
     private val creditDao: CreditDao,
     private val sttJobDao: SttJobDao,
+    private val supplierDao: SupplierDao,
     private val cloudSyncManager: CloudSyncManager = CloudSyncManager()
 ) {
 
@@ -32,6 +34,7 @@ class SyncEngine(
             count += syncUnsyncedJobTraces()
             count += syncUnsyncedCatalog()
             count += syncUnsyncedCredits()
+            count += syncUnsyncedSuppliers()
             count += syncUnsyncedStockIn()
         } catch (e: Exception) {
             Log.w(TAG, "Error during full sync sweep: ${e.message}")
@@ -107,6 +110,23 @@ class SyncEngine(
         syncedIds.size
     }
 
+    suspend fun syncUnsyncedSuppliers(): Int = withContext(Dispatchers.IO) {
+        val unsynced = supplierDao.getUnsyncedSuppliers()
+        if (unsynced.isEmpty()) return@withContext 0
+
+        val syncedIds = mutableListOf<String>()
+        for (supplier in unsynced) {
+            val success = cloudSyncManager.syncSupplierToCloud(supplier)
+            if (success) syncedIds.add(supplier.id)
+        }
+
+        if (syncedIds.isNotEmpty()) {
+            supplierDao.markSynced(syncedIds)
+            Log.i(TAG, "Synced ${syncedIds.size}/${unsynced.size} suppliers to Supabase")
+        }
+        syncedIds.size
+    }
+
     suspend fun syncUnsyncedStockIn(): Int = withContext(Dispatchers.IO) {
         val unsynced = stockInDao.getUnsyncedStockIn()
         if (unsynced.isEmpty()) return@withContext 0
@@ -124,4 +144,3 @@ class SyncEngine(
         syncedIds.size
     }
 }
-

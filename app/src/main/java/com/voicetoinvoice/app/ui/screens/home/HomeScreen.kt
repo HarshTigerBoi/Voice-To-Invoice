@@ -64,6 +64,7 @@ fun HomeScreen(
     catalog: List<CatalogItem>,
     voiceParser: VoiceParser = remember { VoiceParser() },
     onNavigateToUdhaar: () -> Unit,
+    onNavigateToSuppliers: () -> Unit = {},
     onNavigateToPriceUpdate: () -> Unit,
     onNavigateToLogs: () -> Unit = {},
     onNavigateToSummary: () -> Unit = {},
@@ -160,6 +161,11 @@ fun HomeScreen(
                         Icon(Icons.Default.Person, contentDescription = null)
                         Spacer(Modifier.width(4.dp))
                         Text("Udhaar")
+                    }
+                    OutlinedButton(onClick = onNavigateToSuppliers) {
+                        Icon(Icons.Default.Person, contentDescription = null)
+                        Spacer(Modifier.width(4.dp))
+                        Text("Suppliers")
                     }
                     OutlinedButton(onClick = onNavigateToPriceUpdate) {
                         Icon(Icons.Default.Edit, contentDescription = null)
@@ -407,7 +413,7 @@ fun HomeScreen(
                     )
                     db.transactionDao().insert(txRecord)
 
-                    val syncEngine = com.voicetoinvoice.app.data.sync.SyncEngine(db.transactionDao(), db.stockInDao(), db.catalogDao(), db.creditDao(), db.sttJobDao())
+                    val syncEngine = com.voicetoinvoice.app.data.sync.SyncEngine(db.transactionDao(), db.stockInDao(), db.catalogDao(), db.creditDao(), db.sttJobDao(), db.supplierDao())
                     syncEngine.syncAllUnsynced()
                 }
             },
@@ -420,7 +426,7 @@ fun HomeScreen(
                     )
                     db.sttJobDao().updateJob(discardedJob)
 
-                    val syncEngine = com.voicetoinvoice.app.data.sync.SyncEngine(db.transactionDao(), db.stockInDao(), db.catalogDao(), db.creditDao(), db.sttJobDao())
+                    val syncEngine = com.voicetoinvoice.app.data.sync.SyncEngine(db.transactionDao(), db.stockInDao(), db.catalogDao(), db.creditDao(), db.sttJobDao(), db.supplierDao())
                     syncEngine.syncAllUnsynced()
                 }
             },

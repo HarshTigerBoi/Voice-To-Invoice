@@ -15,5 +15,6 @@ data class StockInRecord(
     val costPrice: Double,
     val supplier: String? = null,
     val timestamp: Long = System.currentTimeMillis(),
-    val synced: Boolean = false
+    val synced: Boolean = false,
+    val supplierId: String? = null
 )

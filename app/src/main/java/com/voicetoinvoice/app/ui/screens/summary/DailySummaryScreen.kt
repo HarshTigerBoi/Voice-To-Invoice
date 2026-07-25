@@ -4,12 +4,10 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.PlayArrow
@@ -21,7 +19,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.voicetoinvoice.app.data.local.entity.PaymentMode
 import com.voicetoinvoice.app.data.local.entity.TransactionRecord
 import com.voicetoinvoice.app.utils.AudioFileManager
@@ -29,10 +26,15 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 
+enum class RangeMode { DAY, WEEK, MONTH }
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DailySummaryScreen(
-    todayTransactions: List<TransactionRecord>,
+    rangeTransactions: List<TransactionRecord>,
+    rangeMode: RangeMode,
+    onRangeModeChange: (RangeMode) -> Unit,
+    costPriceByItemId: Map<String, Double> = emptyMap(),
     onUpdateTxPrice: (TransactionRecord, Double) -> Unit = { _, _ -> },
     onNavigateBack: () -> Unit
 ) {
@@ -46,12 +48,17 @@ fun DailySummaryScreen(
         }
     }
 
-    val totalRevenue = todayTransactions.sumOf { it.total }
-    val cashTotal = todayTransactions.filter { it.paymentMode == PaymentMode.CASH }.sumOf { it.total }
-    val upiTotal = todayTransactions.filter { it.paymentMode == PaymentMode.UPI }.sumOf { it.total }
-    val creditTotal = todayTransactions.filter { it.paymentMode == PaymentMode.CREDIT }.sumOf { it.total }
+    val totalRevenue = rangeTransactions.sumOf { it.total }
+    val cashTotal = rangeTransactions.filter { it.paymentMode == PaymentMode.CASH }.sumOf { it.total }
+    val upiTotal = rangeTransactions.filter { it.paymentMode == PaymentMode.UPI }.sumOf { it.total }
+    val creditTotal = rangeTransactions.filter { it.paymentMode == PaymentMode.CREDIT }.sumOf { it.total }
 
-    val pendingPriceItems = todayTransactions.filter { it.total == 0.0 || it.priceAtSale == 0.0 }
+    val totalMargin = rangeTransactions.sumOf { tx ->
+        val cost = costPriceByItemId[tx.itemId] ?: 0.0
+        tx.total - (cost * tx.quantity)
+    }
+
+    val pendingPriceItems = rangeTransactions.filter { it.total == 0.0 || it.priceAtSale == 0.0 }
     var showExportSafeguardDialog by remember { mutableStateOf(false) }
 
     // Dialog for setting pending price
@@ -64,7 +71,7 @@ fun DailySummaryScreen(
         val sb = StringBuilder()
         sb.append("Time\tSpoken Voice / Transcript\tItem Name\tQuantity\tPrice at Sale\tTotal (₹)\tPayment Mode\n")
 
-        for (tx in todayTransactions) {
+        for (tx in rangeTransactions) {
             val timeStr = timeFormat.format(Date(tx.timestamp))
             val priceStr = if (tx.total == 0.0) "₹0* (PENDING)" else "₹${tx.total}"
             val transcriptStr = if (tx.rawTranscript.isNotBlank()) tx.rawTranscript else tx.itemName
@@ -75,9 +82,10 @@ fun DailySummaryScreen(
         sb.append("Cash Total:\t\t\t\t\t₹${cashTotal.toInt()}\t\n")
         sb.append("UPI Total:\t\t\t\t\t₹${upiTotal.toInt()}\t\n")
         sb.append("Udhaar Total:\t\t\t\t\t₹${creditTotal.toInt()}\t\n")
+        sb.append("Est. Margin:\t\t\t\t\t₹${totalMargin.toInt()}\t\n")
 
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val clip = ClipData.newPlainText("Daily Sales Ledger Table", sb.toString())
+        val clip = ClipData.newPlainText("Sales Ledger Table", sb.toString())
         clipboard.setPrimaryClip(clip)
 
         Toast.makeText(context, "Sales table with Spoken Transcripts copied!", Toast.LENGTH_LONG).show()
@@ -94,7 +102,7 @@ fun DailySummaryScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Daily Summary & Ledger") },
+                title = { Text("Sales Summary & Ledger") },
                 navigationIcon = { TextButton(onClick = onNavigateBack) { Text("Back") } },
                 actions = {
                     IconButton(onClick = { handleExportRequest() }) {
@@ -110,6 +118,33 @@ fun DailySummaryScreen(
                 .padding(padding)
                 .padding(16.dp)
         ) {
+            // Range Selector Toggle Chips (Day / Week / Month)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = rangeMode == RangeMode.DAY,
+                    onClick = { onRangeModeChange(RangeMode.DAY) },
+                    label = { Text("Today") },
+                    modifier = Modifier.weight(1f)
+                )
+                FilterChip(
+                    selected = rangeMode == RangeMode.WEEK,
+                    onClick = { onRangeModeChange(RangeMode.WEEK) },
+                    label = { Text("7 Days") },
+                    modifier = Modifier.weight(1f)
+                )
+                FilterChip(
+                    selected = rangeMode == RangeMode.MONTH,
+                    onClick = { onRangeModeChange(RangeMode.MONTH) },
+                    label = { Text("30 Days") },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
             // Mandatory Warning Banner if Pending Price items exist
             if (pendingPriceItems.isNotEmpty()) {
                 Card(
@@ -135,11 +170,23 @@ fun DailySummaryScreen(
 
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "Total Revenue: ₹${totalRevenue.toInt()}",
-                        style = MaterialTheme.typography.headlineSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Revenue: ₹${totalRevenue.toInt()}",
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = "📈 Est. Margin: ₹${totalMargin.toInt()}",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.secondary,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -170,21 +217,21 @@ fun DailySummaryScreen(
             }
 
             Spacer(Modifier.height(16.dp))
-            Text("Itemized Sales Breakdown (${todayTransactions.size} items)", style = MaterialTheme.typography.titleMedium)
+            Text("Itemized Sales Breakdown (${rangeTransactions.size} items)", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
 
-            if (todayTransactions.isEmpty()) {
+            if (rangeTransactions.isEmpty()) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(32.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("No sales logged today yet.", color = MaterialTheme.colorScheme.outline)
+                    Text("No sales logged in this range.", color = MaterialTheme.colorScheme.outline)
                 }
             } else {
                 LazyColumn {
-                    items(todayTransactions) { tx ->
+                    items(rangeTransactions) { tx ->
                         val isPending = tx.total == 0.0 || tx.priceAtSale == 0.0
                         val isPlaying = playingTxId == tx.id
                         val hasAudio = tx.audioFilePath.isNotBlank() && File(tx.audioFilePath).exists()

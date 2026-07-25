@@ -4,6 +4,8 @@ import androidx.room.*
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
 import kotlinx.coroutines.flow.Flow
 
+data class StockLevel(val itemId: String, val onHand: Double)
+
 @Dao
 interface CatalogDao {
     @Query("SELECT * FROM catalog_items WHERE active = 1 ORDER BY name ASC")
@@ -29,4 +31,16 @@ interface CatalogDao {
 
     @Query("UPDATE catalog_items SET synced = 1 WHERE id IN (:ids)")
     suspend fun markSynced(ids: List<String>)
+
+    @Query("""
+        SELECT c.id as itemId,
+          COALESCE((SELECT SUM(s.quantity) FROM stock_in s WHERE s.itemId = c.id), 0.0) -
+          COALESCE((SELECT SUM(t.quantity) FROM transactions t WHERE t.itemId = c.id), 0.0) as onHand
+        FROM catalog_items c
+        WHERE c.active = 1
+    """)
+    fun getStockLevels(): Flow<List<StockLevel>>
+
+    @Query("UPDATE catalog_items SET lowStockThreshold = :threshold WHERE id = :id")
+    suspend fun updateLowStockThreshold(id: String, threshold: Double?)
 }

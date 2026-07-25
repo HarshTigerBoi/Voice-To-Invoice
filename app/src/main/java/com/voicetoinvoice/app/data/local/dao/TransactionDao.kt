@@ -15,6 +15,9 @@ interface TransactionDao {
     @Query("SELECT * FROM transactions WHERE timestamp >= :startTimeOfDay ORDER BY timestamp DESC")
     fun getTodayTransactions(startTimeOfDay: Long): Flow<List<TransactionRecord>>
 
+    @Query("SELECT * FROM transactions WHERE timestamp >= :startMs AND timestamp < :endMs ORDER BY timestamp DESC")
+    fun getTransactionsBetween(startMs: Long, endMs: Long): Flow<List<TransactionRecord>>
+
     @Query("SELECT SUM(total) FROM transactions WHERE timestamp >= :startTimeOfDay")
     fun getTodayTotalSales(startTimeOfDay: Long): Flow<Double?>
 

@@ -14,5 +14,6 @@ data class CatalogItem(
     val price: Double, // Price per default unit
     val active: Boolean = true,
     val updatedAt: Long = System.currentTimeMillis(),
-    val synced: Boolean = false
+    val synced: Boolean = false,
+    val lowStockThreshold: Double? = null
 )

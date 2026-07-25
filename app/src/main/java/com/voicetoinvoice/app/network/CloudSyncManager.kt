@@ -5,6 +5,7 @@ import com.voicetoinvoice.app.data.local.entity.CatalogItem
 import com.voicetoinvoice.app.data.local.entity.CreditRecord
 import com.voicetoinvoice.app.data.local.entity.StockInRecord
 import com.voicetoinvoice.app.data.local.entity.SttJobRecord
+import com.voicetoinvoice.app.data.local.entity.SupplierRecord
 import com.voicetoinvoice.app.data.local.entity.TransactionRecord
 import com.voicetoinvoice.app.data.local.entity.UnmatchedQueueItem
 import kotlinx.coroutines.Dispatchers
@@ -161,6 +162,34 @@ class CloudSyncManager(
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to sync credit record to cloud: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Syncs a supplier record to Supabase 'suppliers' table.
+     */
+    suspend fun syncSupplierToCloud(supplier: SupplierRecord): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val payload = JSONObject().apply {
+                put("id", supplier.id)
+                put("name", supplier.name)
+                if (supplier.phone != null) put("phone", supplier.phone)
+                put("balance_owed", supplier.balanceOwed)
+                put("updated_at", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
+                    it.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                }.format(java.util.Date(supplier.updatedAt)))
+            }
+            val resCode = upsertToRestApi("/rest/v1/suppliers", payload)
+            if (resCode in 200..299) {
+                Log.i(TAG, "✅ Synced supplier record for '${supplier.name}' to Supabase cloud")
+                true
+            } else {
+                Log.w(TAG, "❌ Supplier record sync HTTP $resCode for '${supplier.name}'")
+                false
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to sync supplier record to cloud: ${e.message}")
             false
         }
     }

@@ -52,7 +52,8 @@ class AppForegroundService : Service() {
                 db.stockInDao(),
                 db.catalogDao(),
                 db.creditDao(),
-                db.sttJobDao()
+                db.sttJobDao(),
+                db.supplierDao()
             )
             while (isActive) {
                 try {

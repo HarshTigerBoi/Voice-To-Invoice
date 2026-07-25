@@ -96,6 +96,23 @@ CREATE POLICY "Public credits access"
     USING (true)
     WITH CHECK (true);
 
+-- 5b. Suppliers Table (Supplier Balances Owed)
+CREATE TABLE IF NOT EXISTS public.suppliers (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    shop_id UUID REFERENCES public.shops(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    phone TEXT,
+    balance_owed DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE public.suppliers ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Public suppliers access"
+    ON public.suppliers FOR ALL
+    USING (true)
+    WITH CHECK (true);
+
 -- 6. Stock-In Table (Append-Only Stock Arrivals)
 CREATE TABLE IF NOT EXISTS public.stock_in (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -105,6 +122,7 @@ CREATE TABLE IF NOT EXISTS public.stock_in (
     quantity DOUBLE PRECISION NOT NULL,
     cost_price DOUBLE PRECISION NOT NULL,
     supplier TEXT,
+    supplier_id UUID REFERENCES public.suppliers(id),
     timestamp TIMESTAMPTZ DEFAULT NOW()
 );
 
