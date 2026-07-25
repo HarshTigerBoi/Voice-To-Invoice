@@ -61,8 +61,8 @@ class VoiceParserTest {
 
     @Test
     fun testPriceBasedQuantityDisambiguation_SattarVsSatrah() {
-        // "sattar kilo pyaz 595" -> STT heard 70, but 595 / 35 = 17 -> Auto-corrected to 17.0 KG!
-        val parsed = voiceParser.parseUtterance("sattar kilo pyaz 595", sampleCatalog)
+        // "sattar kilo pyaz 595 rs" -> STT heard 70, but 595 / 35 = 17 -> Auto-corrected to 17.0 KG!
+        val parsed = voiceParser.parseUtterance("sattar kilo pyaz 595 rs", sampleCatalog)
         assertEquals("Pyaz", parsed.matchedItem?.name)
         assertEquals(17.0, parsed.quantity, 0.01)
         assertEquals("KG", parsed.unit)
@@ -71,15 +71,15 @@ class VoiceParserTest {
 
     @Test
     fun testTier1_HindiNumberWordParsing() {
-        // Test "सत्तर किलो पॉन्ड्स क्रीम 70" -> Qty 70.0 KG, Item Ponds Cream, Total 70.0
-        val parsedSattar = voiceParser.parseUtterance("सत्तर किलो पॉन्ड्स क्रीम 70", sampleCatalog)
+        // Test "सत्तर किलो पॉन्ड्स क्रीम 70 रुपये" -> Qty 70.0 KG, Item Ponds Cream, Total 70.0
+        val parsedSattar = voiceParser.parseUtterance("सत्तर किलो पॉन्ड्स क्रीम 70 रुपये", sampleCatalog)
         assertEquals("Ponds Cream", parsedSattar.matchedItem?.name)
         assertEquals(70.0, parsedSattar.quantity, 0.01)
         assertEquals("KG", parsedSattar.unit)
         assertEquals(70.0, parsedSattar.estimatedTotal, 0.01)
 
-        // Test "पचास पॉन्ड्स क्रीम 50" -> Qty 50.0 PACKET, Item Ponds Cream, Total 50.0
-        val parsedPachas = voiceParser.parseUtterance("पचास पॉन्ड्स क्रीम 50", sampleCatalog)
+        // Test "पचास पॉन्ड्स क्रीम 50 रुपये" -> Qty 50.0 PACKET, Item Ponds Cream, Total 50.0
+        val parsedPachas = voiceParser.parseUtterance("पचास पॉन्ड्स क्रीम 50 रुपये", sampleCatalog)
         assertEquals("Ponds Cream", parsedPachas.matchedItem?.name)
         assertEquals(50.0, parsedPachas.quantity, 0.01)
         assertEquals("PACKET", parsedPachas.unit)
@@ -88,7 +88,7 @@ class VoiceParserTest {
 
     @Test
     fun testTier1_KilometerUnitNormalizationGuard() {
-        val parsed = voiceParser.parseUtterance("70 kilometer pyaz 70", sampleCatalog)
+        val parsed = voiceParser.parseUtterance("70 kilometer pyaz 70 rs", sampleCatalog)
         assertEquals("Pyaz", parsed.matchedItem?.name)
         assertEquals(70.0, parsed.quantity, 0.01)
         assertEquals("KG", parsed.unit)
@@ -110,7 +110,7 @@ class VoiceParserTest {
 
     @Test
     fun testPositionalGheeVsGramDisambiguation() {
-        val parsedGhee = voiceParser.parseUtterance("1 kg ghee 650", sampleCatalog)
+        val parsedGhee = voiceParser.parseUtterance("1 kg ghee 650 rs", sampleCatalog)
         assertEquals("Desi Ghee", parsedGhee.matchedItem?.name)
         assertEquals(1.0, parsedGhee.quantity, 0.01)
         assertEquals("KG", parsedGhee.unit)
@@ -140,5 +140,73 @@ class VoiceParserTest {
         assert(result is TermInterpretationResult.Success)
         val success = result as TermInterpretationResult.Success
         assertEquals(0.5, success.interpretation.quantityValue, 0.01)
+    }
+
+    @Test
+    fun testPriceIntent_RateUpdate_NoQuantity() {
+        val parsed = voiceParser.parseUtterance("aaloo pachaas rupay", sampleCatalog)
+        assertEquals("Aaloo", parsed.matchedItem?.name)
+        assertEquals(com.voicetoinvoice.app.domain.parser.PriceIntent.RATE_UPDATE, parsed.priceIntent)
+        assertEquals(50.0, parsed.updatedUnitPrice, 0.01)
+        assertEquals(0.0, parsed.estimatedTotal, 0.01)
+    }
+
+    @Test
+    fun testPriceIntent_RateUpdate_ExplicitRsKeyword() {
+        val parsed = voiceParser.parseUtterance("aaloo 20 rs", sampleCatalog)
+        assertEquals("Aaloo", parsed.matchedItem?.name)
+        assertEquals(com.voicetoinvoice.app.domain.parser.PriceIntent.RATE_UPDATE, parsed.priceIntent)
+        assertEquals(20.0, parsed.updatedUnitPrice, 0.01)
+    }
+
+    @Test
+    fun testPriceIntent_BulkSaleTotal() {
+        val parsed = voiceParser.parseUtterance("4 kilo aloo 500 rupay", sampleCatalog)
+        assertEquals("Aaloo", parsed.matchedItem?.name)
+        assertEquals(com.voicetoinvoice.app.domain.parser.PriceIntent.BULK_SALE_TOTAL, parsed.priceIntent)
+        assertEquals(4.0, parsed.quantity, 0.01)
+        assertEquals(500.0, parsed.estimatedTotal, 0.01)
+        assertEquals(125.0, parsed.updatedUnitPrice, 0.01)
+    }
+
+    @Test
+    fun testPriceIntent_BulkSaleTotal_QtyOne() {
+        val parsed = voiceParser.parseUtterance("ek kilo aloo pachaas rupay", sampleCatalog)
+        assertEquals("Aaloo", parsed.matchedItem?.name)
+        assertEquals(com.voicetoinvoice.app.domain.parser.PriceIntent.BULK_SALE_TOTAL, parsed.priceIntent)
+        assertEquals(1.0, parsed.quantity, 0.01)
+        assertEquals(50.0, parsed.estimatedTotal, 0.01)
+    }
+
+    @Test
+    fun testPriceIntent_AmbiguousNoRupeeWord() {
+        val parsed = voiceParser.parseUtterance("4 kilo aloo 500", sampleCatalog)
+        assertEquals("Aaloo", parsed.matchedItem?.name)
+        assertEquals(com.voicetoinvoice.app.domain.parser.PriceIntent.AMBIGUOUS_UNTRUSTED, parsed.priceIntent)
+        assertEquals(true, parsed.isPendingPrice)
+        assertEquals(0.0, parsed.estimatedTotal, 0.01)
+    }
+
+    @Test
+    fun testPriceIntent_None_NoPriceSpoken() {
+        val parsed = voiceParser.parseUtterance("4 kilo aloo", sampleCatalog)
+        assertEquals("Aaloo", parsed.matchedItem?.name)
+        assertEquals(com.voicetoinvoice.app.domain.parser.PriceIntent.NONE, parsed.priceIntent)
+        assertEquals(100.0, parsed.estimatedTotal, 0.01)
+    }
+
+    @Test
+    fun testPriceIntent_SanityFlag_LargeRateJump() {
+        val parsed = voiceParser.parseUtterance("aaloo 90 rupay", sampleCatalog)
+        assertEquals("Aaloo", parsed.matchedItem?.name)
+        assertEquals(com.voicetoinvoice.app.domain.parser.PriceIntent.RATE_UPDATE, parsed.priceIntent)
+        assertEquals(true, parsed.isSanityFlagged)
+    }
+
+    @Test
+    fun testItemNameExtraction_ExcludesRupeeWordVariants() {
+        val parsed = voiceParser.parseUtterance("50 rupaya paneer", sampleCatalog)
+        assertEquals("Paneer", parsed.matchedItem?.name)
+        assertEquals(false, parsed.matchedItem?.name?.lowercase()?.contains("rupaya") ?: true)
     }
 }

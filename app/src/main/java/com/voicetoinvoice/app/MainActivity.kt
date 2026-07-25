@@ -11,6 +11,7 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import com.voicetoinvoice.app.data.local.AppDatabase
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
 import com.voicetoinvoice.app.data.local.entity.TransactionRecord
@@ -65,6 +66,7 @@ enum class Screen {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainAppScreen(database: AppDatabase) {
+    val context = LocalContext.current
     var currentScreen by remember { mutableStateOf(Screen.HOME) }
 
     val catalogState by database.catalogDao().getActiveCatalog().collectAsState(initial = emptyList())
@@ -88,6 +90,16 @@ fun MainAppScreen(database: AppDatabase) {
     val scope = rememberCoroutineScope()
     val syncEngine = remember { SyncEngine(database.transactionDao(), database.stockInDao(), database.catalogDao(), database.creditDao(), database.sttJobDao()) }
 
+    fun sendWhatsAppReminder(credit: com.voicetoinvoice.app.data.local.entity.CreditRecord) {
+        val message = "नमस्ते ${credit.customerName} जी, आपका ₹${credit.amount.toInt()} का बकाया (Udhaar) बाकी है। कृपया भुगतान करें। धन्यवाद!"
+        val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_TEXT, message)
+        }
+        val shareIntent = android.content.Intent.createChooser(sendIntent, "Send Udhaar Reminder via")
+        context.startActivity(shareIntent)
+    }
+
     // Trigger immediate background sync sweep on screen startup
     LaunchedEffect(Unit) {
         scope.launch { syncEngine.syncAllUnsynced() }
@@ -110,6 +122,12 @@ fun MainAppScreen(database: AppDatabase) {
                         onClick = { currentScreen = Screen.CATALOG }
                     )
                     NavigationBarItem(
+                        icon = { Icon(Icons.Default.DateRange, contentDescription = "Summary") },
+                        label = { Text("Summary") },
+                        selected = currentScreen == Screen.SUMMARY,
+                        onClick = { currentScreen = Screen.SUMMARY }
+                    )
+                    NavigationBarItem(
                         icon = { Icon(Icons.Default.AccountBox, contentDescription = "Udhaar") },
                         label = { Text("Udhaar") },
                         selected = currentScreen == Screen.UDHAAR,
@@ -125,12 +143,13 @@ fun MainAppScreen(database: AppDatabase) {
             }
         }
     ) { innerPadding ->
-        Surface(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
+        Surface(
+            modifier = Modifier.fillMaxSize().padding(innerPadding),
+            color = MaterialTheme.colorScheme.background
+        ) {
             when (currentScreen) {
                 Screen.ONBOARDING -> {
-                    OnboardingScreen(
-                        onOnboardingComplete = { currentScreen = Screen.HOME }
-                    )
+                    OnboardingScreen(onOnboardingComplete = { currentScreen = Screen.HOME })
                 }
                 Screen.HOME -> {
                     HomeScreen(
@@ -144,31 +163,37 @@ fun MainAppScreen(database: AppDatabase) {
                             scope.launch {
                                 var targetItem = parsedSale.matchedItem
                                 if (targetItem != null) {
-                                    val finalPrice = if (parsedSale.priceOverridden && parsedSale.updatedUnitPrice > 0) {
-                                        parsedSale.updatedUnitPrice
-                                    } else if (targetItem.price == 0.0 && parsedSale.estimatedTotal > 0) {
-                                        parsedSale.estimatedTotal / parsedSale.quantity
-                                    } else {
-                                        targetItem.price
+                                    when (parsedSale.priceIntent) {
+                                        com.voicetoinvoice.app.domain.parser.PriceIntent.RATE_UPDATE -> {
+                                            val newRate = if (parsedSale.updatedUnitPrice > 0) parsedSale.updatedUnitPrice else targetItem.price
+                                            targetItem = targetItem.copy(price = newRate, synced = false)
+                                            database.catalogDao().insertOrUpdate(targetItem)
+                                            syncEngine.syncAllUnsynced()
+                                        }
+                                        com.voicetoinvoice.app.domain.parser.PriceIntent.BULK_SALE_TOTAL,
+                                        com.voicetoinvoice.app.domain.parser.PriceIntent.NONE,
+                                        com.voicetoinvoice.app.domain.parser.PriceIntent.AMBIGUOUS_UNTRUSTED -> {
+                                            val effectiveUnitPrice = if (parsedSale.priceOverridden && parsedSale.updatedUnitPrice > 0) parsedSale.updatedUnitPrice else targetItem.price
+
+                                            // Brand-new item exception: seed initial catalog price if standing catalog price was 0.0
+                                            if (targetItem.price == 0.0 && effectiveUnitPrice > 0.0) {
+                                                targetItem = targetItem.copy(price = effectiveUnitPrice, synced = false)
+                                                database.catalogDao().insertOrUpdate(targetItem)
+                                            }
+
+                                            val tx = TransactionRecord(
+                                                itemId = targetItem.id,
+                                                itemName = targetItem.name,
+                                                quantity = parsedSale.quantity,
+                                                priceAtSale = effectiveUnitPrice,
+                                                total = parsedSale.estimatedTotal,
+                                                rawTranscript = parsedSale.rawTranscript
+                                            )
+                                            database.transactionDao().insert(tx)
+                                            syncEngine.syncAllUnsynced()
+                                        }
                                     }
-
-                                    targetItem = targetItem.copy(price = finalPrice, synced = false)
-                                    database.catalogDao().insertOrUpdate(targetItem)
                                 }
-
-                                val finalItem = targetItem
-                                if (finalItem != null) {
-                                    val tx = TransactionRecord(
-                                        itemId = finalItem.id,
-                                        itemName = finalItem.name,
-                                        quantity = parsedSale.quantity,
-                                        priceAtSale = finalItem.price,
-                                        total = parsedSale.estimatedTotal,
-                                        rawTranscript = parsedSale.rawTranscript
-                                    )
-                                    database.transactionDao().insert(tx)
-                                }
-                                syncEngine.syncAllUnsynced()
                             }
                         }
                     )
@@ -176,9 +201,9 @@ fun MainAppScreen(database: AppDatabase) {
                 Screen.CATALOG -> {
                     CatalogManagementScreen(
                         catalog = catalogState,
-                        onAddItem = { name, unit, price ->
+                        onAddItem = { name, unitId, price ->
                             scope.launch {
-                                database.catalogDao().insertOrUpdate(CatalogItem(name = name, unitId = unit, price = price))
+                                database.catalogDao().insertOrUpdate(CatalogItem(name = name, unitId = unitId, price = price))
                                 syncEngine.syncAllUnsynced()
                             }
                         },
@@ -199,6 +224,9 @@ fun MainAppScreen(database: AppDatabase) {
                                 database.creditDao().updateStatus(credit.id, com.voicetoinvoice.app.data.local.entity.CreditStatus.PAID)
                                 syncEngine.syncAllUnsynced()
                             }
+                        },
+                        onSendReminder = { credit ->
+                            sendWhatsAppReminder(credit)
                         },
                         onNavigateBack = { currentScreen = Screen.HOME }
                     )

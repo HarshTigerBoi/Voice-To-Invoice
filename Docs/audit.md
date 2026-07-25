@@ -6,13 +6,13 @@
 
 ## 1. Ground-Truth Source-Code Verified Constants
 
-*(Verified directly against source code in `process-voice-job/index.ts` and `SttWorker.kt` on July 25, 2026)*
+*(Verified directly against source code in `process-voice-job/index.ts`, `BackgroundSttProcessor.kt`, and `SttWorker.kt` on July 25, 2026)*
 
 | Metric / Parameter | Actual Source Code Value | Source Location | Discrepancy Note |
 | :--- | :--- | :--- | :--- |
-| **Auto-Confirm Confidence Threshold** | **`confidence >= 0.80`** | `supabase/functions/process-voice-job/index.ts` (L697) & `BackgroundSttProcessor.kt` (L336) | *Unified auto-confirm threshold aligned to 0.80 across client and server on July 25, 2026.* |
-| **Catalog Exact Match Confidence** | **`0.95`** | `process-voice-job/index.ts` (L682) | Assigned when item matches DB catalog SKU or explicit keyterm. |
-| **Phonetic Inferred Confidence** | **`0.60` / `0.70`** | `process-voice-job/index.ts` (L682) | Assigned to phonetically resolved/unlisted items. |
+| **Auto-Confirm Confidence Threshold** | **`confidence >= 0.80`** | `supabase/functions/process-voice-job/index.ts` (L716) & `BackgroundSttProcessor.kt` (L336) | *Unified auto-confirm threshold aligned to 0.80 across client and server on July 25, 2026.* |
+| **Catalog Exact Match Confidence** | **`0.95`** | `process-voice-job/index.ts` (L697) | Assigned when item matches a DB catalog SKU (server-side); fallback is `0.60` for unmatched items on the same line. |
+| **Phonetic Inferred Confidence** | **`0.70`** (matched) **`0.90`** (server-confirmed match) | `BackgroundSttProcessor.kt` (L181) | Client-side fallback path, not the edge function — assigns `0.90f` when a catalog item matches, `0.70f` otherwise. |
 | **Edge Function Client Timeout** | **`30s` (connect) / `60s` (read)** | `SttWorker.kt` (L93-94) | Prevents local HTTP timeout fallback rows. |
 | **Background Polling Window** | **`30 seconds`** (every 2s) | `SttWorker.kt` (L161-162) | Drains `stt_job_logs` queue following HTTP 202 ack. |
 
@@ -28,11 +28,69 @@
 - **Current Mitigation**:
   1. Pure Levenshtein Edit-Distance Combinatorial Segmenter (`editDistance`) deployed in `process-voice-job/index.ts`.
   2. Phonetic-Aware Indian Shopkeeper Prompt deployed to Grok AI (Step 4).
-- **Status**: OPEN — Monitoring production transcripts to refine phonetic distance weights.
+  3. [2026-07-25, see ISSUE-011] Segmenter's hardcoded Devanagari vocab expanded + confidence floor added; Grok prompt now explicitly distrusts the segmenter's output and was given aspirated/unaspirated consonant hints.
+- **Status**: OPEN — Monitoring production transcripts to refine phonetic distance weights. ISSUE-011 fixed one concrete failure mode (missing catalog vocab word) of this broader class; other unlisted items can still hit the same failure pattern until their Devanagari alias is added.
 
 ---
 
 ### 🟢 RESOLVED ISSUES
+
+#### [ISSUE-013] [2026-07-25] UPI Auto-Reconciliation & Udhaar WhatsApp Reminders
+- **Feature Overview**:
+  1. **Passive UPI Reconciliation**: Connected `UpiNotificationListenerService.kt` to Room DB. When a Paytm/PhonePe/GPay notification with ₹ amount lands, it queries `transactions` for sales in the last **2 minutes** (120,000 ms) with matching total.
+     - **Match Window Mitigation**: Shrank match window from 15 minutes to 2 minutes to eliminate false-positive flips of unrelated cash sales recorded minutes earlier.
+     - **Ambiguity Rule**: If **exactly 1** candidate matches within 2 minutes, updates `paymentMode = UPI`, `synced = 0`, and sweeps sync to cloud. If 0 or 2+ candidates match, leaves untouched (never guesses).
+  2. **Udhaar WhatsApp Reminders**: Added a **"Remind"** button to `UdhaarScreen.kt` for pending credit rows. Launches native Android share sheet (`Intent.ACTION_SEND`), pre-filling Hindi/Hinglish reminder text (*"नमस्ते {Customer} जी, आपका ₹{Amount} का बकाया (Udhaar) बाकी है..."*). Requires zero API keys or stored phone numbers.
+- **Files Touched**:
+  - `TransactionDao.kt`: Added `getRecentTransactionsByAmount` and `markTransactionPaidViaUpi`.
+  - `UpiNotificationListenerService.kt`: Added passive 2-minute lookup, ambiguity guard, and `SyncEngine` sweep.
+  - `UdhaarScreen.kt`: Added **Remind** `OutlinedButton` next to **Mark Paid**.
+  - `MainActivity.kt`: Added `sendWhatsAppReminder` via `Intent.ACTION_SEND`.
+- **Verification Date**: 2026-07-25 (`BUILD SUCCESSFUL in 28s`, built into `VoiceToInvoice_v60.apk`).
+
+#### [ISSUE-012] [2026-07-25] Rupee-Word-Gated Rate vs. Bulk Sale Price Handling & Catalog Corruption Fix
+- **Symptom**: Spoken prices were previously ambiguous between per-unit rate updates and bulk/discount sales. Furthermore, manual/typed-text entry in `MainActivity.kt` (`onConfirmSale`) unconditionally overwrote `CatalogItem.price` on normal sales, corrupting standing catalog prices.
+- **Root Cause**:
+  1. `VoiceParser.kt` lacked explicit classification distinguishing rate updates from bulk sales.
+  2. Numbers were treated as prices even without a rupee-word, causing false-positive price overrides.
+  3. Manual entry handler in `MainActivity.kt` called `catalogDao().insertOrUpdate(targetItem)` on every sale where price was overridden.
+- **Resolution**:
+  1. Introduced `PriceIntent` enum (`NONE`, `RATE_UPDATE`, `BULK_SALE_TOTAL`, `AMBIGUOUS_UNTRUSTED`) in `VoiceParser.kt`.
+  2. Implemented strict Rupee-Word Gate (`rupay`, `rupaye`, `rs`, `₹`, `rupees`, `रुपये`, etc.): numbers without an adjacent rupee-word are classified as `AMBIGUOUS_UNTRUSTED` and routed to the review queue (`isPendingPrice = true`).
+  3. Classified `RATE_UPDATE` (price + rupee-word, no quantity) to update `CatalogItem.price` with zero transaction created.
+  4. Classified `BULK_SALE_TOTAL` (price + rupee-word + quantity) to record a `TransactionRecord` with `priceAtSale = total / qty`, keeping standing `CatalogItem.price` untouched (except for brand-new unpriced items).
+  5. Implemented >50% rate-jump sanity check (`isSanityFlagged = true`), routing large rate jumps to review instead of auto-applying.
+  6. Fixed `MainActivity.kt` `onConfirmSale` and `BackgroundSttProcessor.kt` to respect `PriceIntent` and preserve catalog rates.
+  7. Added 8 new unit tests in `VoiceParserTest.kt` verifying all `PriceIntent` branches and sanity checks.
+- **Verification Date**: 2026-07-25 (All 27 `VoiceParserTest` unit tests PASSED, APK `VoiceToInvoice_v58.apk` built and verified).
+
+#### [ISSUE-011] [2026-07-25] Segmenter Corrupted "बिंडी" (Bhindi) → "घी" (Ghee) Due to Missing Devanagari Vocab Entry, Auto-Confirmed Wrong Item to Ledger
+- **Symptom**: Trace `6690cc7b-89cf-41f0-a4fc-04d5ae766fec` — shopkeeper said "दो किलो भिंडी" (2kg Bhindi/okra), Grok STT correctly heard it as `"दो किलोबिंडी"` (fused, unaspirated `ब` for `भ` — a common STT confusion), but `combinatorialFuzzySegmenter` rewrote it to `"दो किलो घी"` (Ghee) and auto-confirmed **Desi Ghee × 2KG = ₹1300** to the ledger instead of Bhindi. This is a real wrong-item, wrong-price transaction silently booked to the confirmed ledger.
+- **Root Cause**:
+  1. Catalog items are stored in `catalog_items.name` as English/Latin strings only (e.g. `"Bhindi"` — confirmed via direct query, no Hindi/alias column exists on the table). The segmenter's `catalogVocab` in `process-voice-job/index.ts` mixes these English catalog names with Devanagari transcript tokens and runs raw Unicode edit-distance across them — cross-script comparison (Devanagari vs Latin) never matches, so `"Bhindi"` was mathematically unreachable from any Hindi utterance.
+  2. The segmenter's small **hardcoded** Devanagari fallback vocab (14 words) was the only real anchor available, and it didn't include `भिंडी` — so when the genuinely correct word wasn't a candidate, the segmenter still force-picked the closest available wrong word (`घी`) rather than leaving the token alone.
+  3. The Android client already solves this correctly via a maintained `indicAliasMap` (~60 entries, includes `भिंडी` → `Bhindi`) in `FuzzyCatalogMatcher.kt` — the edge function had reinvented a much smaller, out-of-sync version of the same idea instead of mirroring it.
+  4. Step 4's Grok AI prompt *did* receive the raw STT transcripts alongside the segmenter's (wrong) output, so it could in principle have self-corrected, but the prompt presented the segmenter's output as an already-cleaned "Preprocessed Transcript" with no warning it could be wrong, and its consonant-confusion hint list omitted aspirated/unaspirated pairs (ब↔भ) — exactly the error class that occurred.
+- **Resolution**:
+  1. Expanded `combinatorialFuzzySegmenter`'s hardcoded Devanagari vocab in `process-voice-job/index.ts` to mirror the Devanagari keys in `FuzzyCatalogMatcher.kt`'s `indicAliasMap` (added `भिंडी` plus ~35 other common produce/FMCG words), with a code comment tying the two files together so they don't drift again.
+  2. Added a confidence floor to the segmenter: 2-way/3-way token splits are only accepted when average edit-distance per part is ≤1; otherwise the raw token is left untouched instead of being force-corrected to a weak/wrong match.
+  3. Rewrote the Step 4 Grok AI prompt to explicitly tell the model the "Preprocessed Transcript" is a rigid rule-based guess that can be confidently wrong, and to weight the two raw STT transcripts + its own phonetic/catalog reasoning over it.
+  4. Added aspirated/unaspirated consonant-confusion pairs (क↔ख, ग↔घ, च↔छ, ज↔झ, ट↔ठ, ड↔ढ, त↔थ, द↔ध, प↔फ, ब↔भ) to the prompt with the बिंडी/Bhindi case as a worked example.
+  5. Upgraded the Step 4 chat model from the stale `grok-beta` alias to `grok-2-latest` (matching `term-interpret/index.ts`, which already used the newer model).
+- **Verification Date**: 2026-07-25 (Edge function `process-voice-job` deployed live to Supabase project `lyowklxsbfznnqridtgr`, **Version 26 ACTIVE**).
+
+#### [ISSUE-010] [2026-07-25] Dedicated Summary Bottom Navigation Tab & Documentation Consistency Audit
+- **Symptom**:
+  1. `DailySummaryScreen` was built and fully functional, but lacked a dedicated primary tab in the bottom navigation bar (`NavigationBar`).
+  2. `CLAUDE.md` listed `AppDatabase (version 7)` instead of `version 8`, and `Docs/audit.md` contained drifted line numbers and a typo stating `confidence >= 0.60` instead of `0.80`.
+- **Root Cause**:
+  1. Bottom navigation bar in `MainActivity.kt` only contained Home, Catalog, Udhaar, and Settings tabs.
+  2. Documentation drift after recent database schema migration and auto-confirm threshold alignment.
+- **Resolution**:
+  1. Added a dedicated **`Summary`** tab (`Icons.Default.DateRange`) directly to `NavigationBar` in `MainActivity.kt` (`Home` | `Catalog` | `Summary` | `Udhaar` | `Settings`).
+  2. Updated `CLAUDE.md` to reflect `AppDatabase (version 8)`.
+  3. Corrected line numbers, phonetic-confidence Kotlin attribution, and pipeline diagram auto-confirm threshold (`0.80`) in `Docs/audit.md`.
+- **Verification Date**: 2026-07-25 (`BUILD SUCCESSFUL`, `VoiceToInvoice_v57.apk` deployed).
 
 #### [ISSUE-009] [2026-07-25] On-Device Emulator Verification, "Set Price" Tap Fix & Single-Source Review UI Consolidation
 - **Symptom**: During live on-device emulator testing of `PendingConfirmationsSheet`, setting `enabled = isConfirmable` caused the button to be disabled when `parsedTotal == 0.0`, preventing users from tapping "Set Price" to open the edit dialog. Furthermore, an orphaned duplicate screen (`UnmatchedQueueScreen.kt`) existed alongside the live `PendingConfirmationsSheet.kt`.
@@ -190,7 +248,7 @@ CREATE TABLE IF NOT EXISTS public.transactions (
        ├─► Grok STT + Sarvam STT saarika:v2 (parallel 8s timeouts)
        ├─► Combinatorial Levenshtein Segmenter (editDistance matching)
        ├─► Grok AI (Phonetic-Aware Shopkeeper System Prompt)
-       └─► Final Write: stt_job_logs + transactions (if confidence >= 0.60) / unmatched_queue (if PENDING)
+       └─► Final Write: stt_job_logs + transactions (if confidence >= 0.80 & price/total > 0) / unmatched_queue (if PENDING)
 ```
 
 ---

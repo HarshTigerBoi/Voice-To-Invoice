@@ -4,6 +4,13 @@ import com.voicetoinvoice.app.data.local.entity.CatalogItem
 import com.voicetoinvoice.app.domain.matcher.FuzzyCatalogMatcher
 import java.util.Locale
 
+enum class PriceIntent {
+    NONE,                 // no price spoken; use existing catalog rate
+    RATE_UPDATE,          // price + rupee-word, no quantity spoken
+    BULK_SALE_TOTAL,      // price + rupee-word + quantity spoken
+    AMBIGUOUS_UNTRUSTED   // price-looking number present, but no rupee-word adjacent to it
+}
+
 data class ParsedVoiceSale(
     val matchedItem: CatalogItem?,
     val rawTranscript: String,
@@ -17,10 +24,18 @@ data class ParsedVoiceSale(
     val isSanityFlagged: Boolean = false,
     val trailingQty: Double? = null,
     val trailingUnit: String? = null,
-    val hasLeadingQty: Boolean = false
+    val hasLeadingQty: Boolean = false,
+    val priceIntent: PriceIntent = PriceIntent.NONE
 )
 
 class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher()) {
+
+    private val rupeeWords: Set<String> = setOf(
+        "rs", "rs.", "₹",
+        "rupay", "rupaye", "rupaya", "rupaiya", "rupaiye",
+        "rupee", "rupees",
+        "रुपये", "रुपया", "रुपए", "रु", "रूपये", "रूपए"
+    )
 
     // Comprehensive Hindi & Hinglish Number Words Mapping Table (0-100+)
     private val hindiNumberMap: Map<String, Double> = mapOf(
@@ -73,7 +88,7 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
         val matchResult = matcher.findBestMatch(cleanTranscript, catalog)
         val matchedItemFromCatalog = matchResult?.item
 
-        val (rawQtyExtracted, rawUnit, spokenPrice, trailingQty, trailingUnit, cleanTranscriptWithoutTrailing, hasLeadingQty) = extractQtyUnitAndPrice(cleanTranscript, matchedItemFromCatalog?.unitId ?: "PACKET", matchedItemFromCatalog?.name)
+        val (rawQtyExtracted, rawUnit, spokenPrice, trailingQty, trailingUnit, cleanTranscriptWithoutTrailing, hasLeadingQty, hasAmbiguousPriceNumber) = extractQtyUnitAndPrice(cleanTranscript, matchedItemFromCatalog?.unitId ?: "PACKET", matchedItemFromCatalog?.name)
 
         var explicitUnit = normalizeUnit(rawUnit)
         if (explicitUnit == "PACKET" && matchedItemFromCatalog != null && matchedItemFromCatalog.unitId.isNotBlank()) {
@@ -83,9 +98,55 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
         val catalogPrice = matchedItemFromCatalog?.price ?: 0.0
         val extractedQty = disambiguateQuantityWithPriceSanity(rawQtyExtracted, catalogPrice, spokenPrice)
 
+        val priceIntent: PriceIntent = when {
+            hasAmbiguousPriceNumber -> PriceIntent.AMBIGUOUS_UNTRUSTED
+            spokenPrice != null && spokenPrice > 0.0 && !hasLeadingQty -> PriceIntent.RATE_UPDATE
+            spokenPrice != null && spokenPrice > 0.0 && hasLeadingQty -> PriceIntent.BULK_SALE_TOTAL
+            else -> PriceIntent.NONE
+        }
+
+        var priceOverridden = false
+        var updatedUnitPrice = targetItemPriceOrZero(matchedItemFromCatalog)
+        var total = 0.0
+        var isPendingPrice = false
+
+        when (priceIntent) {
+            PriceIntent.RATE_UPDATE -> {
+                updatedUnitPrice = spokenPrice!!
+                total = 0.0
+                priceOverridden = true
+                isPendingPrice = false
+            }
+            PriceIntent.BULK_SALE_TOTAL -> {
+                total = spokenPrice!!
+                priceOverridden = true
+                updatedUnitPrice = if (extractedQty > 0.0) total / extractedQty else total
+                isPendingPrice = false
+            }
+            PriceIntent.AMBIGUOUS_UNTRUSTED -> {
+                total = 0.0
+                priceOverridden = false
+                updatedUnitPrice = 0.0
+                isPendingPrice = true
+            }
+            PriceIntent.NONE -> {
+                if (matchedItemFromCatalog != null && matchedItemFromCatalog.price > 0.0) {
+                    total = calculateTotalForUnits(extractedQty, explicitUnit, matchedItemFromCatalog.price, matchedItemFromCatalog.unitId)
+                    updatedUnitPrice = matchedItemFromCatalog.price
+                } else {
+                    isPendingPrice = true
+                    total = 0.0
+                    updatedUnitPrice = 0.0
+                }
+            }
+        }
+
         val isSanityFlagged = (explicitUnit == "KG" && extractedQty > 45.0) ||
                 (explicitUnit == "PACKET" && extractedQty > 50.0) ||
-                (explicitUnit == "LITRE" && extractedQty > 30.0)
+                (explicitUnit == "LITRE" && extractedQty > 30.0) ||
+                ((priceIntent == PriceIntent.RATE_UPDATE || priceIntent == PriceIntent.BULK_SALE_TOTAL) &&
+                        catalogPrice > 0.0 &&
+                        Math.abs(updatedUnitPrice - catalogPrice) / catalogPrice > 0.5)
 
         val productName = matchedItemFromCatalog?.name ?: extractRawProductName(cleanTranscriptWithoutTrailing)
 
@@ -95,26 +156,10 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
             CatalogItem(
                 name = capitalizeWords(productName),
                 unitId = explicitUnit,
-                price = spokenPrice ?: 0.0
+                price = if (priceIntent == PriceIntent.RATE_UPDATE || priceIntent == PriceIntent.BULK_SALE_TOTAL) updatedUnitPrice else 0.0
             )
         } else {
             null
-        }
-
-        var priceOverridden = false
-        var updatedUnitPrice = targetItem?.price ?: 0.0
-        var total = 0.0
-        var isPendingPrice = false
-
-        if (spokenPrice != null && spokenPrice > 0.0) {
-            total = spokenPrice
-            priceOverridden = true
-            updatedUnitPrice = if (extractedQty > 0.0) total / extractedQty else total
-        } else if (targetItem != null && targetItem.price > 0.0) {
-            total = calculateTotalForUnits(extractedQty, explicitUnit, targetItem.price, targetItem.unitId)
-        } else {
-            isPendingPrice = true
-            total = 0.0
         }
 
         return ParsedVoiceSale(
@@ -130,9 +175,12 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
             isSanityFlagged = isSanityFlagged,
             trailingQty = trailingQty,
             trailingUnit = trailingUnit,
-            hasLeadingQty = hasLeadingQty
+            hasLeadingQty = hasLeadingQty,
+            priceIntent = priceIntent
         )
     }
+
+    private fun targetItemPriceOrZero(item: CatalogItem?): Double = item?.price ?: 0.0
 
     private fun disambiguateQuantityWithPriceSanity(rawQty: Double, catalogPrice: Double, spokenPrice: Double?): Double {
         if (spokenPrice == null || spokenPrice <= 0.0 || catalogPrice <= 0.0) return rawQty
@@ -169,21 +217,21 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
             val lower = token.lowercase()
             token.toDoubleOrNull() == null &&
                     !hindiNumberMap.containsKey(lower) &&
+                    !rupeeWords.contains(lower) &&
                     !lower.contains("kilometer") && !lower.contains("किलोमीटर") &&
                     !lower.contains("kg") && !lower.contains("kilo") && !lower.contains("किलो") &&
                     !lower.contains("gram") && !lower.contains("ग्राम") && !lower.contains("gm") &&
                     !lower.contains("litre") && !lower.contains("liter") && !lower.contains("लीटर") && !lower.contains("ml") &&
                     !lower.contains("packet") && !lower.contains("पैकेट") && !lower.contains("pkt") &&
                     !lower.contains("dozen") && !lower.contains("दर्जन") &&
-                    !lower.contains("paao") && !lower.contains("पाव") && !lower.contains("pao") && !lower.contains("पाओ") &&
+                    !lower.contains("paao") && !lower.contains("पाव") && !lower.contains("paao") && !lower.contains("पाओ") &&
                     !lower.contains("aadha") && !lower.contains("aadhi") && !lower.contains("aadi") && !lower.contains("adi") &&
                     !lower.contains("आधा") && !lower.contains("आधी") && !lower.contains("आदि") && !lower.contains("अदि") &&
                     !lower.contains("adha") && !lower.contains("adhi") && !lower.contains("अधा") && !lower.contains("अधी") &&
                     !lower.contains("half") && !lower.contains("हाफ") &&
                     !lower.contains("sawa") && !lower.contains("सवा") &&
                     !lower.contains("dhai") && !lower.contains("ढाई") &&
-                    !lower.contains("dedh") && !lower.contains("डेढ़") && !lower.contains("डेढ") &&
-                    !lower.contains("rs") && !lower.contains("rupees") && !lower.contains("रुपये")
+                    !lower.contains("dedh") && !lower.contains("डेढ़") && !lower.contains("डेढ")
         }
 
         val result = nameWords.joinToString(" ").trim()
@@ -265,10 +313,36 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
             activeUnit = if (defaultCatalogUnit == "LITRE" || defaultCatalogUnit == "ML") "LITRE" else "KG"
         }
 
-        // Extract Spoken Price at End
+        // Extract Spoken Price with Rupee-Word Gate
         var spokenPrice: Double? = null
         var spokenPriceIndex = -1
-        if (tokens.size >= 2) {
+        var rupeeWordIndex = -1
+        var hasAmbiguousPriceNumber = false
+
+        val confirmedCandidates = mutableListOf<Triple<Int, Double, Int>>() // <priceIndex, priceValue, rupeeWordIndex>
+
+        for (i in tokens.indices) {
+            val token = tokens[i]
+            val num = token.toDoubleOrNull() ?: hindiNumberMap[token]
+            if (num != null && num > 0.0) {
+                val prevToken = tokens.getOrNull(i - 1)?.lowercase()
+                val nextToken = tokens.getOrNull(i + 1)?.lowercase()
+                val prevMatch = prevToken != null && rupeeWords.contains(prevToken)
+                val nextMatch = nextToken != null && rupeeWords.contains(nextToken)
+
+                if (prevMatch || nextMatch) {
+                    val rIdx = if (prevMatch) i - 1 else i + 1
+                    confirmedCandidates.add(Triple(i, num, rIdx))
+                }
+            }
+        }
+
+        if (confirmedCandidates.isNotEmpty()) {
+            val lastCandidate = confirmedCandidates.last()
+            spokenPriceIndex = lastCandidate.first
+            spokenPrice = lastCandidate.second
+            rupeeWordIndex = lastCandidate.third
+        } else if (tokens.size >= 2) {
             val lastIdx = tokens.size - 1
             val lastToken = tokens[lastIdx]
             val parsedLastNum = lastToken.toDoubleOrNull() ?: hindiNumberMap[lastToken]
@@ -276,11 +350,9 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
                 val firstToken = tokens.first()
                 val parsedFirstNum = firstToken.toDoubleOrNull() ?: hindiNumberMap[firstToken]
                 if (parsedFirstNum != null && tokens.size >= 3) {
-                    spokenPrice = parsedLastNum
-                    spokenPriceIndex = lastIdx
-                } else if (tokens.size >= 2 && (lower.contains("rs") || lower.contains("rupees") || lower.contains("रुपये") || parsedLastNum >= 10.0)) {
-                    spokenPrice = parsedLastNum
-                    spokenPriceIndex = lastIdx
+                    hasAmbiguousPriceNumber = true
+                } else if (tokens.size >= 2 && parsedLastNum >= 10.0) {
+                    hasAmbiguousPriceNumber = true
                 }
             }
         }
@@ -297,13 +369,13 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
             }
         }
 
-        // Separate Leading vs Trailing Quantities
+        // Separate Leading vs Trailing Quantities (excluding spoken price & rupee-word tokens)
         var leadingQty: Double? = null
         var trailingQty: Double? = null
         var trailingQtyTokenStartIdx = -1
 
         for (i in tokens.indices) {
-            if (i == spokenPriceIndex) continue
+            if (i == spokenPriceIndex || i == rupeeWordIndex) continue
             val token = tokens[i]
             val num = token.toDoubleOrNull() ?: hindiNumberMap[token]
             if (num != null) {
@@ -344,7 +416,8 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
             trailingQty = trailingQty,
             trailingUnit = activeUnit,
             cleanTranscriptWithoutTrailing = cleanTranscriptWithoutTrailing,
-            hasLeadingQty = hasLeadingQty
+            hasLeadingQty = hasLeadingQty,
+            hasAmbiguousPriceNumber = hasAmbiguousPriceNumber
         )
     }
 
@@ -355,6 +428,7 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
         val trailingQty: Double?,
         val trailingUnit: String?,
         val cleanTranscriptWithoutTrailing: String,
-        val hasLeadingQty: Boolean
+        val hasLeadingQty: Boolean,
+        val hasAmbiguousPriceNumber: Boolean = false
     )
 }

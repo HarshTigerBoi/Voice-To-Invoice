@@ -5,6 +5,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.voicetoinvoice.app.data.local.entity.CreditRecord
@@ -16,6 +17,7 @@ fun UdhaarScreen(
     credits: List<CreditRecord>,
     onAddCredit: (String, Double) -> Unit,
     onMarkPaid: (CreditRecord) -> Unit,
+    onSendReminder: (CreditRecord) -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     var searchQuery by remember { mutableStateOf("") }
@@ -49,16 +51,22 @@ fun UdhaarScreen(
                 items(filteredCredits) { credit ->
                     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                         Row(
-                            modifier = Modifier.padding(16.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Column {
+                            Column(modifier = Modifier.weight(1f)) {
                                 Text(credit.customerName, style = MaterialTheme.typography.titleMedium)
                                 Text("Owed: ₹${credit.amount.toInt()}", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.error)
                             }
                             if (credit.status == CreditStatus.PENDING) {
-                                Button(onClick = { onMarkPaid(credit) }) {
-                                    Text("Mark Paid")
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(onClick = { onSendReminder(credit) }) {
+                                        Text("Remind")
+                                    }
+                                    Button(onClick = { onMarkPaid(credit) }) {
+                                        Text("Mark Paid")
+                                    }
                                 }
                             } else {
                                 Text("PAID", color = MaterialTheme.colorScheme.primary)

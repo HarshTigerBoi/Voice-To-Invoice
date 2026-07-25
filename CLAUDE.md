@@ -79,7 +79,7 @@ Every processing step writes into a single JSON `diagnosticTraceJson` blob (`ste
 
 ### Local persistence (Room, `data/local/`)
 
-`AppDatabase` (version 7) is the single Room database, manually migrated with one `Migration` object per version bump (no auto-migrations) — follow that existing pattern (bump `version`, add a `MIGRATION_N_N+1` with try/catch'd `ALTER TABLE`, register it in `addMigrations(...)`) when changing entities. It seeds `item_units` and a large default `catalog_items` list on first create (`seedItemUnits`/`seedMasterCatalog`), and has an `onOpen` callback that purges a hardcoded list of known bad STT-parsed catalog/transaction rows (e.g. "kilometer", "किलोमीटर") — a workaround for recurring STT misfires rather than a general mechanism.
+`AppDatabase` (version 8) is the single Room database, manually migrated with one `Migration` object per version bump (no auto-migrations) — follow that existing pattern (bump `version`, add a `MIGRATION_N_N+1` with try/catch'd `ALTER TABLE`, register it in `addMigrations(...)`) when changing entities. It seeds `item_units` and a large default `catalog_items` list on first create (`seedItemUnits`/`seedMasterCatalog`), and has an `onOpen` callback that purges a hardcoded list of known bad STT-parsed catalog/transaction rows (e.g. "kilometer", "किलोमीटर") — a workaround for recurring STT misfires rather than a general mechanism.
 
 Entities: `CatalogItem`, `ItemUnit`, `TransactionRecord` (append-only sale events), `CreditRecord` (Udhaar), `StockInRecord`, `UnmatchedQueueItem`, `SyncQueueItem`, `SttJobRecord` (the voice pipeline's per-recording state machine — see `SttJobStatus`).
 
@@ -104,3 +104,15 @@ Single-Activity Compose app (`MainActivity.kt`) with a hand-rolled `enum class S
 - The client's `SttProxyClient` posts to `SupabaseConfig.STT_PROXY_ENDPOINT`, which actually points at the `process-voice-job` function, not the older `stt-proxy` function (which still exists in `supabase/functions/stt-proxy/` but appears superseded — see `implementation_plan.md`).
 
 For full DB schema, credential variable map, and known-issue history, see `C:\Users\harsh\Documents\Voice To Invoice\Docs\audit.md`
+
+## Keeping Docs/audit.md in sync — do this automatically, every session
+
+`Docs/audit.md`'s "Living Issues Log" (§2) is the shared handoff mechanism between every AI agent working on this repo (this tool and Antigravity, working in separate sessions with no shared memory otherwise). Updating it is part of finishing a fix, not an optional extra step — an unlogged fix is invisible to whichever agent opens the repo next.
+
+Whenever you diagnose and fix a real bug (behavior-affecting — not a typo or pure refactor):
+1. Add a new entry under "🟢 RESOLVED ISSUES", using the next sequential `ISSUE-NNN` number (check the highest existing number in the file first) and today's date.
+2. Match the existing format exactly: **Symptom** (what was observed, with a trace ID or concrete example if you have one), **Root Cause** (numbered if multi-part), **Resolution** (numbered, one line per concrete change, naming exact files), **Verification Date** (state plainly what you actually verified vs. what's still unverified — don't imply testing that didn't happen).
+3. If the fix is a refinement of an existing 🔴 OPEN issue (same root-cause class), update that issue's mitigation list / status to point at the new entry instead of creating an orphaned duplicate — see how ISSUE-011 cross-references ISSUE-004.
+4. If you change a source-of-truth constant (confidence thresholds, model names, DB schema, line-number references cited elsewhere in the doc), also update the relevant row in "Ground-Truth Source-Code Verified Constants" (§1) so it doesn't silently drift out of date.
+
+Do this before ending the turn, not "later." Also: when the user has approved a commit, reference the issue number in the commit message (e.g. `Fix ISSUE-011: segmenter vocab gap...`) so `git log` independently corroborates the audit log — the log and git history should never diverge.

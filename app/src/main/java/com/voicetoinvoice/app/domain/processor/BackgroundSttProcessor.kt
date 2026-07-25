@@ -331,44 +331,70 @@ class BackgroundSttProcessor(
 
                         val item = saleResult.matchedItem
 
-                        // Smart Auto-Confirm Logic
-                        val isAutoConfirmable = item != null &&
-                                saleResult.confidence >= 0.80f &&
-                                !saleResult.isPendingPrice &&
-                                saleResult.estimatedTotal > 0.0 &&
-                                !saleResult.isSanityFlagged
+                        // RATE_UPDATE vs BULK_SALE_TOTAL vs NONE Auto-Confirm Logic
+                        if (saleResult.priceIntent == com.voicetoinvoice.app.domain.parser.PriceIntent.RATE_UPDATE) {
+                            val isRateUpdateValid = item != null && !saleResult.isSanityFlagged && saleResult.updatedUnitPrice > 0.0
 
-                        val itemOutcomeJson = JSONObject().apply {
-                            put("itemName", item?.name ?: "Unrecognized Item")
-                            put("matchedCatalogId", item?.id ?: JSONObject.NULL)
-                            put("quantity", saleResult.quantity)
-                            put("unit", saleResult.unit)
-                            put("estimatedTotal", saleResult.estimatedTotal)
-                            put("confidence", saleResult.confidence)
-                            put("isSanityFlagged", saleResult.isSanityFlagged)
-                            put("autoConfirmedToLedger", isAutoConfirmable)
-                        }
-                        outcomeArray.put(itemOutcomeJson)
+                            val itemOutcomeJson = JSONObject().apply {
+                                put("itemName", item?.name ?: "Unrecognized Item")
+                                put("matchedCatalogId", item?.id ?: JSONObject.NULL)
+                                put("outcomeType", "RATE_UPDATE")
+                                put("updatedUnitPrice", saleResult.updatedUnitPrice)
+                                put("confidence", saleResult.confidence)
+                                put("isSanityFlagged", saleResult.isSanityFlagged)
+                                put("autoConfirmedToLedger", false)
+                            }
+                            outcomeArray.put(itemOutcomeJson)
 
-                        if (isAutoConfirmable) {
-                            val txRecord = TransactionRecord(
-                                itemId = item!!.id,
-                                itemName = item.name,
-                                quantity = saleResult.quantity,
-                                priceAtSale = item.price,
-                                total = saleResult.estimatedTotal,
-                                paymentMode = PaymentMode.CASH,
-                                source = TransactionSource.VOICE,
-                                rawTranscript = saleResult.rawTranscript,
-                                audioFilePath = job.audioFilePath,
-                                jobId = job.id,
-                                audioCloudUrl = "${SupabaseConfig.SUPABASE_URL}/storage/v1/object/public/voice-recordings/${job.id}.wav"
-                            )
-                            db.transactionDao().insert(txRecord)
+                            if (isRateUpdateValid && item != null) {
+                                db.catalogDao().insertOrUpdate(item.copy(price = saleResult.updatedUnitPrice, synced = false))
+                            }
+                        } else {
+                            val isAutoConfirmable = item != null &&
+                                    saleResult.confidence >= 0.80f &&
+                                    !saleResult.isPendingPrice &&
+                                    saleResult.estimatedTotal > 0.0 &&
+                                    !saleResult.isSanityFlagged
 
-                            // Async cloud sync transaction
-                            scope.launch(Dispatchers.IO) {
-                                try { cloudSyncManager.syncTransactionToCloud(txRecord) } catch (e: Exception) {}
+                            val itemOutcomeJson = JSONObject().apply {
+                                put("itemName", item?.name ?: "Unrecognized Item")
+                                put("matchedCatalogId", item?.id ?: JSONObject.NULL)
+                                put("quantity", saleResult.quantity)
+                                put("unit", saleResult.unit)
+                                put("estimatedTotal", saleResult.estimatedTotal)
+                                put("confidence", saleResult.confidence)
+                                put("isSanityFlagged", saleResult.isSanityFlagged)
+                                put("autoConfirmedToLedger", isAutoConfirmable)
+                            }
+                            outcomeArray.put(itemOutcomeJson)
+
+                            if (isAutoConfirmable && item != null) {
+                                val effectiveUnitPrice = if (saleResult.priceOverridden && saleResult.updatedUnitPrice > 0.0) saleResult.updatedUnitPrice else item.price
+
+                                val txRecord = TransactionRecord(
+                                    itemId = item.id,
+                                    itemName = item.name,
+                                    quantity = saleResult.quantity,
+                                    priceAtSale = effectiveUnitPrice,
+                                    total = saleResult.estimatedTotal,
+                                    paymentMode = PaymentMode.CASH,
+                                    source = TransactionSource.VOICE,
+                                    rawTranscript = saleResult.rawTranscript,
+                                    audioFilePath = job.audioFilePath,
+                                    jobId = job.id,
+                                    audioCloudUrl = "${SupabaseConfig.SUPABASE_URL}/storage/v1/object/public/voice-recordings/${job.id}.wav"
+                                )
+                                db.transactionDao().insert(txRecord)
+
+                                // Brand-new item exception: seed initial catalog price if standing catalog price was 0.0
+                                if (item.price == 0.0 && effectiveUnitPrice > 0.0) {
+                                    db.catalogDao().insertOrUpdate(item.copy(price = effectiveUnitPrice, synced = false))
+                                }
+
+                                // Async cloud sync transaction
+                                scope.launch(Dispatchers.IO) {
+                                    try { cloudSyncManager.syncTransactionToCloud(txRecord) } catch (e: Exception) {}
+                                }
                             }
                         }
                     }

@@ -86,9 +86,20 @@ function combinatorialFuzzySegmenter(
   const tokens = transcript.trim().split(/\s+/)
   const resolvedTokens: string[] = []
 
+  // Keep this list in sync with the Devanagari keys in indicAliasMap
+  // (app/src/main/java/com/voicetoinvoice/app/domain/matcher/FuzzyCatalogMatcher.kt) —
+  // that's the human-curated source of truth for Hindi produce/FMCG names. Without a
+  // matching entry here, a Hindi utterance for that item can never resolve correctly:
+  // catalogNames are stored in English (e.g. "Bhindi"), so edit-distance against a
+  // Devanagari transcript token never matches them, and the segmenter falls back to
+  // whatever *is* in this list — silently corrupting the word instead of leaving it alone.
   const catalogVocab = Array.from(new Set([
     ...catalogNames,
-    "सोना", "चांदी", "आलू", "प्याज", "टमाटर", "सेब", "घी", "पनीर", "दूध", "चीनी", "बैंगन", "मूंगफली", "काजू", "बादाम"
+    "सोना", "चांदी", "सेब", "दूध", "मूंगफली", "काजू", "बादाम",
+    "प्याज", "प्याज़", "टमाटर", "आलू", "अलू", "अदरक", "भिंडी", "धनिया", "मिर्च",
+    "गोभी", "बैंगन", "गाजर", "मटर", "खीरा", "पालक", "लहसुन", "ब्रोकली",
+    "गोल्ड", "ताज़ा", "सरस", "दही", "छाछ", "मट्ठा", "पनीर", "घी", "मक्खन", "बटर",
+    "अंडे", "अंडा", "इप्पी", "मैगी", "सर्फ", "आशीर्वाद", "बर्बन", "पॉन्ड्स", "चीनी", "शक्कर"
   ]))
 
   for (const token of tokens) {
@@ -163,12 +174,21 @@ function combinatorialFuzzySegmenter(
       }
     }
 
-    if (bestThreeWay && (!bestTwoWay || bestThreeWay.score <= bestTwoWay.score)) {
-      console.log(`Combinatorial Fuzzy Segmenter decompounded 3-way run-on token "${token}" -> ["${bestThreeWay.p1}", "${bestThreeWay.p2}", "${bestThreeWay.p3}"]`)
-      resolvedTokens.push(bestThreeWay.p1, bestThreeWay.p2, bestThreeWay.p3)
-    } else if (bestTwoWay) {
-      console.log(`Combinatorial Fuzzy Segmenter decompounded 2-way run-on token "${token}" -> ["${bestTwoWay.p1}", "${bestTwoWay.p2}"]`)
-      resolvedTokens.push(bestTwoWay.p1, bestTwoWay.p2)
+    // Confidence floor: each matched part is allowed dist <= 2, but a split where every
+    // part is maximally fuzzy is weak evidence, not a real correction. Requiring an
+    // average distance <= 1 per part means we only force a rewrite when the match is
+    // actually close — otherwise we leave the raw token alone and let the downstream
+    // AI interpretation step reason about it with full context, instead of the segmenter
+    // confidently rewriting it to the wrong word (e.g. "बिंडी" -> "घी" instead of "भिंडी").
+    const twoWayConfident = bestTwoWay && bestTwoWay.score <= 2
+    const threeWayConfident = bestThreeWay && bestThreeWay.score <= 3
+
+    if (threeWayConfident && (!twoWayConfident || bestThreeWay!.score <= bestTwoWay!.score)) {
+      console.log(`Combinatorial Fuzzy Segmenter decompounded 3-way run-on token "${token}" -> ["${bestThreeWay!.p1}", "${bestThreeWay!.p2}", "${bestThreeWay!.p3}"]`)
+      resolvedTokens.push(bestThreeWay!.p1, bestThreeWay!.p2, bestThreeWay!.p3)
+    } else if (twoWayConfident) {
+      console.log(`Combinatorial Fuzzy Segmenter decompounded 2-way run-on token "${token}" -> ["${bestTwoWay!.p1}", "${bestTwoWay!.p2}"]`)
+      resolvedTokens.push(bestTwoWay!.p1, bestTwoWay!.p2)
     } else {
       resolvedTokens.push(token)
     }
@@ -606,12 +626,27 @@ Rules:
 4. If a word still matches nothing after phonetic reasoning, keep it as a
    new item name (clean Hinglish transliteration) — never return empty.
 5. Report confidence per item: high (0.85+) for exact or phonetically matched catalog items; lower (0.4-0.7) for unlisted items.
+6. STT confuses aspirated/unaspirated consonant pairs constantly — this is
+   the single most common Hindi STT error, so weight it heavily when a raw
+   token almost-but-not-quite matches a catalog item:
+   क↔ख, ग↔घ, च↔छ, ज↔झ, ट↔ठ, ड↔ढ, त↔थ, द↔ध, प↔फ, ब↔भ.
+   Example: STT token "बिंडी" (unaspirated ब) against catalog item "Bhindi"
+   is a near-exact phonetic match (भिंडी, aspirated भ) — prefer it over a
+   dissimilar catalog item just because that item's name happens to be
+   closer in raw spelling.
+7. The "Preprocessed Transcript" below was produced by a separate rigid
+   rule-based segmenter, NOT by you — it can be confidently wrong, especially
+   for item names it doesn't recognize. Treat it as one hint among three, not
+   as ground truth. When it conflicts with what the two raw STT transcripts
+   plus your own phonetic/catalog reasoning suggest, trust your own reasoning
+   over the preprocessed transcript.
 
 Shop catalog: ${catalogContextStr}
-DUAL STT TRANSCRIPTIONS RECEIVED:
+DUAL STT TRANSCRIPTIONS RECEIVED (these are the actual audio-derived signal —
+weight them over the preprocessed transcript):
 - Grok STT Transcript: "${rawGrokTranscript || '(none)'}"
 - Sarvam AI STT Transcript: "${rawSarvamTranscript || '(none)'}"
-- Preprocessed Transcript: "${transcript || '(none)'}"
+- Preprocessed Transcript (rule-based guess, may be wrong — see rule 7): "${transcript || '(none)'}"
 
 Output ONLY valid JSON formatted as:
 {
@@ -637,7 +672,7 @@ Output ONLY valid JSON formatted as:
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            model: 'grok-beta',
+            model: 'grok-2-latest',
             messages: [{ role: 'system', content: multiPrompt }],
             temperature: 0
           }),

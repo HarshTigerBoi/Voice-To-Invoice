@@ -26,4 +26,10 @@ interface TransactionDao {
 
     @Query("UPDATE transactions SET synced = 1 WHERE id IN (:ids)")
     suspend fun markSynced(ids: List<String>)
+
+    @Query("SELECT * FROM transactions WHERE total = :amount AND timestamp >= :sinceMs AND paymentMode != 'UPI' ORDER BY timestamp DESC")
+    suspend fun getRecentTransactionsByAmount(amount: Double, sinceMs: Long): List<TransactionRecord>
+
+    @Query("UPDATE transactions SET paymentMode = 'UPI', synced = 0 WHERE id = :txId")
+    suspend fun markTransactionPaidViaUpi(txId: String)
 }
