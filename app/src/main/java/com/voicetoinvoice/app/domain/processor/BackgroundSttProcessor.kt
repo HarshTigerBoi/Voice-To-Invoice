@@ -125,7 +125,9 @@ class BackgroundSttProcessor(
                     traceObj.put("step_2_stt_proxy_response", sttJson)
 
                     // Step 3: Deterministic OrderingSegmenter
-                    val segResult = orderingSegmenter.segmentTranscript(transcript, pendingCarryoverQty)
+                    // Pass the live catalog so the phonetic lattice can use this shop's
+                    // own item names as split targets, not just the built-in vocabulary.
+                    val segResult = orderingSegmenter.segmentTranscript(transcript, pendingCarryoverQty, catalogNames)
                     pendingCarryoverQty = segResult.carryoverQty
                     val deterministicSegments = segResult.segments
                     val segJson = JSONObject().apply {

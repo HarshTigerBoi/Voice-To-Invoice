@@ -1,5 +1,14 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import {
+  segmentTranscript,
+  normalizeTranscript,
+  phoneticKey,
+  DEFAULT_ITEM_VOCAB,
+  HINDI_NUMBER_MAP,
+  UNIT_SET,
+  type RawItemSegment,
+} from './phonetic.ts'
 
 // Deno Deploy / Supabase Edge Runtime global declaration
 declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void }
@@ -8,6 +17,13 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
+
+// Model ids are env-configurable so they can be bumped without a redeploy of this
+// file. Defaults are the previously hardcoded values, so behaviour is unchanged until
+// the env var is set. `grok-2-latest` in particular is an old chat model and is a
+// known weak point in step 4 — set XAI_CHAT_MODEL to a current one.
+const XAI_CHAT_MODEL = Deno.env.get('XAI_CHAT_MODEL') || 'grok-2-latest'
+const SARVAM_STT_MODEL = Deno.env.get('SARVAM_STT_MODEL') || 'saarika:v2'
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -27,183 +43,144 @@ function getNullSafeShopId(shopIdRaw: string | null): string | null {
 }
 
 // -----------------------------------------------------------------------------
-// GENERALIZED COMBINATORIAL EDIT-DISTANCE FUZZY SEGMENTATION ENGINE
-// Pure mathematical edit-distance matching across Numbers, Units, & Catalog Items.
+// STT CALLS
+//
+// Both providers report a structured outcome rather than just a string. The previous
+// version swallowed every failure into an empty transcript, so a wrong model name, an
+// auth failure, a timeout, and genuine silence were all indistinguishable in the
+// diagnostic trace — the Sarvam leg of the ISSUE-020 trace came back "" with no
+// recorded reason anywhere. Never collapse an error into "" again.
 // -----------------------------------------------------------------------------
 
-function editDistance(a: string, b: string): number {
-  if (a === b) return 0
-  if (a.length === 0) return b.length
-  if (b.length === 0) return a.length
-
-  const matrix: number[][] = []
-  for (let i = 0; i <= b.length; i++) matrix[i] = [i]
-  for (let j = 0; j <= a.length; j++) matrix[0][j] = j
-
-  for (let i = 1; i <= b.length; i++) {
-    for (let j = 1; j <= a.length; j++) {
-      if (b.charAt(i - 1) === a.charAt(j - 1)) {
-        matrix[i][j] = matrix[i - 1][j - 1]
-      } else {
-        matrix[i][j] = Math.min(
-          matrix[i - 1][j - 1] + 1, // substitution
-          matrix[i][j - 1] + 1,     // insertion
-          matrix[i - 1][j] + 1      // deletion
-        )
-      }
-    }
-  }
-  return matrix[b.length][a.length]
+interface SttOutcome {
+  transcript: string
+  error: string | null
+  httpStatus: number | null
+  latencyMs: number
 }
 
-const CANONICAL_NUMBERS = ["एक", "दो", "तीन", "चार", "पांच", "पाँच", "छह", "सात", "आठ", "नौ", "दस", "आधा", "पाव", "डेढ़", "ढाई", "सवा"]
-const CANONICAL_UNITS = ["किलो", "ग्राम", "लीटर", "पैकेट", "पीस", "दर्जन"]
+const EMPTY_STT: SttOutcome = { transcript: '', error: 'not attempted (missing API key)', httpStatus: null, latencyMs: 0 }
 
-function fuzzyMatchVocab(token: string, vocab: string[], maxDist = 2): { canonical: string, dist: number } | null {
-  if (!token || token.length === 0) return null
-  let best: string | null = null
-  let minDist = maxDist + 1
+async function callGrokStt(
+  audioBuffer: ArrayBuffer,
+  jobId: string,
+  apiKey: string,
+  opts: { keyterms?: string[]; language?: string | null; timeoutMs?: number } = {}
+): Promise<SttOutcome> {
+  const started = Date.now()
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), opts.timeoutMs ?? 8000)
+  try {
+    const bytes = new Uint8Array(audioBuffer.slice(0))
+    const file = new File([bytes], `${jobId}.wav`, { type: 'audio/wav' })
+    const form = new FormData()
+    form.append('file', file, `${jobId}.wav`)
+    if (opts.language) form.append('language', opts.language)
+    for (const k of opts.keyterms ?? []) form.append('keyterm', k)
 
-  for (const item of vocab) {
-    const dist = editDistance(token.toLowerCase(), item.toLowerCase())
-    if (dist < minDist) {
-      minDist = dist
-      best = item
+    const resp = await fetch('https://api.x.ai/v1/stt', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+      body: form,
+      signal: controller.signal,
+    })
+    clearTimeout(timeoutId)
+    const latencyMs = Date.now() - started
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '')
+      return { transcript: '', error: `HTTP ${resp.status}: ${body.slice(0, 300)}`, httpStatus: resp.status, latencyMs }
     }
+    const data = await resp.json()
+    return { transcript: (data.text || data.transcript || '').trim(), error: null, httpStatus: resp.status, latencyMs }
+  } catch (e: any) {
+    clearTimeout(timeoutId)
+    const msg = e?.name === 'AbortError' ? `timeout after ${opts.timeoutMs ?? 8000}ms` : (e?.message || String(e))
+    return { transcript: '', error: msg, httpStatus: null, latencyMs: Date.now() - started }
   }
-
-  if (best && minDist <= maxDist) {
-    return { canonical: best, dist: minDist }
-  }
-  return null
 }
 
-function combinatorialFuzzySegmenter(
-  transcript: string,
-  catalogNames: string[]
-): string {
-  if (!transcript) return ""
-  const tokens = transcript.trim().split(/\s+/)
-  const resolvedTokens: string[] = []
+async function callSarvamStt(
+  audioBuffer: ArrayBuffer,
+  jobId: string,
+  apiKey: string,
+  opts: { model?: string; languageCode?: string; timeoutMs?: number } = {}
+): Promise<SttOutcome> {
+  const started = Date.now()
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), opts.timeoutMs ?? 8000)
+  try {
+    const bytes = new Uint8Array(audioBuffer.slice(0))
+    const file = new File([bytes], `${jobId}.wav`, { type: 'audio/wav' })
+    const form = new FormData()
+    form.append('file', file, `${jobId}.wav`)
+    form.append('language_code', opts.languageCode ?? 'hi-IN')
+    form.append('model', opts.model ?? SARVAM_STT_MODEL)
 
-  // Keep this list in sync with the Devanagari keys in indicAliasMap
-  // (app/src/main/java/com/voicetoinvoice/app/domain/matcher/FuzzyCatalogMatcher.kt) —
-  // that's the human-curated source of truth for Hindi produce/FMCG names. Without a
-  // matching entry here, a Hindi utterance for that item can never resolve correctly:
-  // catalogNames are stored in English (e.g. "Bhindi"), so edit-distance against a
-  // Devanagari transcript token never matches them, and the segmenter falls back to
-  // whatever *is* in this list — silently corrupting the word instead of leaving it alone.
-  const catalogVocab = Array.from(new Set([
-    ...catalogNames,
-    "सोना", "चांदी", "सेब", "दूध", "मूंगफली", "काजू", "बादाम",
-    "प्याज", "प्याज़", "टमाटर", "आलू", "अलू", "अदरक", "भिंडी", "धनिया", "मिर्च",
-    "गोभी", "बैंगन", "गाजर", "मटर", "खीरा", "पालक", "लहसुन", "ब्रोकली",
-    "गोल्ड", "ताज़ा", "सरस", "दही", "छाछ", "मट्ठा", "पनीर", "घी", "मक्खन", "बटर",
-    "अंडे", "अंडा", "इप्पी", "मैगी", "सर्फ", "आशीर्वाद", "बर्बन", "पॉन्ड्स", "चीनी", "शक्कर"
-  ]))
+    const resp = await fetch('https://api.sarvam.ai/speech-to-text', {
+      method: 'POST',
+      headers: { 'api-subscription-key': apiKey },
+      body: form,
+      signal: controller.signal,
+    })
+    clearTimeout(timeoutId)
+    const latencyMs = Date.now() - started
 
-  for (const token of tokens) {
-    const lowerT = token.toLowerCase()
-
-    // 1. Direct single-token check against Numbers, Units, Catalog — cost-based,
-    // not first-match-wins. Checking numbers unconditionally first used to mean
-    // a token like "लो" (STT clipping the leading "कि" off "किलो" in fast speech,
-    // e.g. "एक किलो" -> "एकलो" -> heard as "एक लो") got corrected to the number
-    // "दो" (edit distance 1) before ever being compared against unit words —
-    // even though "लो" is exactly the trailing remnant of "किलो" (an elision,
-    // not a typo). Scoring every candidate and taking the cheapest lets an
-    // elided-unit reading (cost 0.5) beat a technically-closer-by-raw-distance
-    // number misread (cost 1). See ISSUE-019 in Docs/audit.md.
-    const numMatch = fuzzyMatchVocab(lowerT, CANONICAL_NUMBERS, 1)
-    const unitMatch = fuzzyMatchVocab(lowerT, CANONICAL_UNITS, 1)
-    const unitElision = lowerT.length >= 2
-      ? CANONICAL_UNITS.find(u => u.length > lowerT.length && u.endsWith(lowerT))
-      : undefined
-    const catMatch = fuzzyMatchVocab(lowerT, catalogVocab, 1)
-
-    const singleTokenCandidates: { canonical: string, cost: number }[] = []
-    if (numMatch) singleTokenCandidates.push({ canonical: numMatch.canonical, cost: numMatch.dist })
-    if (unitElision) singleTokenCandidates.push({ canonical: unitElision, cost: 0.5 })
-    if (unitMatch) singleTokenCandidates.push({ canonical: unitMatch.canonical, cost: unitMatch.dist })
-    if (catMatch) singleTokenCandidates.push({ canonical: catMatch.canonical, cost: catMatch.dist })
-
-    if (singleTokenCandidates.length > 0) {
-      const best = singleTokenCandidates.reduce((a, b) => (b.cost < a.cost ? b : a))
-      resolvedTokens.push(best.canonical)
-      continue
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '')
+      return { transcript: '', error: `HTTP ${resp.status}: ${body.slice(0, 300)}`, httpStatus: resp.status, latencyMs }
     }
-
-    // 2. Evaluate 2-Way Combinatorial Splits (Number+Unit or Unit+Item)
-    let bestTwoWay: { p1: string, p2: string, score: number } | null = null
-
-    for (let i = 1; i <= lowerT.length - 1; i++) {
-      const part1 = lowerT.slice(0, i)
-      const part2 = lowerT.slice(i)
-
-      // Case A: Number + Unit (e.g. "चरगलो" -> "चार" + "किलो")
-      const m1Num = fuzzyMatchVocab(part1, CANONICAL_NUMBERS, 2)
-      const m2Unit = fuzzyMatchVocab(part2, CANONICAL_UNITS, 2)
-      if (m1Num && m2Unit) {
-        const score = m1Num.dist + m2Unit.dist
-        if (!bestTwoWay || score < bestTwoWay.score) {
-          bestTwoWay = { p1: m1Num.canonical, p2: m2Unit.canonical, score }
-        }
-      }
-
-      // Case B: Unit + Item (e.g. "ग्लोसोना" -> "किलो" + "सोना")
-      const m1Unit = fuzzyMatchVocab(part1, CANONICAL_UNITS, 2)
-      const m2Cat = fuzzyMatchVocab(part2, catalogVocab, 2)
-      if (m1Unit && m2Cat) {
-        const score = m1Unit.dist + m2Cat.dist
-        if (!bestTwoWay || score < bestTwoWay.score) {
-          bestTwoWay = { p1: m1Unit.canonical, p2: m2Cat.canonical, score }
-        }
-      }
-    }
-
-    // 3. Evaluate 3-Way Combinatorial Splits (Number + Unit + Item)
-    let bestThreeWay: { p1: string, p2: string, p3: string, score: number } | null = null
-
-    for (let i = 1; i <= lowerT.length - 2; i++) {
-      for (let j = i + 1; j <= lowerT.length - 1; j++) {
-        const p1 = lowerT.slice(0, i)
-        const p2 = lowerT.slice(i, j)
-        const p3 = lowerT.slice(j)
-
-        const m1 = fuzzyMatchVocab(p1, CANONICAL_NUMBERS, 2)
-        const m2 = fuzzyMatchVocab(p2, CANONICAL_UNITS, 2)
-        const m3 = fuzzyMatchVocab(p3, catalogVocab, 2)
-
-        if (m1 && m2 && m3) {
-          const score = m1.dist + m2.dist + m3.dist
-          if (!bestThreeWay || score < bestThreeWay.score) {
-            bestThreeWay = { p1: m1.canonical, p2: m2.canonical, p3: m3.canonical, score }
-          }
-        }
-      }
-    }
-
-    // Confidence floor: each matched part is allowed dist <= 2, but a split where every
-    // part is maximally fuzzy is weak evidence, not a real correction. Requiring an
-    // average distance <= 1 per part means we only force a rewrite when the match is
-    // actually close — otherwise we leave the raw token alone and let the downstream
-    // AI interpretation step reason about it with full context, instead of the segmenter
-    // confidently rewriting it to the wrong word (e.g. "बिंडी" -> "घी" instead of "भिंडी").
-    const twoWayConfident = bestTwoWay && bestTwoWay.score <= 2
-    const threeWayConfident = bestThreeWay && bestThreeWay.score <= 3
-
-    if (threeWayConfident && (!twoWayConfident || bestThreeWay!.score <= bestTwoWay!.score)) {
-      console.log(`Combinatorial Fuzzy Segmenter decompounded 3-way run-on token "${token}" -> ["${bestThreeWay!.p1}", "${bestThreeWay!.p2}", "${bestThreeWay!.p3}"]`)
-      resolvedTokens.push(bestThreeWay!.p1, bestThreeWay!.p2, bestThreeWay!.p3)
-    } else if (twoWayConfident) {
-      console.log(`Combinatorial Fuzzy Segmenter decompounded 2-way run-on token "${token}" -> ["${bestTwoWay!.p1}", "${bestTwoWay!.p2}"]`)
-      resolvedTokens.push(bestTwoWay!.p1, bestTwoWay!.p2)
-    } else {
-      resolvedTokens.push(token)
-    }
+    const data = await resp.json()
+    return { transcript: (data.transcript || data.text || '').trim(), error: null, httpStatus: resp.status, latencyMs }
+  } catch (e: any) {
+    clearTimeout(timeoutId)
+    const msg = e?.name === 'AbortError' ? `timeout after ${opts.timeoutMs ?? 8000}ms` : (e?.message || String(e))
+    return { transcript: '', error: msg, httpStatus: null, latencyMs: Date.now() - started }
   }
+}
 
-  return resolvedTokens.join(" ")
+// -----------------------------------------------------------------------------
+// TRANSCRIPT SCORING
+//
+// Used to decide whether a re-decode pass actually improved on the first attempt.
+// A good shopkeeper transcript resolves to at least one segment carrying a real
+// quantity, a real unit, and an item the vocabulary recognizes.
+// -----------------------------------------------------------------------------
+
+function scoreTranscript(transcript: string, catalogNames: string[]): { score: number; segments: RawItemSegment[] } {
+  if (!transcript || !transcript.trim()) return { score: 0, segments: [] }
+  const { segments } = segmentTranscript(transcript, catalogNames)
+  if (!segments.length) return { score: 0, segments: [] }
+
+  const itemKeys = new Set([...DEFAULT_ITEM_VOCAB, ...catalogNames].map(n => phoneticKey(n)).filter(Boolean))
+
+  let score = 0
+  for (const seg of segments) {
+    // A recognized item is the strongest signal that the audio was understood.
+    const name = seg.itemTokens.join(' ')
+    if (itemKeys.has(phoneticKey(name))) score += 3
+    // An explicit unit means the [QTY][UNIT][ITEM] frame was actually found, rather
+    // than the segmenter falling back to its PACKET default.
+    if (seg.unit && seg.unit !== 'PACKET') score += 2
+    if (seg.quantity && seg.quantity !== 1.0) score += 1
+    if (seg.isSanityFlagged) score -= 2
+  }
+  return { score, segments }
+}
+
+/** True when nothing in the transcript resolves to known shopkeeper vocabulary —
+ *  the signature of STT decoding the audio into the wrong language entirely
+ *  ("तीन किलो सेब" -> "tinggal sebab"). */
+function looksUnrecognizable(transcript: string, catalogNames: string[]): boolean {
+  if (!transcript || !transcript.trim()) return true
+  const known = new Set(
+    [...Object.keys(HINDI_NUMBER_MAP), ...UNIT_SET, ...DEFAULT_ITEM_VOCAB, ...catalogNames]
+      .map(n => phoneticKey(n)).filter(Boolean)
+  )
+  for (const tok of transcript.trim().split(/\s+/)) {
+    if (known.has(phoneticKey(tok))) return false
+  }
+  return true
 }
 
 serve(async (req) => {
@@ -427,184 +404,124 @@ async function processVoiceJob(args: {
     ]
 
     const fullCatalogList = Array.from(new Set([...catalogNames, ...defaultCatalogFallback]))
-    const keyterms = Array.from(new Set([...fullCatalogList, ...CANONICAL_NUMBERS, ...CANONICAL_UNITS])).slice(0, 100)
+
+    // Keyterm biasing only works if the terms are in the script STT is going to emit.
+    // Sending English-only keyterms while asking for Hindi meant the bias was largely
+    // wasted, so send the Devanagari forms too (DEFAULT_ITEM_VOCAB carries both).
+    const keyterms = Array.from(new Set([
+      ...fullCatalogList,
+      ...DEFAULT_ITEM_VOCAB,
+      ...Object.keys(HINDI_NUMBER_MAP).filter(k => k.length >= 2 && !/^\d+$/.test(k)),
+      ...UNIT_SET,
+    ])).slice(0, 100)
 
     // Step 2: Dual concurrent STT (Grok + Sarvam), 8s timeout each, run in parallel
     const xaiApiKey = Deno.env.get('XAI_API_KEY') || ''
     const sarvamApiKey = Deno.env.get('SARVAM_API_KEY') || ''
 
-    let rawGrokTranscript = ""
-    let rawSarvamTranscript = ""
-    let sttProvider = "none"
+    const [grokOutcome, sarvamOutcome] = await Promise.all([
+      xaiApiKey
+        ? callGrokStt(audioBuffer, jobId, xaiApiKey, { keyterms, language: 'hi' })
+        : Promise.resolve(EMPTY_STT),
+      sarvamApiKey
+        ? callSarvamStt(audioBuffer, jobId, sarvamApiKey, { model: SARVAM_STT_MODEL })
+        : Promise.resolve(EMPTY_STT),
+    ])
 
-    const sttPromises: Promise<void>[] = []
+    if (grokOutcome.error) console.warn(`Grok STT failed for ${jobId}: ${grokOutcome.error}`)
+    if (sarvamOutcome.error) console.warn(`Sarvam STT failed for ${jobId}: ${sarvamOutcome.error}`)
 
-    if (xaiApiKey) {
-      sttPromises.push((async () => {
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 8000)
-        try {
-          const grokBytes = new Uint8Array(audioBuffer.slice(0))
-          const grokFile = new File([grokBytes], `${jobId}.wav`, { type: 'audio/wav' })
-          const xaiForm = new FormData()
-          xaiForm.append('file', grokFile, `${jobId}.wav`)
-          xaiForm.append('language', 'hi')
-          keyterms.forEach(k => xaiForm.append('keyterm', k))
+    let rawGrokTranscript = grokOutcome.transcript
+    let rawSarvamTranscript = sarvamOutcome.transcript
 
-          const xaiResp = await fetch('https://api.x.ai/v1/stt', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${xaiApiKey}` },
-            body: xaiForm,
-            signal: controller.signal
-          })
-          clearTimeout(timeoutId)
+    const providerOf = (g: string, s: string) =>
+      g && s ? 'grok+sarvam' : g ? 'grok' : s ? 'sarvam' : 'none'
+    let sttProvider = providerOf(rawGrokTranscript, rawSarvamTranscript)
 
-          if (xaiResp.ok) {
-            const xaiData = await xaiResp.json()
-            rawGrokTranscript = (xaiData.text || xaiData.transcript || "").trim()
-            console.log(`Grok STT transcribed: "${rawGrokTranscript}"`)
-          } else {
-            console.warn(`Grok STT returned HTTP ${xaiResp.status}:`, await xaiResp.text())
-          }
-        } catch (e: any) {
-          clearTimeout(timeoutId)
-          console.warn("Grok STT fetch warning (degrading cleanly):", e.name === 'AbortError' ? 'STT Timeout (8s limit)' : e.message)
+    // Step 3: Phonetic, grammar-aware segmentation (replaces the old Devanagari-only
+    // orthographic fuzzy segmenter — see phonetic.ts header and ISSUE-020).
+    const grokScored = scoreTranscript(rawGrokTranscript, fullCatalogList)
+    const sarvamScored = scoreTranscript(rawSarvamTranscript, fullCatalogList)
+
+    // Pick whichever STT stream actually parses as a shopkeeper order, rather than
+    // always preferring Grok. Previously Grok won unconditionally, so a confident
+    // Grok mis-decode buried a correct Sarvam transcript.
+    let chosenRaw = grokScored.score >= sarvamScored.score ? rawGrokTranscript : rawSarvamTranscript
+    let step3Segments: RawItemSegment[] = grokScored.score >= sarvamScored.score ? grokScored.segments : sarvamScored.segments
+    let bestScore = Math.max(grokScored.score, sarvamScored.score)
+    let transcript = chosenRaw ? normalizeTranscript(chosenRaw, fullCatalogList) : ''
+
+    // Step 5 (runs before AI interpretation so the AI sees the best available audio
+    // reading): ADAPTIVE RE-DECODE.
+    //
+    // This used to be a no-op that echoed the same two transcripts back alongside a
+    // fabricated "EXPANDED_300MS_AUDIO_WINDOW_EVALUATED" status without ever calling
+    // STT again — the trace reported a recovery pass that never happened. It now
+    // genuinely re-transcribes with different decode parameters when the first pass
+    // produced nothing the shopkeeper vocabulary recognizes, which is exactly the
+    // ISSUE-020 signature (STT decoding Hindi audio into another language's lexicon).
+    const passesDetail: any[] = []
+    // Trigger on the PARSE RESULT, not on how foreign the raw text looks. "tinggal
+    // sebab" reads as gibberish but now segments correctly to 3 KG Seb, and paying for
+    // a second round-trip on an already-solved job would just add latency. A score
+    // below 3 means we got neither a recognized item nor a usable quantity+unit frame.
+    const rawLooksUnrecognizable = looksUnrecognizable(chosenRaw, fullCatalogList)
+    const needsReDecode = bestScore < 3
+
+    if (needsReDecode && (xaiApiKey || sarvamApiKey)) {
+      // Keyterm biasing can itself drag a decode toward the wrong word, and the
+      // language hint can lock in a wrong language guess — so vary both.
+      const [grokRetry, sarvamRetry] = await Promise.all([
+        xaiApiKey
+          ? callGrokStt(audioBuffer, jobId, xaiApiKey, { keyterms: [], language: null, timeoutMs: 8000 })
+          : Promise.resolve(EMPTY_STT),
+        sarvamApiKey
+          ? callSarvamStt(audioBuffer, jobId, sarvamApiKey, { model: SARVAM_STT_MODEL, languageCode: 'unknown' })
+          : Promise.resolve(EMPTY_STT),
+      ])
+
+      const candidates = [
+        { label: 'grok_no_keyterms_no_language', outcome: grokRetry },
+        { label: 'sarvam_language_autodetect', outcome: sarvamRetry },
+      ]
+
+      for (const c of candidates) {
+        const scored = scoreTranscript(c.outcome.transcript, fullCatalogList)
+        passesDetail.push({
+          passNumber: passesDetail.length + 1,
+          variant: c.label,
+          transcript: c.outcome.transcript,
+          error: c.outcome.error,
+          httpStatus: c.outcome.httpStatus,
+          latencyMs: c.outcome.latencyMs,
+          score: scored.score,
+          adopted: false,
+        })
+        if (scored.score > bestScore) {
+          bestScore = scored.score
+          chosenRaw = c.outcome.transcript
+          step3Segments = scored.segments
+          transcript = normalizeTranscript(c.outcome.transcript, fullCatalogList)
+          passesDetail[passesDetail.length - 1].adopted = true
+          // Surface the winning re-decode to the AI step as well.
+          if (c.label.startsWith('grok')) rawGrokTranscript = c.outcome.transcript
+          else rawSarvamTranscript = c.outcome.transcript
+          sttProvider = providerOf(rawGrokTranscript, rawSarvamTranscript) + '+redecode'
         }
-      })())
-    }
-
-    if (sarvamApiKey) {
-      sttPromises.push((async () => {
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 8000)
-        try {
-          const sarvamBytes = new Uint8Array(audioBuffer.slice(0))
-          const sarvamFile = new File([sarvamBytes], `${jobId}.wav`, { type: 'audio/wav' })
-          const sarvamForm = new FormData()
-          sarvamForm.append('file', sarvamFile, `${jobId}.wav`)
-          sarvamForm.append('language_code', 'hi-IN')
-          sarvamForm.append('model', 'saarika:v2')
-
-          const sarvamResp = await fetch('https://api.sarvam.ai/speech-to-text', {
-            method: 'POST',
-            headers: { 'api-subscription-key': sarvamApiKey },
-            body: sarvamForm,
-            signal: controller.signal
-          })
-          clearTimeout(timeoutId)
-
-          if (sarvamResp.ok) {
-            const sarvamData = await sarvamResp.json()
-            rawSarvamTranscript = (sarvamData.transcript || sarvamData.text || "").trim()
-            console.log(`Sarvam AI STT transcribed: "${rawSarvamTranscript}"`)
-          } else {
-            const errBody = await sarvamResp.text()
-            console.warn(`Sarvam STT returned HTTP ${sarvamResp.status}: ${errBody}`)
-          }
-        } catch (e: any) {
-          clearTimeout(timeoutId)
-          console.warn("Sarvam STT fetch warning (degrading cleanly):", e.name === 'AbortError' ? 'STT Timeout (8s limit)' : e.message)
-        }
-      })())
-    }
-
-    await Promise.all(sttPromises)
-
-    if (rawGrokTranscript && rawSarvamTranscript) {
-      sttProvider = "grok+sarvam"
-    } else if (rawGrokTranscript) {
-      sttProvider = "grok"
-    } else if (rawSarvamTranscript) {
-      sttProvider = "sarvam"
-    }
-
-    // Apply GENERALIZED COMBINATORIAL EDIT-DISTANCE FUZZY SEGMENTER
-    const grokTranscript = combinatorialFuzzySegmenter(rawGrokTranscript, fullCatalogList)
-    const sarvamTranscript = combinatorialFuzzySegmenter(rawSarvamTranscript, fullCatalogList)
-    const transcript = grokTranscript || sarvamTranscript || ""
-
-    console.log(`Fuzzy segmented transcript: "${transcript}" (Grok: "${grokTranscript}", Sarvam: "${sarvamTranscript}")`)
-
-    // Step 3: Deterministic ordering segmenter
-    let step3Segments: any[] = []
-    try {
-      if (transcript && transcript.trim().length > 0) {
-        const numberMap: Record<string, number> = {
-          "एक": 1, "ek": 1, "1": 1, "दो": 2, "do": 2, "2": 2, "तीन": 3, "teen": 3, "3": 3,
-          "चार": 4, "chaar": 4, "4": 4, "पांच": 5, "पाँच": 5, "paanch": 5, "5": 5,
-          "छह": 6, "छे": 6, "6": 6, "सात": 7, "saat": 7, "7": 7, "आठ": 8, "aath": 8, "8": 8,
-          "नौ": 9, "nau": 9, "9": 9, "दस": 10, "das": 10, "10": 10, "आधा": 0.5, "पाव": 0.25, "ढाई": 2.5, "डेढ़": 1.5
-        }
-
-        const cleanT = transcript.trim()
-        const tokens = cleanT.split(/\s+/)
-        let currentQty = 1.0
-        let currentUnit = "PACKET"
-        let currentItemTokens: string[] = []
-        // Mirrors OrderingSegmenter.kt's ambiguousDoubleQty tracking: the Kotlin
-        // client already flags "two quantities in a row with no item between
-        // them" instead of silently overwriting the first one; this was the
-        // one client/server behavior gap, so port it here too (ISSUE-019).
-        let hasPendingQty = false
-        let ambiguousDoubleQty = false
-
-        const flushSegment = () => {
-          if (currentItemTokens.length > 0) {
-            const rawName = currentItemTokens.join(" ").trim()
-            step3Segments.push({
-              rawSegmentText: `${currentQty} ${currentUnit} ${rawName}`,
-              quantity: currentQty,
-              unit: currentUnit,
-              itemTokens: [rawName],
-              isSanityFlagged: ambiguousDoubleQty
-            })
-          }
-          currentItemTokens = []
-          currentUnit = "PACKET"
-          hasPendingQty = false
-          ambiguousDoubleQty = false
-        }
-
-        for (let i = 0; i < tokens.length; i++) {
-          const token = tokens[i].toLowerCase()
-          const numericVal = numberMap[token] !== undefined
-            ? numberMap[token]
-            : (/^\d+(\.\d+)?$/.test(token) ? parseFloat(token) : null)
-
-          if (numericVal !== null) {
-            if (currentItemTokens.length > 0) {
-              flushSegment()
-            } else if (hasPendingQty) {
-              ambiguousDoubleQty = true
-            }
-            currentQty = numericVal
-            hasPendingQty = true
-          } else if (["किलो", "kg", "kilo"].includes(token)) {
-            currentUnit = "KG"
-          } else if (["ग्राम", "gm", "g"].includes(token)) {
-            currentUnit = "GRAM"
-          } else if (["लीटर", "l", "litre"].includes(token)) {
-            currentUnit = "LITRE"
-          } else if (["पैकेट", "pkt"].includes(token)) {
-            currentUnit = "PACKET"
-          } else {
-            currentItemTokens.push(tokens[i])
-          }
-        }
-
-        flushSegment()
-        console.log(`Step 3 Segmenter extracted ${step3Segments.length} segments from transcript: "${transcript}"`)
       }
-    } catch (segErr) {
-      console.error(`Step 3 Segmenter error:`, segErr)
+      console.log(`Re-decode for ${jobId}: ${passesDetail.length} variants, bestScore now ${bestScore}`)
     }
+
+    console.log(`Segmented transcript: "${transcript}" (Grok: "${rawGrokTranscript}", Sarvam: "${rawSarvamTranscript}", score ${bestScore})`)
 
     // Step 4: Multi-item interpretation via Grok AI using Phonetic-Aware Shopkeeper System Prompt
     const catalogContextStr = fullCatalogList.join(', ')
 
     let parsedRawItems: any[] = []
+    let aiError: string | null = null
+
     if ((rawGrokTranscript || rawSarvamTranscript || transcript) && xaiApiKey) {
-      const multiPrompt = `You are a phonetic-aware parser for an Indian shopkeeper's voice orders.
+      const systemPrompt = `You are a phonetic-aware parser for an Indian shopkeeper's voice orders.
 Shopkeepers speak rapidly in Hindi, Hinglish (romanized Hindi), or English —
 often mixed in the same sentence, often without pauses between words.
 
@@ -613,6 +530,12 @@ commonly distorts it:
 - drops vowel matras (चार → चर, तीन → तिन)
 - fuses adjacent words when spoken fast (किलो सोना → ग्लोसोना, चार किलो → चरगलो)
 - confuses similar-sounding consonants (क↔ग, ब↔प, स↔श)
+- sometimes decodes Hindi audio into ANOTHER LANGUAGE's spelling entirely.
+  Real example: "तीन किलो सेब" (3 kg apples) came back as the Malay-looking
+  "tinggal sebab". Read such output PHONETICALLY, not semantically — "tinggal"
+  is "teen kilo" and "sebab" is "seb", regardless of what those strings mean
+  in some other language. NEVER treat a foreign word's dictionary meaning as
+  the shopkeeper's intent.
 
 Every order ALWAYS follows this pattern, repeated per item:
 [QUANTITY] [UNIT] [ITEM NAME]
@@ -626,7 +549,7 @@ Rules:
    - Numbers: एक/1/ek, दो/2/do, तीन/3/teen, चार/4/chaar, पांच/5/paanch, आधा/0.5, पाव/0.25, ढाई/2.5, डेढ़/1.5
    - Units: किलो/kg/kilo, ग्राम/gram/g, लीटर/litre/l, पैकेट/packet/pkt, Piece/pc/पीस, Dozen/दर्जन
    - Catalog items: ${catalogContextStr}
-2. If one token looks like multiple fused words (e.g. "चरगलो", "ग्लोसोना", "Tinggal benggan"),
+2. If one token looks like multiple fused words (e.g. "चरगलो", "ग्लोसोना", "tinggal"),
    split it at whichever point best matches known vocabulary — approximate
    phonetic closeness counts, exact spelling match is NOT required.
 3. Accept any mix of Devanagari, Hinglish, and English in the same sentence.
@@ -641,21 +564,13 @@ Rules:
    is a near-exact phonetic match (भिंडी, aspirated भ) — prefer it over a
    dissimilar catalog item just because that item's name happens to be
    closer in raw spelling.
-7. The "Preprocessed Transcript" below was produced by a separate rigid
-   rule-based segmenter, NOT by you — it can be confidently wrong, especially
-   for item names it doesn't recognize. Treat it as one hint among three, not
-   as ground truth. When it conflicts with what the two raw STT transcripts
-   plus your own phonetic/catalog reasoning suggest, trust your own reasoning
-   over the preprocessed transcript.
+7. The "Preprocessed Transcript" below was produced by a separate rule-based
+   phonetic segmenter, NOT by you. It is usually right but can be confidently
+   wrong, especially for item names outside its vocabulary. Treat it as one
+   hint among three. When it conflicts with what the raw STT transcripts plus
+   your own phonetic/catalog reasoning suggest, trust your own reasoning.
 
-Shop catalog: ${catalogContextStr}
-DUAL STT TRANSCRIPTIONS RECEIVED (these are the actual audio-derived signal —
-weight them over the preprocessed transcript):
-- Grok STT Transcript: "${rawGrokTranscript || '(none)'}"
-- Sarvam AI STT Transcript: "${rawSarvamTranscript || '(none)'}"
-- Preprocessed Transcript (rule-based guess, may be wrong — see rule 7): "${transcript || '(none)'}"
-
-Output ONLY valid JSON formatted as:
+Output ONLY valid JSON, no prose, in exactly this shape:
 {
   "parsed_items": [
     {
@@ -668,6 +583,16 @@ Output ONLY valid JSON formatted as:
   ]
 }`
 
+      const userPrompt = `Shop catalog: ${catalogContextStr}
+
+DUAL STT TRANSCRIPTIONS RECEIVED (these are the actual audio-derived signal —
+weight them over the preprocessed transcript):
+- Grok STT Transcript: "${rawGrokTranscript || '(none)'}"
+- Sarvam AI STT Transcript: "${rawSarvamTranscript || '(none)'}"
+- Preprocessed Transcript (rule-based phonetic segmenter, may be wrong — see rule 7): "${transcript || '(none)'}"
+
+Parse this order.`
+
       const chatController = new AbortController()
       const chatTimeoutId = setTimeout(() => chatController.abort(), 8000)
 
@@ -679,8 +604,15 @@ Output ONLY valid JSON formatted as:
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            model: 'grok-2-latest',
-            messages: [{ role: 'system', content: multiPrompt }],
+            model: XAI_CHAT_MODEL,
+            // A real user turn plus JSON mode: the previous version put everything in
+            // a single system message with no user turn and no response_format, which
+            // is a weak configuration for structured extraction.
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            response_format: { type: 'json_object' },
             temperature: 0
           }),
           signal: chatController.signal
@@ -699,31 +631,29 @@ Output ONLY valid JSON formatted as:
             }
           }
         } else {
-          console.error('Grok AI returned HTTP:', grokResp.status)
+          aiError = `HTTP ${grokResp.status}: ${(await grokResp.text().catch(() => '')).slice(0, 300)}`
+          console.error('Grok AI chat failed:', aiError)
         }
       } catch (aiErr: any) {
         clearTimeout(chatTimeoutId)
-        console.error('Grok AI multi-item interpretation error:', aiErr.name === 'AbortError' ? 'AI Timeout (8s limit)' : aiErr.message)
+        aiError = aiErr?.name === 'AbortError' ? 'AI Timeout (8s limit)' : (aiErr?.message || String(aiErr))
+        console.error('Grok AI multi-item interpretation error:', aiError)
       }
+    } else if (!xaiApiKey) {
+      aiError = 'XAI_API_KEY not configured'
     }
 
-    // Step 3 segmenter fallback if Grok AI failed
+    // Segmenter fallback if Grok AI failed or returned nothing.
     if (parsedRawItems.length === 0 && step3Segments.length > 0) {
-      console.log(`Using Step 3 Deterministic Segmenter output as fallback (${step3Segments.length} items)`)
-      const nameMap: Record<string, string> = {
-        "आलू": "Aaloo", "प्याज": "Pyaz", "टमाटर": "Tamatar", "सेब": "Seb",
-        "भिंडी": "Bhindi", "धनिया": "Dhaniya", "सोना": "Sona", "चांदी": "Chaandi",
-        "घी": "Ghee", "पनीर": "Paneer", "दूध": "Doodh", "चीनी": "Chini", "बैंगन": "Baingan", "पेंगन": "Baingan"
-      }
+      console.log(`Using deterministic phonetic segmenter output as fallback (${step3Segments.length} items)`)
       parsedRawItems = step3Segments.map(seg => {
-        const rawN = seg.itemTokens.join(" ").trim()
-        const normN = nameMap[rawN] || (rawN.charAt(0).toUpperCase() + rawN.slice(1))
+        const rawName = seg.itemTokens.join(' ').trim()
+        const normN = rawName.charAt(0).toUpperCase() + rawName.slice(1)
         // This path only runs when Grok's own multi-item interpretation was
-        // unavailable, so there's no AI double-check behind it — never
-        // self-report a confidence here. Leave it unset so the catalog-match
-        // step below (which knows whether this item is actually recognized)
-        // computes the real number, and cap it hard if the segmenter itself
-        // already flagged this as an ambiguous double-quantity read.
+        // unavailable, so there's no AI double-check behind it — never self-report a
+        // confidence here. Leave it unset so the catalog-match step below (which knows
+        // whether this item is actually recognized) computes the real number, and cap
+        // it hard if the segmenter itself flagged an ambiguous double-quantity read.
         return {
           item_name: normN,
           quantity: seg.quantity,
@@ -735,15 +665,24 @@ Output ONLY valid JSON formatted as:
       })
     }
 
-    // Catalog matching & price computation
+    // Catalog matching & price computation. Matching is phonetic so a Hindi-spoken
+    // item resolves to its English catalog row (सेब -> "Seb"), which plain substring
+    // matching could never do.
+    const catalogByKey = new Map<string, { id: string, name: string, price: number, unit_id: string }>()
+    for (const dbItem of dbCatalogItems) {
+      const k = phoneticKey(dbItem.name)
+      if (k && !catalogByKey.has(k)) catalogByKey.set(k, dbItem)
+    }
+
     const finalParsedItems: any[] = parsedRawItems.map(rawItem => {
       const rawName = (rawItem.item_name || "").trim()
       const lowerN = rawName.toLowerCase()
 
-      const matched = dbCatalogItems.find(dbItem => {
+      let matched = dbCatalogItems.find(dbItem => {
         const dbN = dbItem.name.toLowerCase().trim()
         return dbN === lowerN || lowerN.includes(dbN) || dbN.includes(lowerN)
       })
+      if (!matched) matched = catalogByKey.get(phoneticKey(rawName))
 
       const qty = rawItem.quantity || 1.0
       const priceAtSale = matched ? matched.price : (rawItem.price || 0.0)
@@ -774,7 +713,7 @@ Output ONLY valid JSON formatted as:
     // 1. confidence >= 0.80
     // 2. price_at_sale > 0.0 and total > 0.0 (No ₹0 sales in confirmed ledger!)
     // 3. valid, non-empty item name
-    const isAutoConfirmed = finalParsedItems.length > 0 && finalParsedItems.every(item => 
+    const isAutoConfirmed = finalParsedItems.length > 0 && finalParsedItems.every(item =>
       item.confidence >= 0.80 &&
       item.price_at_sale > 0.0 &&
       item.total > 0.0 &&
@@ -783,28 +722,6 @@ Output ONLY valid JSON formatted as:
       item.item_name !== "Unrecognized Item"
     )
     const finalStatus = isAutoConfirmed ? "AUTO_CONFIRMED" : "PARSED"
-
-    // Step 5: Lightweight adaptive audio expansion metadata evaluation
-    let passesExecuted = 0
-    let passesDetail: any[] = []
-
-    if (!isAutoConfirmed) {
-      passesExecuted = 1
-      const padMs = 300
-      const expandedStartMs = (metadata.pressStartMs || Date.now()) - padMs
-      const expandedEndMs = (metadata.releaseMs || Date.now()) + padMs
-
-      passesDetail.push({
-        passNumber: 1,
-        expansionAppliedMs: padMs,
-        audioWindowStartMs: expandedStartMs,
-        audioWindowEndMs: expandedEndMs,
-        grokTranscriptStream: grokTranscript,
-        sarvamTranscriptStream: sarvamTranscript,
-        status: "EXPANDED_300MS_AUDIO_WINDOW_EVALUATED",
-        resolution: "Cross-evaluated 300ms front/back padding against dual STT streams"
-      })
-    }
 
     // Assemble diagnostic trace
     const traceObj = {
@@ -823,10 +740,16 @@ Output ONLY valid JSON formatted as:
         sarvamTranscript: rawSarvamTranscript,
         provider: sttProvider,
         audioFileSize: audioBuffer.byteLength,
-        catalogKeytermsSentCount: fullCatalogList.length
+        catalogKeytermsSentCount: keyterms.length,
+        // Failures are recorded explicitly — an empty transcript is no longer
+        // indistinguishable from silence, a bad model name, or an auth failure.
+        grokStt: { error: grokOutcome.error, httpStatus: grokOutcome.httpStatus, latencyMs: grokOutcome.latencyMs },
+        sarvamStt: { error: sarvamOutcome.error, httpStatus: sarvamOutcome.httpStatus, latencyMs: sarvamOutcome.latencyMs, model: SARVAM_STT_MODEL },
+        transcriptScores: { grok: grokScored.score, sarvam: sarvamScored.score, adopted: bestScore },
       },
       step_3_deterministic_ordering_segmenter: {
         carryoverQty: null,
+        engine: 'phonetic_grammar_lattice_v2',
         segments: step3Segments.length > 0 ? step3Segments : finalParsedItems.map(item => ({
           rawSegmentText: `${item.quantity} ${item.unit} ${item.item_name}`,
           quantity: item.quantity,
@@ -837,9 +760,16 @@ Output ONLY valid JSON formatted as:
       },
       step_4_grok_ai_interpretation: finalParsedItems,
       step_5_adaptive_audio_expansion_engine: {
-        passesExecuted: passesExecuted,
-        passesDetail: passesDetail
+        // Honest reporting: this records what was actually re-run. When no re-decode
+        // was needed the pass list is empty rather than claiming a fabricated pass.
+        engine: 'adaptive_redecode_v2',
+        triggered: needsReDecode,
+        firstPassScore: bestScore,
+        rawLooksUnrecognizable,
+        passesExecuted: passesDetail.length,
+        passesDetail,
       },
+      step_4_ai_error: aiError,
       step_6_final_outcome: finalParsedItems.map(item => ({
         itemName: item.item_name,
         matchedCatalogId: item.item_id,
@@ -855,6 +785,12 @@ Output ONLY valid JSON formatted as:
 
     const firstItem = finalParsedItems[0] || null
 
+    const sttErrorSummary = [
+      grokOutcome.error ? `grok: ${grokOutcome.error}` : null,
+      sarvamOutcome.error ? `sarvam: ${sarvamOutcome.error}` : null,
+      aiError ? `ai: ${aiError}` : null,
+    ].filter(Boolean).join(' | ')
+
     // Final write to stt_job_logs (PERMANENT STORAGE - NEVER DELETED)
     const logPayload = {
       job_id: jobId,
@@ -869,7 +805,7 @@ Output ONLY valid JSON formatted as:
       parsed_unit: firstItem ? firstItem.unit : "PACKET",
       parsed_total: firstItem ? firstItem.total : 0.0,
       is_sanity_flagged: !isAutoConfirmed,
-      error_message: transcript ? "" : "Empty transcript from STT",
+      error_message: transcript ? sttErrorSummary : (sttErrorSummary || "Empty transcript from STT"),
       diagnostic_trace_json: JSON.stringify(traceObj),
       audio_cloud_url: audioCloudUrl
     }

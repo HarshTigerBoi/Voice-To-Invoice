@@ -2,6 +2,7 @@ package com.voicetoinvoice.app.network
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -10,24 +11,47 @@ import java.io.File
 import java.io.FileInputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
 
 sealed class SttResult {
     data class Success(val transcript: String) : SttResult()
     data class Error(val code: Int?, val message: String) : SttResult()
 }
 
+/**
+ * Synchronous-looking wrapper over the asynchronous `process-voice-job` Edge Function,
+ * used by [com.voicetoinvoice.app.domain.processor.BackgroundSttProcessor] — the
+ * in-app fallback that runs when WorkManager enqueue fails.
+ *
+ * This previously did not work at all. It posted `model` and `language_code` fields
+ * that `process-voice-job` never reads (it sets both server-side), and — fatally —
+ * omitted `jobId`, which that function requires, so every call was rejected with
+ * HTTP 400 before any audio was transcribed. Even had it been accepted, the function
+ * replies 202 `{status: "QUEUED"}` with no transcript, while this client only looked
+ * for a `transcript`/`text` field and reported "empty transcript" regardless.
+ *
+ * It now speaks the real contract: submit with a job id, then poll `stt_job_logs`
+ * until the background pipeline publishes a terminal status. See ISSUE-020.
+ */
 class SttProxyClient(
     private val endpointUrl: String = SupabaseConfig.STT_PROXY_ENDPOINT,
     private val anonKey: String = SupabaseConfig.SUPABASE_ANON_KEY
 ) {
 
     /**
-     * Sends recorded audio payload to Supabase Edge Function proxy (/functions/v1/stt-proxy).
-     * The Edge Function securely attaches the SARVAM_API_KEY server-side before invoking Sarvam STT API.
+     * Uploads [audioFile] and waits for the server-side pipeline to publish a result.
      *
-     * Returns SttResult.Success(transcript) or SttResult.Error(code, message).
+     * @param jobId defaults to a fresh UUID per call. This matters: the Edge Function
+     *   is idempotent per job id and replays the cached log for one it has already
+     *   processed, so reusing an id across the adaptive audio-expansion retries would
+     *   return the first pass's transcript for every subsequent pass.
      */
-    suspend fun transcribeAudioProxy(audioFile: File, catalogContext: List<String> = emptyList()): SttResult = withContext(Dispatchers.IO) {
+    suspend fun transcribeAudioProxy(
+        audioFile: File,
+        catalogContext: List<String> = emptyList(),
+        jobId: String = UUID.randomUUID().toString(),
+        shopId: String? = null
+    ): SttResult = withContext(Dispatchers.IO) {
         if (!audioFile.exists()) {
             return@withContext SttResult.Error(null, "Audio file does not exist")
         }
@@ -62,25 +86,25 @@ class SttProxyClient(
                     output.write(str.toByteArray(Charsets.UTF_8))
                 }
 
-                // Part 1: model parameter
-                writeString("$twoHyphens$boundary$lineEnd")
-                writeString("Content-Disposition: form-data; name=\"model\"$lineEnd$lineEnd")
-                writeString("saaras:v3$lineEnd")
-
-                // Part 2: language_code parameter
-                writeString("$twoHyphens$boundary$lineEnd")
-                writeString("Content-Disposition: form-data; name=\"language_code\"$lineEnd$lineEnd")
-                writeString("hi-IN$lineEnd")
-
-                // Part 3: catalogNames parameter for keyterm biasing
-                if (catalogContext.isNotEmpty()) {
-                    val catalogJson = JSONArray(catalogContext).toString()
+                fun writeField(name: String, value: String) {
                     writeString("$twoHyphens$boundary$lineEnd")
-                    writeString("Content-Disposition: form-data; name=\"catalogNames\"$lineEnd$lineEnd")
-                    writeString("$catalogJson$lineEnd")
+                    writeString("Content-Disposition: form-data; name=\"$name\"$lineEnd$lineEnd")
+                    writeString("$value$lineEnd")
                 }
 
-                // Part 4: file parameter
+                // Required by the Edge Function; its absence was the 400 above.
+                writeField("jobId", jobId)
+
+                SupabaseConfig.getNullSafeShopId(shopId)?.let { writeField("shopId", it) }
+
+                if (catalogContext.isNotEmpty()) {
+                    writeField("catalogNames", JSONArray(catalogContext).toString())
+                }
+
+                writeField("metadata", JSONObject().apply {
+                    put("recordedAtMs", System.currentTimeMillis())
+                }.toString())
+
                 val filename = if (audioFile.name.endsWith(".wav", ignoreCase = true)) audioFile.name else "${audioFile.name}.wav"
                 writeString("$twoHyphens$boundary$lineEnd")
                 writeString("Content-Disposition: form-data; name=\"file\"; filename=\"$filename\"$lineEnd")
@@ -99,7 +123,7 @@ class SttProxyClient(
             }
 
             val responseCode = connection.responseCode
-            Log.d("SttProxyClient", "HTTP Response Code: $responseCode")
+            Log.d(TAG, "HTTP Response Code: $responseCode (job $jobId)")
 
             val inputStream = if (responseCode in 200..299) {
                 connection.inputStream
@@ -108,41 +132,99 @@ class SttProxyClient(
             }
 
             val responseString = inputStream?.bufferedReader()?.use { it.readText() } ?: ""
-            Log.d("SttProxyClient", "HTTP Response Body: $responseString")
 
-            if (responseCode in 200..299 && responseString.isNotBlank()) {
-                val json = JSONObject(responseString)
-                val transcript = json.optString("transcript", "").ifBlank {
-                    json.optString("text", "")
-                }
-                if (transcript.isNotBlank()) {
-                    return@withContext SttResult.Success(transcript.trim())
-                } else {
-                    return@withContext SttResult.Error(responseCode, "STT returned empty transcript: $responseString")
-                }
-            } else {
+            if (responseCode !in 200..299) {
                 var errDetail = responseString
                 try {
                     val json = JSONObject(responseString)
                     if (json.has("error")) {
                         val errObj = json.get("error")
-                        errDetail = if (errObj is JSONObject) {
-                            errObj.optString("message", responseString)
-                        } else {
-                            errObj.toString()
-                        }
+                        errDetail = if (errObj is JSONObject) errObj.optString("message", responseString) else errObj.toString()
                     }
                 } catch (_: Exception) {}
 
-                Log.e("SttProxyClient", "STT proxy error HTTP $responseCode: $errDetail")
+                Log.e(TAG, "STT proxy error HTTP $responseCode: $errDetail")
                 return@withContext SttResult.Error(responseCode, "HTTP $responseCode: $errDetail")
             }
+
+            if (responseString.isBlank()) {
+                return@withContext SttResult.Error(responseCode, "Empty response body from STT proxy")
+            }
+
+            val json = JSONObject(responseString)
+
+            // A cached (already-processed) job comes back complete on the first call.
+            val immediateTranscript = json.optString("raw_transcript", "")
+            if (json.optString("status", "") != "QUEUED" && immediateTranscript.isNotBlank()) {
+                return@withContext SttResult.Success(immediateTranscript.trim())
+            }
+
+            pollForTranscript(jobId)
         } catch (e: Exception) {
-            Log.e("SttProxyClient", "STT Proxy request failed", e)
+            Log.e(TAG, "STT Proxy request failed", e)
             val msg = e.localizedMessage ?: e.message ?: "Network failure"
             return@withContext SttResult.Error(null, "Connection error: $msg")
         } finally {
             connection?.disconnect()
         }
+    }
+
+    /** Polls `stt_job_logs` until the background pipeline publishes a terminal status. */
+    private suspend fun pollForTranscript(jobId: String): SttResult = withContext(Dispatchers.IO) {
+        val pollUrl = "${SupabaseConfig.SUPABASE_URL}/rest/v1/stt_job_logs" +
+            "?job_id=eq.$jobId&select=status,raw_transcript,error_message"
+
+        var lastError = "STT job did not complete within ${POLL_TIMEOUT_MS / 1000}s"
+
+        val deadline = System.currentTimeMillis() + POLL_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            delay(POLL_INTERVAL_MS)
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(pollUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 10000
+                    readTimeout = 10000
+                    setRequestProperty("Authorization", "Bearer $anonKey")
+                    setRequestProperty("apikey", anonKey)
+                }
+                if (conn.responseCode !in 200..299) {
+                    lastError = "Poll failed with HTTP ${conn.responseCode}"
+                    continue
+                }
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val arr = JSONArray(body)
+                if (arr.length() == 0) continue
+
+                val row = arr.getJSONObject(0)
+                when (val status = row.optString("status", "QUEUED")) {
+                    "QUEUED" -> continue
+                    "ERROR" -> {
+                        val msg = row.optString("error_message", "Server reported ERROR")
+                        return@withContext SttResult.Error(null, msg.ifBlank { "Server reported ERROR" })
+                    }
+                    else -> {
+                        val transcript = row.optString("raw_transcript", "")
+                        return@withContext if (transcript.isNotBlank()) {
+                            SttResult.Success(transcript.trim())
+                        } else {
+                            val msg = row.optString("error_message", "")
+                            SttResult.Error(null, msg.ifBlank { "STT returned an empty transcript (status $status)" })
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                lastError = "Poll exception: ${e.message}"
+            } finally {
+                conn?.disconnect()
+            }
+        }
+        SttResult.Error(null, lastError)
+    }
+
+    companion object {
+        private const val TAG = "SttProxyClient"
+        private const val POLL_INTERVAL_MS = 2000L
+        private const val POLL_TIMEOUT_MS = 30000L
     }
 }

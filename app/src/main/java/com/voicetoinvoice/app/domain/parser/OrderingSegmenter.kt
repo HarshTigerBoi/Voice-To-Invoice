@@ -17,13 +17,6 @@ data class SegmentResult(
 
 private enum class TokenType { NUM, UNIT, ITEM }
 
-private data class Candidate(
-    val type: TokenType,
-    val cost: Double,
-    val numericValue: Double? = null,
-    val canonicalUnit: String? = null
-)
-
 private data class DecodedToken(
     val type: TokenType,
     val rawToken: String,
@@ -31,38 +24,83 @@ private data class DecodedToken(
     val canonicalUnit: String? = null
 )
 
+/** One typed piece a source token can decode to. A source token yields several of these
+ *  when STT fused two or three words into it. */
+private data class Emission(
+    val type: TokenType,
+    val cost: Double,
+    val surface: String,
+    val numericValue: Double? = null,
+    val canonicalUnit: String? = null
+)
+
+/** One complete reading of a single source token: either a whole-token reading
+ *  (one emission) or a fused-token reading (two or three emissions). */
+private data class Expansion(val emissions: List<Emission>, val emissionCost: Double)
+
+internal data class VocabEntry(
+    val key: String,
+    val surface: String,
+    val numericValue: Double? = null,
+    val canonicalUnit: String? = null
+)
+
+private data class VocabHit(val entry: VocabEntry, val normalized: Double)
+
 /**
  * Grammar-aware lattice decoder for shopkeeper voice orders.
  *
  * A shopkeeper utterance almost always follows [QUANTITY] [UNIT] [ITEM], repeated.
- * STT commonly clips the leading syllable of a unit word in fast connected speech
- * (e.g. "एक किलो" -> "एकलो" -> STT hears "एक लो"), and a naive per-token classifier
- * will match the orphaned fragment "लो" against the nearest NUMBER word ("दो", edit
- * distance 1) purely because that's textually closer than the full unit word "किलो"
- * (edit distance 2+). That greedy choice discards the real quantity and invents a
- * second one.
+ * Two STT behaviours break naive per-token classification, and this decoder exists to
+ * absorb both without letting either one corrupt a clean transcript:
  *
- * Instead of classifying each token in isolation, this decoder scores every
- * plausible (NUM/UNIT/ITEM) reading of every token and runs a Viterbi decode over
- * the whole sequence using the shopkeeper grammar as a transition prior — so a
- * cheap "elided unit" reading of an ambiguous token can beat a technically-closer
- * but grammatically nonsensical "second number in a row" reading.
+ *  - ELISION. STT clips the leading syllable of a unit word in connected speech
+ *    ("एक किलो" -> "एकलो" -> heard as "एक लो"). A per-token classifier matches the
+ *    orphan "लो" to the number "दो" (distance 1) rather than the unit "किलो"
+ *    (distance 2+), inventing a second quantity. See ISSUE-019.
+ *
+ *  - FUSION. STT welds two or three words into one token ("चार किलो" -> "चरगलो",
+ *    "teen kilo" -> "tinggal"). Splitting these greedily in a pre-pass is unsafe: the
+ *    cheapest split of a fused token in isolation is frequently the wrong one, because
+ *    the evidence that disambiguates it lives in the *neighbouring* tokens. "एकलो"
+ *    reads equally well as "ek kilo" and "ek aaloo" on its own; only a following item
+ *    token settles it. See ISSUE-020.
+ *
+ * So splits are not decided up front. Each source token contributes a set of competing
+ * *expansions* (whole-token, 2-way, 3-way) into a lattice, and a Viterbi decode over
+ * the whole utterance picks the combination that best satisfies the shopkeeper grammar.
+ * A fused reading has to earn its place against the surrounding sequence, and a clean
+ * transcript still decodes exactly as plain lookup would.
  */
 private object GrammarLatticeDecoder {
 
-    // Emission costs: lower = more confident. Exact matches always win; these
-    // constants only apply to tokens that DON'T exactly match anything, so a
-    // clean, unambiguous transcript decodes identically to plain lookup.
+    // Emission costs: lower = more confident. Exact matches always win; these constants
+    // only apply to tokens that DON'T exactly match anything, so a clean, unambiguous
+    // transcript decodes identically to plain lookup.
     private const val EXACT_COST = 0.0
-    private const val ELISION_COST = 0.5 // token is the trailing remnant of a canonical unit word
-    private const val FUZZY_COST = 1.0   // token is 1 edit away from a canonical number/unit word
-    private const val ITEM_BASELINE_COST = 1.2
+    private const val ELISION_COST = 0.5   // token is the trailing remnant of a canonical unit word
+    private const val ITEM_BASELINE_COST = 1.2   // unrecognized word, read as an item name
+    private const val ITEM_MATCHED_BASE_COST = 0.2 // word phonetically resolves to a known item
 
-    // Transition costs encode the [NUM][UNIT][ITEM] grammar. NUM->NUM is
-    // heavily penalized: shopkeepers essentially never say two bare numbers
-    // back-to-back for a single item, so when it's the only path left it's
-    // both correct to pick, cheap enough for closing a genuinely double-quantity
-    // utterance, and expensive enough to lose to a plausible unit/item reading.
+    // Max average phonetic distance per phone for a whole-token fuzzy read.
+    // Tuned down from an initial 0.34, which was loose enough to accept outright
+    // nonsense: "एकलो" (IKALO) matched ग्यारह/11 (KIALA) at 0.300 and "ग्लोसोना"
+    // (KLOSONA) matched लहसुन (LASON) at 0.286, so both fused tokens were swallowed
+    // whole as the wrong word instead of being split. 0.25 rejects both while still
+    // admitting the trailing-echo read "sebab" -> सेब (0.200).
+    private const val WHOLE_TOKEN_MAX_NORM = 0.25
+    // Split parts are shorter and therefore noisier, so they keep slightly more room
+    // than a whole-token read — "tinggal" needs KAL -> किलो at exactly 0.25.
+    private const val SPLIT_PART_MAX_NORM = 0.30
+    // A split part must rest on at least this many phones of evidence.
+    private const val MIN_SPLIT_PHONES = 2
+    // Per-part surcharge on a split, so a fused reading never wins a coin-flip against
+    // an equally-scoring whole-token reading. Deliberately small: at 0.35 it swamped
+    // the emission scores entirely, letting a mediocre whole-token match (0.286) beat
+    // a near-perfect split (0.125 + 0.000). The grammar transitions, not this penalty,
+    // are what should decide between readings.
+    private const val SPLIT_PENALTY = 0.10
+
     private fun transitionCost(prev: TokenType?, curr: TokenType): Double {
         if (prev == null) {
             return when (curr) {
@@ -90,153 +128,246 @@ private object GrammarLatticeDecoder {
         }
     }
 
-    private fun editDistance(a: String, b: String): Int {
-        val dp = Array(a.length + 1) { IntArray(b.length + 1) }
-        for (i in 0..a.length) dp[i][0] = i
-        for (j in 0..b.length) dp[0][j] = j
-        for (i in 1..a.length) {
-            for (j in 1..b.length) {
-                dp[i][j] = if (a[i - 1] == b[j - 1]) {
-                    dp[i - 1][j - 1]
-                } else {
-                    1 + minOf(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+    /** Best phonetic match for [fragment] in [vocab].
+     *  @param allowElision accept a fragment that is the tail of a longer unit word.
+     *  @param allowEcho accept trailing material the vocabulary entry doesn't account
+     *   for ("sebab" -> "seb"). Whole-token catalog reads only: inside a split, every
+     *   phone must be paid for by some part, or a fragment steals phones from its
+     *   neighbour and the split silently misaligns. */
+    private fun matchVocab(
+        fragment: String,
+        vocab: List<VocabEntry>,
+        maxNorm: Double,
+        allowElision: Boolean = false,
+        allowEcho: Boolean = false
+    ): VocabHit? {
+        if (fragment.isEmpty()) return null
+        var best: VocabHit? = null
+        for (entry in vocab) {
+            if (entry.key.isEmpty()) continue
+            var cost = PhoneticKey.distance(fragment, entry.key)
+            if (allowElision && entry.key.length > fragment.length && entry.key.endsWith(fragment)) {
+                cost = min(cost, ELISION_COST)
+            }
+            if (allowEcho && fragment.length > entry.key.length && fragment.startsWith(entry.key)) {
+                cost = min(cost, (fragment.length - entry.key.length) * 0.5)
+            }
+            val norm = cost / maxOf(fragment.length, entry.key.length).toDouble()
+            if (best == null || norm < best.normalized) best = VocabHit(entry, norm)
+        }
+        return if (best != null && best.normalized <= maxNorm) best else null
+    }
+
+    private fun wholeTokenExpansions(raw: String, vocab: SegmenterVocabulary): List<Expansion> {
+        val lower = raw.lowercase()
+        val out = mutableListOf<Expansion>()
+
+        // Exact literal lookups stay exact — never route a known word through phonetics.
+        OrderingSegmenter.HINDI_NUMBER_MAP[lower]?.let {
+            out.add(Expansion(listOf(Emission(TokenType.NUM, EXACT_COST, raw, numericValue = it)), EXACT_COST))
+        }
+        lower.toDoubleOrNull()?.let {
+            out.add(Expansion(listOf(Emission(TokenType.NUM, EXACT_COST, raw, numericValue = it)), EXACT_COST))
+        }
+        if (OrderingSegmenter.UNIT_SET.contains(lower)) {
+            out.add(Expansion(listOf(Emission(TokenType.UNIT, EXACT_COST, raw, canonicalUnit = lower)), EXACT_COST))
+        }
+        if (out.isNotEmpty()) {
+            // An exact vocabulary match is unambiguous by definition — don't offer an ITEM
+            // escape hatch that would let the decoder buy a cheaper global path by
+            // relabelling a literal number/unit as a fake item name just to dodge a
+            // transition penalty (e.g. avoiding UNIT->NUM by pretending "किलो" is the item).
+            return out
+        }
+
+        val key = PhoneticKey.of(lower)
+        if (key.isNotEmpty()) {
+            matchVocab(key, vocab.numbers, WHOLE_TOKEN_MAX_NORM)?.let {
+                out.add(Expansion(listOf(Emission(TokenType.NUM, it.normalized, raw, numericValue = it.entry.numericValue)), it.normalized))
+            }
+            matchVocab(key, vocab.units, WHOLE_TOKEN_MAX_NORM, allowElision = true)?.let {
+                out.add(Expansion(listOf(Emission(TokenType.UNIT, it.normalized, raw, canonicalUnit = it.entry.canonicalUnit)), it.normalized))
+            }
+            // A token that phonetically resolves to a known item is much stronger
+            // evidence than an unrecognized word, so it emits below ITEM_BASELINE_COST
+            // and carries the canonical surface forward. `allowEcho` absorbs the
+            // trailing syllable STT tacks on at utterance end ("sebab" -> "सेब").
+            matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, allowEcho = true)?.let {
+                val cost = ITEM_MATCHED_BASE_COST + it.normalized
+                out.add(Expansion(listOf(Emission(TokenType.ITEM, cost, it.entry.surface)), cost))
+            }
+        }
+
+        // ITEM is always available as a fallback reading — an unknown word is far more
+        // likely to be an item the catalog hasn't seen than a mangled number. This is
+        // what keeps a genuinely new item name intact instead of being rewritten into
+        // the nearest catalog entry (the ISSUE-011 failure mode).
+        out.add(Expansion(listOf(Emission(TokenType.ITEM, ITEM_BASELINE_COST, raw)), ITEM_BASELINE_COST))
+        return out
+    }
+
+    private fun splitExpansions(raw: String, vocab: SegmenterVocabulary): List<Expansion> {
+        val key = PhoneticKey.of(raw.lowercase())
+        if (key.length < MIN_SPLIT_PHONES * 2) return emptyList()
+        val out = mutableListOf<Expansion>()
+
+        fun emissionFor(type: TokenType, hit: VocabHit, cost: Double): Emission = Emission(
+            type = type,
+            cost = cost,
+            surface = hit.entry.surface,
+            numericValue = hit.entry.numericValue,
+            canonicalUnit = hit.entry.canonicalUnit
+        )
+
+        // 2-way: [NUM][UNIT] ("चरगलो"), [UNIT][ITEM] ("ग्लोसोना"), [NUM][ITEM] ("एकलो").
+        for (i in MIN_SPLIT_PHONES..key.length - MIN_SPLIT_PHONES) {
+            val p1 = key.substring(0, i)
+            val p2 = key.substring(i)
+
+            matchVocab(p1, vocab.numbers, SPLIT_PART_MAX_NORM)?.let { n ->
+                matchVocab(p2, vocab.units, SPLIT_PART_MAX_NORM, allowElision = true)?.let { u ->
+                    val c = n.normalized + u.normalized + 2 * SPLIT_PENALTY
+                    out.add(Expansion(listOf(emissionFor(TokenType.NUM, n, n.normalized), emissionFor(TokenType.UNIT, u, u.normalized)), c))
+                }
+                matchVocab(p2, vocab.items, SPLIT_PART_MAX_NORM)?.let { it2 ->
+                    val c = n.normalized + it2.normalized + 2 * SPLIT_PENALTY
+                    out.add(Expansion(listOf(emissionFor(TokenType.NUM, n, n.normalized), emissionFor(TokenType.ITEM, it2, it2.normalized)), c))
+                }
+            }
+            matchVocab(p1, vocab.units, SPLIT_PART_MAX_NORM)?.let { u ->
+                matchVocab(p2, vocab.items, SPLIT_PART_MAX_NORM)?.let { it2 ->
+                    val c = u.normalized + it2.normalized + 2 * SPLIT_PENALTY
+                    out.add(Expansion(listOf(emissionFor(TokenType.UNIT, u, u.normalized), emissionFor(TokenType.ITEM, it2, it2.normalized)), c))
                 }
             }
         }
-        return dp[a.length][b.length]
+
+        // 3-way: [NUM][UNIT][ITEM] — a whole order collapsed into one token.
+        for (i in MIN_SPLIT_PHONES..key.length - 2 * MIN_SPLIT_PHONES) {
+            for (j in i + MIN_SPLIT_PHONES..key.length - MIN_SPLIT_PHONES) {
+                val n = matchVocab(key.substring(0, i), vocab.numbers, SPLIT_PART_MAX_NORM) ?: continue
+                val u = matchVocab(key.substring(i, j), vocab.units, SPLIT_PART_MAX_NORM, allowElision = true) ?: continue
+                val it3 = matchVocab(key.substring(j), vocab.items, SPLIT_PART_MAX_NORM) ?: continue
+                val c = n.normalized + u.normalized + it3.normalized + 3 * SPLIT_PENALTY
+                out.add(
+                    Expansion(
+                        listOf(
+                            emissionFor(TokenType.NUM, n, n.normalized),
+                            emissionFor(TokenType.UNIT, u, u.normalized),
+                            emissionFor(TokenType.ITEM, it3, it3.normalized)
+                        ), c
+                    )
+                )
+            }
+        }
+        return out
     }
 
-    private fun numCandidate(token: String): Candidate? {
-        OrderingSegmenter.HINDI_NUMBER_MAP[token]?.let {
-            return Candidate(TokenType.NUM, EXACT_COST, numericValue = it)
-        }
-        token.toDoubleOrNull()?.let {
-            return Candidate(TokenType.NUM, EXACT_COST, numericValue = it)
-        }
-        if (token.length < 2) return null
-        var bestDist = Int.MAX_VALUE
-        var bestValue: Double? = null
-        for ((word, value) in OrderingSegmenter.HINDI_NUMBER_MAP) {
-            if (word.length < 2) continue
-            val dist = editDistance(token, word)
-            if (dist < bestDist) {
-                bestDist = dist
-                bestValue = value
-            }
-        }
-        return if (bestDist == 1 && bestValue != null) {
-            Candidate(TokenType.NUM, FUZZY_COST, numericValue = bestValue)
-        } else null
-    }
-
-    private fun unitCandidate(token: String): Candidate? {
-        if (OrderingSegmenter.UNIT_SET.contains(token)) {
-            return Candidate(TokenType.UNIT, EXACT_COST, canonicalUnit = token)
-        }
-        if (token.length >= 2) {
-            // Elision: STT dropped the leading syllable(s) of the unit word
-            // (e.g. "किलो" -> "लो", "पैकेट" -> "केट").
-            val elided = OrderingSegmenter.UNIT_SET.firstOrNull { it.length > token.length && it.endsWith(token) }
-            if (elided != null) {
-                return Candidate(TokenType.UNIT, ELISION_COST, canonicalUnit = elided)
-            }
-            var bestDist = Int.MAX_VALUE
-            var bestUnit: String? = null
-            for (unit in OrderingSegmenter.UNIT_SET) {
-                val dist = editDistance(token, unit)
-                if (dist < bestDist) {
-                    bestDist = dist
-                    bestUnit = unit
-                }
-            }
-            if (bestDist == 1 && bestUnit != null) {
-                return Candidate(TokenType.UNIT, FUZZY_COST, canonicalUnit = bestUnit)
-            }
-        }
-        return null
-    }
-
-    /** Decodes the full token sequence via Viterbi, returning the winning type
-     *  for each token plus the ambiguity gap at the single tightest decision
-     *  point (small gap = a genuinely close call the caller should flag). */
-    fun decode(tokens: List<String>): Pair<List<DecodedToken>, Double> {
+    /**
+     * Viterbi over a token-expansion lattice.
+     *
+     * State is (source token index, type of the last emission produced so far), so an
+     * expansion that emits several typed pieces pays the internal transitions between
+     * them as well as the transition from the previous token's final type. Returns the
+     * flattened winning emission sequence plus the ambiguity gap at the tightest
+     * decision point (small gap = genuinely close call worth sanity-flagging).
+     */
+    fun decode(tokens: List<String>, vocab: SegmenterVocabulary): Pair<List<DecodedToken>, Double> {
         if (tokens.isEmpty()) return emptyList<DecodedToken>() to Double.MAX_VALUE
 
-        val candidatesPerToken = tokens.map { raw ->
-            val lower = raw.lowercase()
-            val candidates = mutableListOf<Candidate>()
-            numCandidate(lower)?.let { candidates.add(it) }
-            unitCandidate(lower)?.let { candidates.add(it) }
-            // An exact vocabulary match is unambiguous by definition — don't offer
-            // an ITEM escape hatch that would let the decoder "cheat" a cheaper
-            // global path by relabeling a literal number/unit word as a fake item
-            // name just to dodge a transition penalty (e.g. avoiding UNIT->NUM by
-            // pretending "किलो" is the item being purchased).
-            val hasExactMatch = candidates.any { it.cost == EXACT_COST }
-            if (!hasExactMatch) {
-                candidates.add(Candidate(TokenType.ITEM, ITEM_BASELINE_COST))
-            }
-            candidates
+        val expansionsPerToken = tokens.map { raw ->
+            val whole = wholeTokenExpansions(raw, vocab)
+            val exactOnly = whole.size == 1 && whole[0].emissionCost == EXACT_COST
+            // Don't even consider splitting a token that exactly matches a known word.
+            if (exactOnly) whole else whole + splitExpansions(raw, vocab)
         }
 
-        // dp[i][type] = cheapest total cost of a path ending in `type` at token i
+        // dp[i][lastType] = cheapest cost of consuming tokens 0..i ending on lastType.
         val dp = Array(tokens.size) { mutableMapOf<TokenType, Double>() }
-        val backPointer = Array(tokens.size) { mutableMapOf<TokenType, TokenType?>() }
+        val back = Array(tokens.size) { mutableMapOf<TokenType, Pair<TokenType?, Expansion>>() }
         var minGap = Double.MAX_VALUE
 
         for (i in tokens.indices) {
             val costsHere = mutableMapOf<TokenType, Double>()
-            for (cand in candidatesPerToken[i]) {
+            for (expansion in expansionsPerToken[i]) {
+                // Internal cost of the expansion: its emissions plus the transitions between them.
+                var internal = expansion.emissionCost
+                for (k in 1 until expansion.emissions.size) {
+                    internal += transitionCost(expansion.emissions[k - 1].type, expansion.emissions[k].type)
+                }
+                val firstType = expansion.emissions.first().type
+                val lastType = expansion.emissions.last().type
+
                 var best = Double.MAX_VALUE
                 var bestPrev: TokenType? = null
                 if (i == 0) {
-                    best = cand.cost + transitionCost(null, cand.type)
-                    bestPrev = null
+                    best = internal + transitionCost(null, firstType)
                 } else {
                     for ((prevType, prevCost) in dp[i - 1]) {
-                        val total = prevCost + transitionCost(prevType, cand.type) + cand.cost
+                        val total = prevCost + transitionCost(prevType, firstType) + internal
                         if (total < best) {
                             best = total
                             bestPrev = prevType
                         }
                     }
                 }
-                // Keep the cheapest way to reach this (token, type) combination.
-                val existing = costsHere[cand.type]
+                val existing = costsHere[lastType]
                 if (existing == null || best < existing) {
-                    costsHere[cand.type] = best
-                    backPointer[i][cand.type] = bestPrev
+                    costsHere[lastType] = best
+                    back[i][lastType] = bestPrev to expansion
                 }
             }
             dp[i] = costsHere
 
             val sorted = costsHere.values.sorted()
-            if (sorted.size >= 2) {
-                minGap = min(minGap, sorted[1] - sorted[0])
-            }
+            if (sorted.size >= 2) minGap = min(minGap, sorted[1] - sorted[0])
         }
 
-        // Backtrack from the cheapest final state.
-        val lastCosts = dp[tokens.size - 1]
-        var currentType = lastCosts.entries.minByOrNull { it.value }?.key ?: TokenType.ITEM
-        val typeSequence = arrayOfNulls<TokenType>(tokens.size)
+        // Backtrack, collecting each token's winning expansion.
+        val chosen = arrayOfNulls<Expansion>(tokens.size)
+        var currentType = dp[tokens.size - 1].entries.minByOrNull { it.value }?.key ?: TokenType.ITEM
         for (i in tokens.indices.reversed()) {
-            typeSequence[i] = currentType
-            currentType = backPointer[i][currentType] ?: TokenType.ITEM
+            val entry = back[i][currentType]
+            if (entry == null) {
+                chosen[i] = Expansion(listOf(Emission(TokenType.ITEM, ITEM_BASELINE_COST, tokens[i])), ITEM_BASELINE_COST)
+                currentType = TokenType.ITEM
+                continue
+            }
+            chosen[i] = entry.second
+            currentType = entry.first ?: TokenType.ITEM
         }
 
-        val decoded = tokens.indices.map { i ->
-            val type = typeSequence[i]!!
-            val chosen = candidatesPerToken[i].firstOrNull { it.type == type }
-            DecodedToken(
-                type = type,
-                rawToken = tokens[i],
-                numericValue = chosen?.numericValue,
-                canonicalUnit = chosen?.canonicalUnit
-            )
+        val decoded = mutableListOf<DecodedToken>()
+        for (i in tokens.indices) {
+            for (em in chosen[i]!!.emissions) {
+                decoded.add(
+                    DecodedToken(
+                        type = em.type,
+                        rawToken = em.surface,
+                        numericValue = em.numericValue,
+                        canonicalUnit = em.canonicalUnit
+                    )
+                )
+            }
         }
         return decoded to minGap
     }
+}
+
+/** Phonetically-indexed vocabulary the lattice decodes against. */
+class SegmenterVocabulary(catalogNames: List<String> = emptyList()) {
+    internal val numbers: List<VocabEntry> = OrderingSegmenter.HINDI_NUMBER_MAP
+        .filterKeys { it.length >= 2 }
+        .map { (word, value) -> VocabEntry(PhoneticKey.of(word), word, numericValue = value) }
+
+    internal val units: List<VocabEntry> = OrderingSegmenter.UNIT_SET
+        .map { unit -> VocabEntry(PhoneticKey.of(unit), unit, canonicalUnit = unit) }
+
+    internal val items: List<VocabEntry> =
+        (OrderingSegmenter.DEFAULT_ITEM_VOCAB + catalogNames)
+            .filter { it.isNotBlank() }
+            .distinct()
+            .map { name -> VocabEntry(PhoneticKey.of(name), name) }
 }
 
 class OrderingSegmenter {
@@ -289,14 +420,37 @@ class OrderingSegmenter {
             "dozen", "dozens", "दर्जन"
         )
 
-        // Ambiguity gap below this threshold means the lattice decoder had a
-        // genuinely close call somewhere in the utterance (e.g. a token almost
-        // equally plausible as a unit or a number) — worth surfacing as a
-        // sanity flag even when a structural double-quantity wasn't detected.
+        /**
+         * Item words the splitter may use as the ITEM half of a fused token, in BOTH
+         * scripts. Kept in sync with `indicAliasMap` in FuzzyCatalogMatcher.kt and with
+         * `DEFAULT_ITEM_VOCAB` in supabase/functions/process-voice-job/phonetic.ts.
+         * A shop's live catalog is unioned onto this at construction time.
+         */
+        val DEFAULT_ITEM_VOCAB: List<String> = listOf(
+            "सेब", "Seb", "आलू", "Aaloo", "प्याज", "Pyaz", "टमाटर", "Tamatar",
+            "भिंडी", "Bhindi", "धनिया", "Dhaniya", "मिर्च", "Mirch", "गोभी", "Gobhi",
+            "बैंगन", "Baingan", "गाजर", "Gajar", "मटर", "Matar", "खीरा", "Kheera",
+            "पालक", "Palak", "लहसुन", "Lahsun", "अदरक", "Adrak", "केला", "Kela",
+            "दूध", "Doodh", "दही", "Dahi", "पनीर", "Paneer", "घी", "Ghee",
+            "मक्खन", "Butter", "अंडे", "Anda", "चीनी", "Chini", "आटा", "Atta",
+            "चावल", "Chawal", "नमक", "Namak", "तेल", "Tel", "मैगी", "Maggi",
+            "सोना", "Sona", "चांदी", "Chaandi", "काजू", "Kaju", "बादाम", "Badam",
+            "मूंगफली", "Moongphali"
+        )
+
+        // Ambiguity gap below this threshold means the lattice decoder had a genuinely
+        // close call somewhere in the utterance — worth surfacing as a sanity flag even
+        // when a structural double-quantity wasn't detected.
         private const val LOW_CONFIDENCE_GAP_THRESHOLD = 0.15
     }
 
-    fun segmentTranscript(transcript: String, pendingCarryoverQty: Double? = null): SegmentResult {
+    private val defaultVocabulary = SegmenterVocabulary()
+
+    fun segmentTranscript(
+        transcript: String,
+        pendingCarryoverQty: Double? = null,
+        catalogNames: List<String> = emptyList()
+    ): SegmentResult {
         val cleanText = transcript
             .replace("।", " ")
             .replace(Regex("[.,?!\\-\\\\(\\)]"), " ")
@@ -306,12 +460,9 @@ class OrderingSegmenter {
             return SegmentResult(emptyList(), pendingCarryoverQty)
         }
 
+        val vocabulary = if (catalogNames.isEmpty()) defaultVocabulary else SegmenterVocabulary(catalogNames)
         val tokens = cleanText.split(Regex("\\s+")).filter { it.isNotBlank() }
-        val lowerTokens = tokens.map { it.lowercase() }
-        val (decoded, ambiguityGap) = GrammarLatticeDecoder.decode(lowerTokens)
-        // Recover original casing/text for item tokens & rawSegmentText while
-        // keeping the decoder's type/number/unit decisions.
-        val decodedWithOriginalText = decoded.mapIndexed { i, dt -> dt.copy(rawToken = tokens[i]) }
+        val (decoded, ambiguityGap) = GrammarLatticeDecoder.decode(tokens, vocabulary)
 
         var currentQty: Double? = pendingCarryoverQty
         var currentUnit: String? = null
@@ -340,7 +491,7 @@ class OrderingSegmenter {
             ambiguousDoubleQty = false
         }
 
-        for (dt in decodedWithOriginalText) {
+        for (dt in decoded) {
             when (dt.type) {
                 TokenType.NUM -> {
                     if (currentItemTokens.isNotEmpty()) {

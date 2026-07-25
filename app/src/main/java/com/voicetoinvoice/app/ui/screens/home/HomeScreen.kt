@@ -57,6 +57,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
+/** Audio captured before the button-down event, to recover the leading consonant lost
+ *  to input latency and speech onset preceding the press. */
+private const val PRE_ROLL_MS = 300L
+
+/** Audio captured after release, to recover trailing phonemes. */
+private const val POST_ROLL_MS = 300L
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
@@ -254,15 +261,21 @@ fun HomeScreen(
 
                                         val pressTs = pressTimestamp
                                         val releaseTs = releaseTimestamp
-                                        val audioStartMs = pressTs
-                                        val audioEndMs = releaseTs + 300L
+                                        // Pre-roll: speech onset routinely precedes the button-down event being
+                                        // delivered, and AudioRecord adds its own buffer latency on top, so a
+                                        // window starting exactly at pressTs clips the leading consonant burst.
+                                        // On a ~1s utterance that is enough to turn "तीन" into "een". The whole
+                                        // point of the 30s ring buffer is that this audio is already captured —
+                                        // it just was never being asked for. See ISSUE-020.
+                                        val audioStartMs = pressTs - PRE_ROLL_MS
+                                        val audioEndMs = releaseTs + POST_ROLL_MS
 
                                         scope.launch(Dispatchers.IO) {
-                                            delay(300L) // Exact 300ms post-roll delay to capture tail phonemes
+                                            delay(POST_ROLL_MS) // let the tail phonemes land in the ring buffer
                                             val targetFile = File.createTempFile("voice_record_", ".wav", context.cacheDir)
                                             val extractedAudio = rollingAudioBuffer.extractAudioWindow(
-                                                startMs = pressTs,
-                                                endMs = releaseTs + 300L,
+                                                startMs = audioStartMs,
+                                                endMs = audioEndMs,
                                                 outputFile = targetFile
                                             )
 
