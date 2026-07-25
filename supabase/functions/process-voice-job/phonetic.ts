@@ -467,7 +467,15 @@ function decode(tokens: string[], vocab: SegmenterVocabulary): { decoded: Decode
   const expansionsPerToken = tokens.map(raw => {
     const whole = wholeTokenExpansions(raw, vocab)
     const exactOnly = whole.length >= 1 && whole.every(e => e.emissionCost === EXACT_COST)
-    return exactOnly ? whole : [...whole, ...splitExpansions(raw, vocab)]
+    const all = exactOnly ? whole : [...whole, ...splitExpansions(raw, vocab)]
+    // Suspicion is a property of the SOURCE token, not of one reading of it.
+    // "किलोमीटर" is a mis-decode however we carve it up, so split readings inherit the
+    // flag — otherwise the split wins the lattice (as it should) and drops the warning.
+    if (!DISTANCE_UNIT_TOKENS.includes(raw.toLowerCase())) return all
+    return all.map(exp => ({
+      ...exp,
+      emissions: exp.emissions.map(e => ({ ...e, suspect: true })),
+    }))
   })
 
   const dp: Array<Partial<Record<TokenType, number>>> = tokens.map(() => ({}))

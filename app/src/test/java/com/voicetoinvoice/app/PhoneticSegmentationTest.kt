@@ -149,4 +149,88 @@ class PhoneticSegmentationTest {
         assertEquals(2.0, result.segments[0].quantity, 0.01)
         assertEquals("KG", result.segments[0].unit)
     }
+
+    // ---------- ISSUE-021: distance words must never eat the item ----------
+    //
+    // Production trace 9fc1fc32-7685-4503-9330-1363a16ec544: the shopkeeper said
+    // "पांच किलो मैगी" and STT returned "पांच किलोमीटर". Because "किलोमीटर" was listed in
+    // UNIT_SET it matched exactly, which suppressed split expansions entirely, so the
+    // decode was NUM(5) + UNIT(KG) with no ITEM at all — closeSegment() never fired and
+    // the whole sale came back as `segments: []`.
+
+    @Test
+    fun kilometerIsNotAShopUnit() {
+        assertFalse(
+            "a distance word in UNIT_SET exact-matches and suppresses splitting, " +
+                "which is what swallowed the item in ISSUE-021",
+            OrderingSegmenter.UNIT_SET.contains("kilometer")
+        )
+        assertFalse(OrderingSegmenter.UNIT_SET.contains("किलोमीटर"))
+    }
+
+    @Test
+    fun kilometerMisTranscriptionStillYieldsASegment() {
+        // The item name is genuinely unrecoverable here — मीटर and मैगी differ by a
+        // consonant, and the information was destroyed at the audio->text boundary. What
+        // must NOT happen is the utterance evaporating: quantity and unit are certain and
+        // have to survive so the shopkeeper gets a one-tap review row instead of silence.
+        val result = segmenter.segmentTranscript("पांच किलोमीटर")
+        assertEquals(
+            "quantity+unit with no item must still produce a reviewable segment",
+            1, result.segments.size
+        )
+        assertEquals(5.0, result.segments[0].quantity, 0.01)
+        assertEquals("KG", result.segments[0].unit)
+    }
+
+    @Test
+    fun kilometerDerivedSegmentIsFlaggedForReview() {
+        // The recovered item name is a guess resting on a token STT is known to have
+        // mangled, so it must never ride the auto-confirm path.
+        val result = segmenter.segmentTranscript("पांच किलोमीटर")
+        assertTrue(
+            "a segment recovered from a distance-word mis-decode must be sanity-flagged",
+            result.segments[0].isSanityFlagged
+        )
+    }
+
+    @Test
+    fun romanizedKilometerBehavesTheSameWay() {
+        val result = segmenter.segmentTranscript("paanch kilometer")
+        assertEquals(1, result.segments.size)
+        assertEquals(5.0, result.segments[0].quantity, 0.01)
+        assertEquals("KG", result.segments[0].unit)
+        assertTrue(result.segments[0].isSanityFlagged)
+    }
+
+    @Test
+    fun realItemAfterAKilometerMisdecodeIsStillRead() {
+        // "पांच किलो आलू" mis-heard with the unit fused: the item is present and must win.
+        val result = segmenter.segmentTranscript("पांच किलोमीटर आलू")
+        assertEquals(1, result.segments.size)
+        assertEquals(5.0, result.segments[0].quantity, 0.01)
+        assertEquals("KG", result.segments[0].unit)
+        assertTrue(
+            "expected आलू to survive, got ${result.segments[0].itemTokens}",
+            result.segments[0].itemTokens.any { PhoneticKey.of(it) == PhoneticKey.of("आलू") }
+        )
+    }
+
+    // ---------- Terminal grammar constraint ----------
+
+    @Test
+    fun trailingQuantityAndUnitStillCarriesOverToNextUtterance() {
+        // The END-transition penalty must not break the deliberate carryover feature: a
+        // clean "चार किलो" with no item is a legitimate reading, not a broken one.
+        val result = segmenter.segmentTranscript("चार किलो")
+        assertEquals("a bare quantity+unit must not invent an item", 0, result.segments.size)
+        assertEquals(4.0, result.carryoverQty ?: 0.0, 0.01)
+    }
+
+    @Test
+    fun carryoverQuantityAttachesToTheFollowingUtterance() {
+        val result = segmenter.segmentTranscript("आलू", pendingCarryoverQty = 4.0)
+        assertEquals(1, result.segments.size)
+        assertEquals(4.0, result.segments[0].quantity, 0.01)
+    }
 }

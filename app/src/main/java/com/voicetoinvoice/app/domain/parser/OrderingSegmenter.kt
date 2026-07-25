@@ -320,7 +320,16 @@ private object GrammarLatticeDecoder {
             val whole = wholeTokenExpansions(raw, vocab)
             val exactOnly = whole.size == 1 && whole[0].emissionCost == EXACT_COST
             // Don't even consider splitting a token that exactly matches a known word.
-            if (exactOnly) whole else whole + splitExpansions(raw, vocab)
+            val all = if (exactOnly) whole else whole + splitExpansions(raw, vocab)
+            // Suspicion is a property of the SOURCE token, not of one reading of it.
+            // "किलोमीटर" is a mis-decode however we choose to carve it up, so the split
+            // readings have to inherit the flag too — otherwise the split wins the
+            // lattice (as it should) and silently drops the warning with it.
+            if (OrderingSegmenter.DISTANCE_UNIT_TOKENS.contains(raw.lowercase())) {
+                all.map { exp ->
+                    exp.copy(emissions = exp.emissions.map { it.copy(suspect = true) })
+                }
+            } else all
         }
 
         // dp[i][lastType] = cheapest cost of consuming tokens 0..i ending on lastType.
