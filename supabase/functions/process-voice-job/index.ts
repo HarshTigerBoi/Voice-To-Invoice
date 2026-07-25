@@ -18,12 +18,60 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
-// Model ids are env-configurable so they can be bumped without a redeploy of this
-// file. Defaults are the previously hardcoded values, so behaviour is unchanged until
-// the env var is set. `grok-2-latest` in particular is an old chat model and is a
-// known weak point in step 4 — set XAI_CHAT_MODEL to a current one.
-const XAI_CHAT_MODEL = Deno.env.get('XAI_CHAT_MODEL') || 'grok-2-latest'
-const SARVAM_STT_MODEL = Deno.env.get('SARVAM_STT_MODEL') || 'saarika:v2'
+// Model ids are env-configurable AND fall back down a chain at runtime.
+//
+// Pinning a single default is what caused ISSUE-021: `saarika:v2` was deprecated and
+// `grok-2-latest` was retired, so BOTH the second STT opinion and the entire step-4 AI
+// interpretation returned hard errors on every single job — silently, for an unknown
+// number of days, because nothing treats "this pipeline stage has never once succeeded"
+// as an alarm. Provider deprecations are routine and will happen again; they must
+// degrade to the next model, not kill a stage.
+//
+// Order matters: first entry is preferred, later entries are older fallbacks. The env
+// var (if set) is always tried first.
+const XAI_CHAT_MODELS: string[] = [
+  Deno.env.get('XAI_CHAT_MODEL') || '',
+  'grok-4.5',   // current flagship as of 2026-07
+  'grok-4.3',   // what the retired grok-4/grok-3 families now redirect to
+  'grok-4',
+].filter(Boolean)
+
+const SARVAM_STT_MODELS: string[] = [
+  Deno.env.get('SARVAM_STT_MODEL') || '',
+  'saaras:v3',     // current flagship; 19.31% WER on IndicVoices vs ~22% for the v2 line
+  'saarika:v2.5',  // v2 deprecated; the API's own 400 body names v2.5 as the successor
+  'saarika:v2',
+].filter(Boolean)
+
+// saaras:v3 accepts a `mode` parameter that older models reject, so it is only sent for
+// that model. VERBATIM, not TRANSLATE: translate mode emits English ("आलू" -> "potato"),
+// which would strip out exactly the Hindi phonetics that PhoneticKey and the segmenter
+// vocabulary are built to match against. Verbatim is word-for-word with no
+// normalization — the closest thing to raw phones this API exposes.
+const SARVAM_STT_MODE = Deno.env.get('SARVAM_STT_MODE') || 'verbatim'
+const supportsModeParam = (model: string) => model.startsWith('saaras:v3')
+
+// Once a model id is known to work in this isolate, stop paying for the discovery
+// round-trips. Reset naturally on cold start, which is how a newly-set env var or a
+// freshly-restored model gets picked up without a redeploy.
+let knownGoodChatModel: string | null = null
+let knownGoodSarvamModel: string | null = null
+
+/** True when an HTTP error body indicates "this model id is wrong/gone" rather than a
+ *  transient fault — the only case where advancing down the chain is meaningful. */
+function isModelUnavailableError(status: number | null, body: string): boolean {
+  if (status !== 400 && status !== 404 && status !== 422) return false
+  const b = (body || '').toLowerCase()
+  return b.includes('deprecat') || b.includes('model not found') ||
+    b.includes('does not exist') || b.includes('unknown model') ||
+    b.includes('invalid model') || b.includes('no longer')
+}
+
+/** Candidate order for this invocation: the known-good model first if we have one. */
+function modelChain(all: string[], knownGood: string | null): string[] {
+  if (!knownGood) return all
+  return [knownGood, ...all.filter(m => m !== knownGood)]
+}
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -57,6 +105,9 @@ interface SttOutcome {
   error: string | null
   httpStatus: number | null
   latencyMs: number
+  /** Which model id actually served this call. Recorded in the trace so a silent
+   *  fallback down the chain is visible instead of looking like the pinned default. */
+  model?: string
 }
 
 const EMPTY_STT: SttOutcome = { transcript: '', error: 'not attempted (missing API key)', httpStatus: null, latencyMs: 0 }
@@ -75,6 +126,7 @@ async function callGrokStt(
     const file = new File([bytes], `${jobId}.wav`, { type: 'audio/wav' })
     const form = new FormData()
     form.append('file', file, `${jobId}.wav`)
+    form.append('model', 'grok-stt')
     if (opts.language) form.append('language', opts.language)
     for (const k of opts.keyterms ?? []) form.append('keyterm', k)
 
@@ -100,11 +152,12 @@ async function callGrokStt(
   }
 }
 
-async function callSarvamStt(
+async function callSarvamSttOnce(
   audioBuffer: ArrayBuffer,
   jobId: string,
   apiKey: string,
-  opts: { model?: string; languageCode?: string; timeoutMs?: number } = {}
+  model: string,
+  opts: { languageCode?: string; timeoutMs?: number } = {}
 ): Promise<SttOutcome> {
   const started = Date.now()
   const controller = new AbortController()
@@ -115,7 +168,8 @@ async function callSarvamStt(
     const form = new FormData()
     form.append('file', file, `${jobId}.wav`)
     form.append('language_code', opts.languageCode ?? 'hi-IN')
-    form.append('model', opts.model ?? SARVAM_STT_MODEL)
+    form.append('model', model)
+    if (supportsModeParam(model)) form.append('mode', SARVAM_STT_MODE)
 
     const resp = await fetch('https://api.sarvam.ai/speech-to-text', {
       method: 'POST',
@@ -128,15 +182,38 @@ async function callSarvamStt(
 
     if (!resp.ok) {
       const body = await resp.text().catch(() => '')
-      return { transcript: '', error: `HTTP ${resp.status}: ${body.slice(0, 300)}`, httpStatus: resp.status, latencyMs }
+      return { transcript: '', error: `HTTP ${resp.status}: ${body.slice(0, 300)}`, httpStatus: resp.status, latencyMs, model }
     }
     const data = await resp.json()
-    return { transcript: (data.transcript || data.text || '').trim(), error: null, httpStatus: resp.status, latencyMs }
+    return { transcript: (data.transcript || data.text || '').trim(), error: null, httpStatus: resp.status, latencyMs, model }
   } catch (e: any) {
     clearTimeout(timeoutId)
     const msg = e?.name === 'AbortError' ? `timeout after ${opts.timeoutMs ?? 8000}ms` : (e?.message || String(e))
-    return { transcript: '', error: msg, httpStatus: null, latencyMs: Date.now() - started }
+    return { transcript: '', error: msg, httpStatus: null, latencyMs: Date.now() - started, model }
   }
+}
+
+/** Sarvam STT with model-deprecation fallback. Advances down [SARVAM_STT_MODELS] only
+ *  on an error that actually means "wrong model id" — a timeout or a 5xx is retried
+ *  against nothing, since the next model would fail identically. */
+async function callSarvamStt(
+  audioBuffer: ArrayBuffer,
+  jobId: string,
+  apiKey: string,
+  opts: { languageCode?: string; timeoutMs?: number } = {}
+): Promise<SttOutcome> {
+  const chain = modelChain(SARVAM_STT_MODELS, knownGoodSarvamModel)
+  let last: SttOutcome = { ...EMPTY_STT, error: 'no Sarvam model configured' }
+  for (const model of chain) {
+    last = await callSarvamSttOnce(audioBuffer, jobId, apiKey, model, opts)
+    if (!last.error) {
+      knownGoodSarvamModel = model
+      return last
+    }
+    if (!isModelUnavailableError(last.httpStatus, last.error)) return last
+    console.warn(`Sarvam model "${model}" unavailable, trying next: ${last.error}`)
+  }
+  return last
 }
 
 // -----------------------------------------------------------------------------
@@ -424,7 +501,7 @@ async function processVoiceJob(args: {
         ? callGrokStt(audioBuffer, jobId, xaiApiKey, { keyterms, language: 'hi' })
         : Promise.resolve(EMPTY_STT),
       sarvamApiKey
-        ? callSarvamStt(audioBuffer, jobId, sarvamApiKey, { model: SARVAM_STT_MODEL })
+        ? callSarvamStt(audioBuffer, jobId, sarvamApiKey)
         : Promise.resolve(EMPTY_STT),
     ])
 
@@ -469,20 +546,39 @@ async function processVoiceJob(args: {
     const needsReDecode = bestScore < 3
 
     if (needsReDecode && (xaiApiKey || sarvamApiKey)) {
-      // Keyterm biasing can itself drag a decode toward the wrong word, and the
-      // language hint can lock in a wrong language guess — so vary both.
-      const [grokRetry, sarvamRetry] = await Promise.all([
+      // Each variant must be capable of producing a DIFFERENT answer, or the pass is
+      // pure latency. The ISSUE-021 trace shows the old pair failing that test twice
+      // over: variant 2 was the dead Sarvam model (guaranteed HTTP 400), and variant 1
+      // differed from the first pass only in bias flags, so it returned the identical
+      // string. Two "recovery passes", zero recovery. The three below vary the three
+      // things that actually move a decode: the bias set, the language hint, and the
+      // acoustic model itself.
+      //
+      // Tight keyterms matter more than they look: the first pass sends 100 terms
+      // (catalog + numbers + units, capped), which spreads the bias so thin it barely
+      // registers. A short catalog-only list concentrates it where the ambiguity
+      // actually is — the item name.
+      const tightKeyterms = Array.from(new Set([
+        ...fullCatalogList,
+        ...DEFAULT_ITEM_VOCAB,
+      ])).slice(0, 25)
+
+      const [grokUnbiased, sarvamRetry, grokTight] = await Promise.all([
         xaiApiKey
           ? callGrokStt(audioBuffer, jobId, xaiApiKey, { keyterms: [], language: null, timeoutMs: 8000 })
           : Promise.resolve(EMPTY_STT),
         sarvamApiKey
-          ? callSarvamStt(audioBuffer, jobId, sarvamApiKey, { model: SARVAM_STT_MODEL, languageCode: 'unknown' })
+          ? callSarvamStt(audioBuffer, jobId, sarvamApiKey, { languageCode: 'unknown' })
+          : Promise.resolve(EMPTY_STT),
+        xaiApiKey
+          ? callGrokStt(audioBuffer, jobId, xaiApiKey, { keyterms: tightKeyterms, language: 'hi', timeoutMs: 8000 })
           : Promise.resolve(EMPTY_STT),
       ])
 
       const candidates = [
-        { label: 'grok_no_keyterms_no_language', outcome: grokRetry },
+        { label: 'grok_no_keyterms_no_language', outcome: grokUnbiased },
         { label: 'sarvam_language_autodetect', outcome: sarvamRetry },
+        { label: 'grok_tight_catalog_keyterms', outcome: grokTight },
       ]
 
       for (const c of candidates) {
@@ -494,6 +590,7 @@ async function processVoiceJob(args: {
           error: c.outcome.error,
           httpStatus: c.outcome.httpStatus,
           latencyMs: c.outcome.latencyMs,
+          model: c.outcome.model ?? null,
           score: scored.score,
           adopted: false,
         })
@@ -519,6 +616,7 @@ async function processVoiceJob(args: {
 
     let parsedRawItems: any[] = []
     let aiError: string | null = null
+    let aiModelUsed: string | null = null
 
     if ((rawGrokTranscript || rawSarvamTranscript || transcript) && xaiApiKey) {
       const systemPrompt = `You are a phonetic-aware parser for an Indian shopkeeper's voice orders.
@@ -593,51 +691,66 @@ weight them over the preprocessed transcript):
 
 Parse this order.`
 
-      const chatController = new AbortController()
-      const chatTimeoutId = setTimeout(() => chatController.abort(), 8000)
+      // Walk the model chain on deprecation errors, exactly as the STT calls do. This
+      // stage returned "Model not found: grok-2-latest" on every job in the ISSUE-021
+      // trace, which meant the app's most capable interpreter had been silently absent
+      // the whole time and every sale was riding on the rule-based segmenter alone.
+      for (const model of modelChain(XAI_CHAT_MODELS, knownGoodChatModel)) {
+        const chatController = new AbortController()
+        const chatTimeoutId = setTimeout(() => chatController.abort(), 8000)
+        try {
+          const grokResp = await fetch('https://api.x.ai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${xaiApiKey}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              model,
+              // A real user turn plus JSON mode: the previous version put everything in
+              // a single system message with no user turn and no response_format, which
+              // is a weak configuration for structured extraction.
+              messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt },
+              ],
+              response_format: { type: 'json_object' },
+              temperature: 0
+            }),
+            signal: chatController.signal
+          })
+          clearTimeout(chatTimeoutId)
 
-      try {
-        const grokResp = await fetch('https://api.x.ai/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${xaiApiKey}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            model: XAI_CHAT_MODEL,
-            // A real user turn plus JSON mode: the previous version put everything in
-            // a single system message with no user turn and no response_format, which
-            // is a weak configuration for structured extraction.
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt },
-            ],
-            response_format: { type: 'json_object' },
-            temperature: 0
-          }),
-          signal: chatController.signal
-        })
-        clearTimeout(chatTimeoutId)
-
-        if (grokResp.ok) {
-          const grokData = await grokResp.json()
-          const content = grokData.choices?.[0]?.message?.content || '{}'
-          const cleanContent = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
-          const match = cleanContent.match(/\{[\s\S]*\}/)
-          if (match) {
-            const parsedJson = JSON.parse(match[0])
-            if (Array.isArray(parsedJson.parsed_items)) {
-              parsedRawItems = parsedJson.parsed_items
+          if (grokResp.ok) {
+            const grokData = await grokResp.json()
+            const content = grokData.choices?.[0]?.message?.content || '{}'
+            const cleanContent = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
+            const match = cleanContent.match(/\{[\s\S]*\}/)
+            if (match) {
+              const parsedJson = JSON.parse(match[0])
+              if (Array.isArray(parsedJson.parsed_items)) {
+                parsedRawItems = parsedJson.parsed_items
+              }
             }
+            knownGoodChatModel = model
+            aiModelUsed = model
+            aiError = null
+            break
           }
-        } else {
-          aiError = `HTTP ${grokResp.status}: ${(await grokResp.text().catch(() => '')).slice(0, 300)}`
-          console.error('Grok AI chat failed:', aiError)
+
+          const body = await grokResp.text().catch(() => '')
+          aiError = `HTTP ${grokResp.status}: ${body.slice(0, 300)}`
+          if (!isModelUnavailableError(grokResp.status, body)) {
+            console.error('Grok AI chat failed:', aiError)
+            break
+          }
+          console.warn(`Grok chat model "${model}" unavailable, trying next: ${aiError}`)
+        } catch (aiErr: any) {
+          clearTimeout(chatTimeoutId)
+          aiError = aiErr?.name === 'AbortError' ? 'AI Timeout (8s limit)' : (aiErr?.message || String(aiErr))
+          console.error('Grok AI multi-item interpretation error:', aiError)
+          break
         }
-      } catch (aiErr: any) {
-        clearTimeout(chatTimeoutId)
-        aiError = aiErr?.name === 'AbortError' ? 'AI Timeout (8s limit)' : (aiErr?.message || String(aiErr))
-        console.error('Grok AI multi-item interpretation error:', aiError)
       }
     } else if (!xaiApiKey) {
       aiError = 'XAI_API_KEY not configured'
@@ -744,7 +857,15 @@ Parse this order.`
         // Failures are recorded explicitly — an empty transcript is no longer
         // indistinguishable from silence, a bad model name, or an auth failure.
         grokStt: { error: grokOutcome.error, httpStatus: grokOutcome.httpStatus, latencyMs: grokOutcome.latencyMs },
-        sarvamStt: { error: sarvamOutcome.error, httpStatus: sarvamOutcome.httpStatus, latencyMs: sarvamOutcome.latencyMs, model: SARVAM_STT_MODEL },
+        // `model` is the id that actually served the call, not the configured default —
+        // otherwise a silent fallback down the chain is invisible in the trace.
+        sarvamStt: {
+          error: sarvamOutcome.error,
+          httpStatus: sarvamOutcome.httpStatus,
+          latencyMs: sarvamOutcome.latencyMs,
+          model: sarvamOutcome.model ?? null,
+          mode: sarvamOutcome.model && supportsModeParam(sarvamOutcome.model) ? SARVAM_STT_MODE : null,
+        },
         transcriptScores: { grok: grokScored.score, sarvam: sarvamScored.score, adopted: bestScore },
       },
       step_3_deterministic_ordering_segmenter: {
@@ -770,6 +891,7 @@ Parse this order.`
         passesDetail,
       },
       step_4_ai_error: aiError,
+      step_4_ai_model: aiModelUsed,
       step_6_final_outcome: finalParsedItems.map(item => ({
         itemName: item.item_name,
         matchedCatalogId: item.item_id,

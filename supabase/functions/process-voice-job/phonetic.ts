@@ -211,13 +211,31 @@ export const HINDI_NUMBER_MAP: Record<string, number> = {
 }
 
 export const UNIT_SET: string[] = [
-  'kilo', 'kilos', 'kg', 'kgs', 'किलो', 'किलोग्राम', 'kilometer', 'किलोमीटर',
+  'kilo', 'kilos', 'kg', 'kgs', 'किलो', 'किलोग्राम',
   'gram', 'grams', 'gm', 'gms', 'ग्राम', 'g',
   'litre', 'litres', 'liter', 'liters', 'लीटर', 'l',
   'ml', 'एमएल',
   'packet', 'packets', 'pkt', 'पैकेट',
   'piece', 'pieces', 'pcs', 'नग',
   'dozen', 'dozens', 'दर्जन',
+]
+
+/**
+ * Distance words — impossible as shop units, therefore always an STT mis-decode.
+ *
+ * Mirrors OrderingSegmenter.DISTANCE_UNIT_TOKENS. These used to sit in UNIT_SET as a
+ * band-aid for "किलो X" being heard as "किलोमीटर", which backfired badly: an exact
+ * UNIT_SET hit emits at EXACT_COST and returns early from wholeTokenExpansions, which
+ * sets `exactOnly` in decode() and suppresses split expansions altogether. So
+ * "पांच किलोमीटर" decoded to NUM(5)+UNIT(KG) with no ITEM, closeSegment() never fired,
+ * and the sale came back as `segments: []`. See ISSUE-021.
+ */
+export const DISTANCE_UNIT_TOKENS: string[] = [
+  'kilometer', 'kilometers', 'kilometre', 'kilometres', 'km', 'kms',
+  'किलोमीटर', 'किलोमीटर्स',
+  'meter', 'meters', 'metre', 'metres', 'मीटर',
+  'centimeter', 'centimetre', 'cm', 'सेंटीमीटर',
+  'mile', 'miles', 'मील', 'foot', 'feet', 'फुट', 'फीट',
 ]
 
 /** Item words usable as the ITEM half of a fused token, in BOTH scripts. Kept in sync
@@ -254,7 +272,7 @@ type TokenType = 'NUM' | 'UNIT' | 'ITEM'
 
 interface VocabEntry { key: string; surface: string; numericValue?: number; canonicalUnit?: string }
 interface VocabHit { entry: VocabEntry; normalized: number }
-interface Emission { type: TokenType; cost: number; surface: string; numericValue?: number; canonicalUnit?: string }
+interface Emission { type: TokenType; cost: number; surface: string; numericValue?: number; canonicalUnit?: string; suspect?: boolean }
 interface Expansion { emissions: Emission[]; emissionCost: number }
 
 export interface SegmenterVocabulary {
@@ -285,12 +303,27 @@ const WHOLE_TOKEN_MAX_NORM = 0.25
 const SPLIT_PART_MAX_NORM = 0.30
 const MIN_SPLIT_PHONES = 2
 const SPLIT_PENALTY = 0.10
+// A distance word read whole, as an item name — priced above any plausible split of the
+// same token, so it only wins when nothing else matches at all and the token would
+// otherwise vanish.
+const DISTANCE_TOKEN_ITEM_COST = 2.5
 
 function transitionCost(prev: TokenType | null, curr: TokenType): number {
   if (prev === null) return curr === 'NUM' ? 0.0 : curr === 'ITEM' ? 0.3 : 1.0
   if (prev === 'NUM') return curr === 'UNIT' ? 0.0 : curr === 'ITEM' ? 0.3 : 4.0
   if (prev === 'UNIT') return curr === 'ITEM' ? 0.0 : curr === 'NUM' ? 2.0 : 3.0
   return curr === 'NUM' ? 0.0 : curr === 'UNIT' ? 1.5 : 0.2
+}
+
+/**
+ * Cost of finishing the utterance on `last`. A shopkeeper does not say "five kilos" and
+ * stop, so a decode ending on a bare quantity/unit is structurally incomplete and should
+ * lose to any reading that yields an item. Small on purpose: an exact UNIT_SET match
+ * costs 0.0 and returns before any ITEM alternative is offered, so a genuine trailing
+ * "चार किलो" (carryover to the next recording) has no competing path this can flip.
+ */
+function endCost(last: TokenType): number {
+  return last === 'ITEM' ? 0.0 : 0.6
 }
 
 function matchVocab(
@@ -322,6 +355,17 @@ function matchVocab(
 function wholeTokenExpansions(raw: string, vocab: SegmenterVocabulary): Expansion[] {
   const lower = raw.toLowerCase()
   const out: Expansion[] = []
+
+  // Distance word: never a real reading of shop speech. Offer only a suspect ITEM
+  // fallback so it can't be consumed as a unit, and so `exactOnly` stays false in
+  // decode() — which is what re-enables the split expansions that should actually
+  // carry this token (किलोमीटर -> किलो + मीटर).
+  if (DISTANCE_UNIT_TOKENS.includes(lower)) {
+    return [{
+      emissions: [{ type: 'ITEM', cost: DISTANCE_TOKEN_ITEM_COST, surface: raw, suspect: true }],
+      emissionCost: DISTANCE_TOKEN_ITEM_COST,
+    }]
+  }
 
   if (HINDI_NUMBER_MAP[lower] !== undefined) {
     out.push({ emissions: [{ type: 'NUM', cost: EXACT_COST, surface: raw, numericValue: HINDI_NUMBER_MAP[lower] }], emissionCost: EXACT_COST })
@@ -403,7 +447,10 @@ function splitExpansions(raw: string, vocab: SegmenterVocabulary): Expansion[] {
   return out
 }
 
-interface DecodedToken { type: TokenType; rawToken: string; numericValue?: number; canonicalUnit?: string }
+/** `suspect`: this reading rests on a token STT is known to have mangled (a distance
+ *  word). Quantity and unit are trustworthy; the item name is a guess that must reach
+ *  the review queue instead of auto-confirming. */
+interface DecodedToken { type: TokenType; rawToken: string; numericValue?: number; canonicalUnit?: string; suspect?: boolean }
 
 /**
  * Viterbi over a token-expansion lattice. State is (source token index, type of the
@@ -459,9 +506,15 @@ function decode(tokens: string[], vocab: SegmenterVocabulary): { decoded: Decode
     if (sorted.length >= 2) minGap = Math.min(minGap, sorted[1] - sorted[0])
   }
 
+  // The final state is picked on path cost PLUS the terminal penalty, so a decode that
+  // leaves the utterance hanging on a quantity or unit has to actually be cheaper to win.
   const chosen: Expansion[] = new Array(tokens.length)
   const last = dp[tokens.length - 1]
-  let currentType: TokenType = (Object.entries(last).sort((a, b) => (a[1] as number) - (b[1] as number))[0]?.[0] as TokenType) || 'ITEM'
+  let currentType: TokenType = (Object.entries(last)
+    .sort((a, b) =>
+      ((a[1] as number) + endCost(a[0] as TokenType)) -
+      ((b[1] as number) + endCost(b[0] as TokenType))
+    )[0]?.[0] as TokenType) || 'ITEM'
   for (let i = tokens.length - 1; i >= 0; i--) {
     const entry = back[i][currentType]
     if (!entry) {
@@ -476,7 +529,7 @@ function decode(tokens: string[], vocab: SegmenterVocabulary): { decoded: Decode
   const decoded: DecodedToken[] = []
   for (const exp of chosen) {
     for (const e of exp.emissions) {
-      decoded.push({ type: e.type, rawToken: e.surface, numericValue: e.numericValue, canonicalUnit: e.canonicalUnit })
+      decoded.push({ type: e.type, rawToken: e.surface, numericValue: e.numericValue, canonicalUnit: e.canonicalUnit, suspect: e.suspect })
     }
   }
   return { decoded, minGap }
@@ -515,6 +568,10 @@ export function segmentTranscript(
   let currentItemTokens: string[] = []
   let currentSegmentTokens: string[] = []
   let ambiguousDoubleQty = minGap < LOW_CONFIDENCE_GAP_THRESHOLD
+  // Set when a token in the current segment came from a reading the decoder itself
+  // distrusts (a distance word STT invented). Quantity and unit stay good; the item
+  // name is a guess, so the segment must reach review instead of auto-confirming.
+  let suspectReading = false
   const segments: RawItemSegment[] = []
 
   const closeSegment = () => {
@@ -526,7 +583,7 @@ export function segmentTranscript(
         quantity: currentQty ?? 1.0,
         unit: currentUnit ?? 'PACKET',
         itemTokens: [name],
-        isSanityFlagged: ambiguousDoubleQty,
+        isSanityFlagged: ambiguousDoubleQty || suspectReading,
       })
     }
     currentQty = null
@@ -534,9 +591,11 @@ export function segmentTranscript(
     currentItemTokens = []
     currentSegmentTokens = []
     ambiguousDoubleQty = false
+    suspectReading = false
   }
 
   for (const dt of decoded) {
+    if (dt.suspect) suspectReading = true
     if (dt.type === 'NUM') {
       if (currentItemTokens.length > 0) closeSegment()
       else if (currentQty !== null) ambiguousDoubleQty = true

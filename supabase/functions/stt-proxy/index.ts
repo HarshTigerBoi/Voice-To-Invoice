@@ -136,6 +136,7 @@ serve(async (req) => {
 
       const xaiFormData = new FormData()
       xaiFormData.append('file', audioFile, audioFile.name || 'audio.wav')
+      xaiFormData.append('model', 'grok-stt')
       xaiFormData.append('language', 'hi')
       xaiFormData.append('format', 'true')
 
@@ -185,7 +186,13 @@ serve(async (req) => {
       const sarvamFormData = new FormData()
       sarvamFormData.append('file', audioFile, audioFile.name || 'audio.wav')
       sarvamFormData.append('language_code', 'hi-IN')
-      sarvamFormData.append('model', 'saarika:v2')
+      // `saarika:v2` is deprecated and returns HTTP 400 (see ISSUE-021). saaras:v3 is
+      // the current model; `mode` is only accepted by saaras:v3, hence the guard.
+      const sarvamModel = Deno.env.get('SARVAM_STT_MODEL') || 'saaras:v3'
+      sarvamFormData.append('model', sarvamModel)
+      if (sarvamModel.startsWith('saaras:v3')) {
+        sarvamFormData.append('mode', Deno.env.get('SARVAM_STT_MODE') || 'verbatim')
+      }
 
       if (uniqueKeyterms.length > 0) {
         sarvamFormData.append('prompt', uniqueKeyterms.join(", "))

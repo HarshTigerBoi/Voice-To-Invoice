@@ -21,7 +21,11 @@ private data class DecodedToken(
     val type: TokenType,
     val rawToken: String,
     val numericValue: Double? = null,
-    val canonicalUnit: String? = null
+    val canonicalUnit: String? = null,
+    /** This reading rests on a token STT is known to have mangled (see
+     *  [OrderingSegmenter.DISTANCE_UNIT_TOKENS]). The quantity/unit are trustworthy;
+     *  the item name is a guess and must never auto-confirm. */
+    val suspect: Boolean = false
 )
 
 /** One typed piece a source token can decode to. A source token yields several of these
@@ -31,7 +35,8 @@ private data class Emission(
     val cost: Double,
     val surface: String,
     val numericValue: Double? = null,
-    val canonicalUnit: String? = null
+    val canonicalUnit: String? = null,
+    val suspect: Boolean = false
 )
 
 /** One complete reading of a single source token: either a whole-token reading
@@ -101,6 +106,28 @@ private object GrammarLatticeDecoder {
     // are what should decide between readings.
     private const val SPLIT_PENALTY = 0.10
 
+    // A distance word read whole, as an item name. Priced well above a normal split so
+    // any halfway-plausible [UNIT][ITEM] split of the same token wins — this exists only
+    // so the token still reaches the review queue if no split matches at all.
+    private const val DISTANCE_TOKEN_ITEM_COST = 2.5
+
+    /**
+     * Cost of finishing the utterance on [last].
+     *
+     * A shopkeeper does not say "five kilos" and stop — an order that decodes to a
+     * quantity and unit with no item is a structurally incomplete reading, and should
+     * lose to any reading that produces an item. Kept deliberately small: an exact
+     * UNIT_SET match costs 0.0 and returns before any ITEM alternative is even offered,
+     * so a genuine trailing "चार किलो" (the carryover-to-next-recording case) has no
+     * competing path this could flip. It only breaks near-ties, which is precisely
+     * where the ISSUE-021 class of error lives.
+     */
+    private fun endCost(last: TokenType): Double = when (last) {
+        TokenType.ITEM -> 0.0
+        TokenType.NUM -> 0.6
+        TokenType.UNIT -> 0.6
+    }
+
     private fun transitionCost(prev: TokenType?, curr: TokenType): Double {
         if (prev == null) {
             return when (curr) {
@@ -161,6 +188,20 @@ private object GrammarLatticeDecoder {
     private fun wholeTokenExpansions(raw: String, vocab: SegmenterVocabulary): List<Expansion> {
         val lower = raw.lowercase()
         val out = mutableListOf<Expansion>()
+
+        // A distance word is never a real reading of shop speech. Offer only a suspect
+        // ITEM fallback so the token can't be consumed as a unit and can't win on cost;
+        // the split expansions added by the caller are what should actually carry it
+        // (किलोमीटर -> किलो + मीटर). Returning a non-exact expansion here is deliberate:
+        // it keeps `exactOnly` false in decode(), which is what re-enables splitting.
+        if (OrderingSegmenter.DISTANCE_UNIT_TOKENS.contains(lower)) {
+            return listOf(
+                Expansion(
+                    listOf(Emission(TokenType.ITEM, DISTANCE_TOKEN_ITEM_COST, raw, suspect = true)),
+                    DISTANCE_TOKEN_ITEM_COST
+                )
+            )
+        }
 
         // Exact literal lookups stay exact — never route a known word through phonetics.
         OrderingSegmenter.HINDI_NUMBER_MAP[lower]?.let {
@@ -323,9 +364,12 @@ private object GrammarLatticeDecoder {
             if (sorted.size >= 2) minGap = min(minGap, sorted[1] - sorted[0])
         }
 
-        // Backtrack, collecting each token's winning expansion.
+        // Backtrack, collecting each token's winning expansion. The final state is
+        // picked on path cost PLUS the terminal penalty, so a decode that leaves the
+        // utterance hanging on a quantity or unit has to actually be cheaper to win.
         val chosen = arrayOfNulls<Expansion>(tokens.size)
-        var currentType = dp[tokens.size - 1].entries.minByOrNull { it.value }?.key ?: TokenType.ITEM
+        var currentType = dp[tokens.size - 1].entries
+            .minByOrNull { it.value + endCost(it.key) }?.key ?: TokenType.ITEM
         for (i in tokens.indices.reversed()) {
             val entry = back[i][currentType]
             if (entry == null) {
@@ -345,7 +389,8 @@ private object GrammarLatticeDecoder {
                         type = em.type,
                         rawToken = em.surface,
                         numericValue = em.numericValue,
-                        canonicalUnit = em.canonicalUnit
+                        canonicalUnit = em.canonicalUnit,
+                        suspect = em.suspect
                     )
                 )
             }
@@ -411,13 +456,39 @@ class OrderingSegmenter {
         )
 
         val UNIT_SET: Set<String> = setOf(
-            "kilo", "kilos", "kg", "kgs", "किलो", "किलोग्राम", "kilometer", "किलोमीटर",
+            "kilo", "kilos", "kg", "kgs", "किलो", "किलोग्राम",
             "gram", "grams", "gm", "gms", "ग्राम", "g",
             "litre", "litres", "liter", "liters", "लीटर", "l",
             "ml", "एमएल",
             "packet", "packets", "pkt", "पैकेट",
             "piece", "pieces", "pcs", "नग",
             "dozen", "dozens", "दर्जन"
+        )
+
+        /**
+         * Distance words. A shop ledger has no distance units, so any of these coming
+         * back from STT is a mis-decode by definition — never data.
+         *
+         * These used to live in [UNIT_SET] (mapping to KG via [normalizeUnit]) as a
+         * band-aid for "किलो X" being heard as "किलोमीटर". That band-aid was worse than
+         * the wound: an exact UNIT_SET hit emits at EXACT_COST and returns early from
+         * [GrammarLatticeDecoder.wholeTokenExpansions], which in turn sets `exactOnly`
+         * in [GrammarLatticeDecoder.decode] and suppresses split expansions entirely.
+         * So "पांच किलोमीटर" decoded as NUM(5) + UNIT(KG) with zero ITEM tokens,
+         * `closeSegment()` never fired, and the whole sale came back as `segments: []` —
+         * the shopkeeper's "paanch kilo maggie" vanished into an empty review row.
+         * See ISSUE-021.
+         *
+         * Now they are excluded from the unit vocabulary and forced down the split path,
+         * so "किलोमीटर" is offered to the lattice as किलो(UNIT) + मीटर(ITEM) and the
+         * quantity and unit survive even when the item name doesn't.
+         */
+        val DISTANCE_UNIT_TOKENS: Set<String> = setOf(
+            "kilometer", "kilometers", "kilometre", "kilometres", "km", "kms",
+            "किलोमीटर", "किलोमीटर्स",
+            "meter", "meters", "metre", "metres", "मीटर",
+            "centimeter", "centimetre", "cm", "सेंटीमीटर",
+            "mile", "miles", "मील", "foot", "feet", "फुट", "फीट"
         )
 
         /**
@@ -469,6 +540,11 @@ class OrderingSegmenter {
         var currentItemTokens = mutableListOf<String>()
         var currentSegmentTokens = mutableListOf<String>()
         var ambiguousDoubleQty = ambiguityGap < LOW_CONFIDENCE_GAP_THRESHOLD
+        // Set when any token in the current segment came from a reading the decoder
+        // itself distrusts (a distance word STT invented). The quantity and unit are
+        // still good; only the item name is a guess, so the segment must reach the
+        // review queue rather than auto-confirm.
+        var suspectReading = false
         val segments = mutableListOf<RawItemSegment>()
 
         fun closeSegment() {
@@ -480,7 +556,7 @@ class OrderingSegmenter {
                         unit = currentUnit,
                         itemTokens = currentItemTokens.toList(),
                         rawSegmentText = if (rawText.isNotBlank()) rawText else currentItemTokens.joinToString(" "),
-                        isSanityFlagged = ambiguousDoubleQty
+                        isSanityFlagged = ambiguousDoubleQty || suspectReading
                     )
                 )
             }
@@ -489,9 +565,11 @@ class OrderingSegmenter {
             currentItemTokens = mutableListOf()
             currentSegmentTokens = mutableListOf()
             ambiguousDoubleQty = false
+            suspectReading = false
         }
 
         for (dt in decoded) {
+            if (dt.suspect) suspectReading = true
             when (dt.type) {
                 TokenType.NUM -> {
                     if (currentItemTokens.isNotEmpty()) {

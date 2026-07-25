@@ -1,6 +1,11 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
+// Was hardcoded to `grok-2-latest` in three places, which xAI has since retired — every
+// call here returned "Model not found" until ISSUE-021. Keep it env-configurable and in
+// one place so the next deprecation is a secret change, not a code change.
+const XAI_CHAT_MODEL = Deno.env.get('XAI_CHAT_MODEL') || 'grok-4.5'
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', {
@@ -136,7 +141,7 @@ Output ONLY valid JSON formatted as:
                 'Content-Type': 'application/json'
               },
               body: JSON.stringify({
-                model: 'grok-2-latest',
+                model: XAI_CHAT_MODEL,
                 messages: [{ role: 'system', content: multiPrompt }],
                 temperature: 0
               })
@@ -198,7 +203,7 @@ Extract the sale into JSON format:
               'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-              model: 'grok-2-latest',
+              model: XAI_CHAT_MODEL,
               messages: [{ role: 'system', content: fullUtterancePrompt }],
               temperature: 0
             })
@@ -259,7 +264,7 @@ Output ONLY valid JSON format:
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            model: 'grok-2-latest',
+            model: XAI_CHAT_MODEL,
             messages: [
               { role: 'system', content: systemPrompt },
               { role: 'user', scope: userPrompt }
