@@ -22,7 +22,6 @@ import com.voicetoinvoice.app.ui.screens.settings.SettingsScreen
 import com.voicetoinvoice.app.ui.screens.stockin.StockInScreen
 import com.voicetoinvoice.app.ui.screens.summary.DailySummaryScreen
 import com.voicetoinvoice.app.ui.screens.udhaar.UdhaarScreen
-import com.voicetoinvoice.app.ui.screens.unmatched.UnmatchedQueueScreen
 import kotlinx.coroutines.launch
 import java.util.Calendar
 
@@ -60,7 +59,7 @@ class MainActivity : ComponentActivity() {
 }
 
 enum class Screen {
-    ONBOARDING, HOME, CATALOG, UDHAAR, PRICE_UPDATE, UNMATCHED_QUEUE, STOCK_IN, SUMMARY, SETTINGS, DIAGNOSTIC_LOGS
+    ONBOARDING, HOME, CATALOG, UDHAAR, PRICE_UPDATE, STOCK_IN, SUMMARY, SETTINGS, DIAGNOSTIC_LOGS
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -210,94 +209,6 @@ fun MainAppScreen(database: AppDatabase) {
                         onUpdatePrice = { item, newPrice ->
                             scope.launch {
                                 database.catalogDao().updatePrice(item.id, newPrice)
-                                syncEngine.syncAllUnsynced()
-                            }
-                        },
-                        onNavigateBack = { currentScreen = Screen.HOME }
-                    )
-                }
-                Screen.UNMATCHED_QUEUE -> {
-                    UnmatchedQueueScreen(
-                        unmatchedItems = unmatchedState,
-                        sttJobs = sttJobsState,
-                        catalog = catalogState,
-                        onConfirmSale = { unmatchedId, itemName, qty, unit, price, matchedItem ->
-                            scope.launch {
-                                val total = qty * price
-                                if (SaleValidation.isConfirmableSale(itemName, price, qty)) {
-                                    val resolvedItem = matchedItem ?: database.catalogDao().getActiveCatalogList().find { it.name.equals(itemName, ignoreCase = true) }
-                                    val targetRaw = unmatchedState.find { it.id == unmatchedId }?.rawTranscript ?: ""
-
-                                    val txRecord = com.voicetoinvoice.app.data.local.entity.TransactionRecord(
-                                        itemId = resolvedItem?.id ?: "unlisted-$unmatchedId",
-                                        itemName = resolvedItem?.name ?: itemName,
-                                        quantity = qty,
-                                        priceAtSale = resolvedItem?.price ?: price,
-                                        total = total,
-                                        paymentMode = com.voicetoinvoice.app.data.local.entity.PaymentMode.CASH,
-                                        source = com.voicetoinvoice.app.data.local.entity.TransactionSource.VOICE,
-                                        rawTranscript = targetRaw,
-                                        jobId = unmatchedId,
-                                        audioCloudUrl = "${SupabaseConfig.SUPABASE_URL}/storage/v1/object/public/voice-recordings/$unmatchedId.wav"
-                                    )
-
-                                    database.transactionDao().insert(txRecord)
-                                    database.unmatchedQueueDao().resolveItem(unmatchedId, com.voicetoinvoice.app.data.local.entity.UnmatchedStatus.RESOLVED, resolvedItem?.id)
-
-                                    // Update stt_jobs local record & trace log so stt_job_logs stays fully updated
-                                    val existingJob = database.sttJobDao().getJobById(unmatchedId)
-                                    if (existingJob != null) {
-                                        val traceObj = try { JSONObject(existingJob.diagnosticTraceJson) } catch (_: Exception) { JSONObject() }
-                                        val outcomeArr = JSONArray().apply {
-                                            put(JSONObject().apply {
-                                                put("itemName", resolvedItem?.name ?: itemName)
-                                                put("matchedCatalogId", resolvedItem?.id ?: JSONObject.NULL)
-                                                put("quantity", qty)
-                                                put("unit", unit)
-                                                put("priceAtSale", resolvedItem?.price ?: price)
-                                                put("estimatedTotal", total)
-                                                put("confidence", 1.0)
-                                                put("isSanityFlagged", false)
-                                                put("autoConfirmedToLedger", true)
-                                                put("userResolved", true)
-                                            })
-                                        }
-                                        traceObj.put("step_6_final_outcome", outcomeArr)
-
-                                        val updatedJob = existingJob.copy(
-                                            status = SttJobStatus.CONFIRMED,
-                                            parsedItemId = resolvedItem?.id,
-                                            parsedItemName = resolvedItem?.name ?: itemName,
-                                            parsedQty = qty,
-                                            parsedUnit = unit,
-                                            parsedTotal = total,
-                                            isSanityFlagged = false,
-                                            diagnosticTraceJson = traceObj.toString()
-                                        )
-                                        database.sttJobDao().updateJob(updatedJob)
-
-                                        val cloudSync = CloudSyncManager()
-                                        cloudSync.syncJobRecordToCloud(updatedJob)
-                                    }
-
-                                    val cloudSync = CloudSyncManager()
-                                    cloudSync.syncTransactionToCloud(txRecord)
-                                    cloudSync.syncReviewItemToCloud(com.voicetoinvoice.app.data.local.entity.UnmatchedQueueItem(
-                                        id = unmatchedId,
-                                        resolvedItemId = resolvedItem?.id,
-                                        rawTranscript = targetRaw,
-                                        status = com.voicetoinvoice.app.data.local.entity.UnmatchedStatus.RESOLVED
-                                    ))
-
-                                    syncEngine.syncAllUnsynced()
-                                }
-                            }
-                        },
-                        onDiscardItem = { item ->
-                            scope.launch {
-                                database.unmatchedQueueDao().resolveItem(item.id, com.voicetoinvoice.app.data.local.entity.UnmatchedStatus.DISCARDED, null)
-                                val cloudSync = CloudSyncManager()
-                                cloudSync.syncReviewItemToCloud(item.copy(status = com.voicetoinvoice.app.data.local.entity.UnmatchedStatus.DISCARDED))
                                 syncEngine.syncAllUnsynced()
                             }
                         },
