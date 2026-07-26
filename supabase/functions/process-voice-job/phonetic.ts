@@ -281,6 +281,12 @@ export const DEFAULT_ITEM_VOCAB: string[] = [
   'साबुन', 'Sabun', 'शैम्पू', 'Shampoo', 'अगरबत्ती', 'Agarbatti',
   'माचिस', 'Machis', 'बिस्कुट', 'Biscuit', 'ब्रेड', 'Bread',
   'नमकीन', 'Namkeen', 'सोना', 'Sona', 'चांदी', 'Chaandi',
+  // Pooja / religious items — ISSUE-023: "चंदन" (chandan) was absent everywhere, so a
+  // mis-hearing of it ("संधन") matched the phonetically-closer-but-wrong "संतरा" (Santra)
+  // at 0.214 instead of the actually-closer "चंदन" at 0.167, which did not exist to compete.
+  'चंदन', 'Chandan', 'कुमकुम', 'Kumkum', 'रोली', 'Roli', 'मौली', 'Mouli',
+  'अक्षत', 'Akshat', 'कपूर', 'Kapoor', 'धूप', 'Dhoop', 'दीया', 'Diya',
+  'रुई', 'Rooi', 'हवन सामग्री', 'Havan Samagri', 'गंगाजल', 'Gangajal',
 ]
 
 export function normalizeUnit(unitStr: string): string {

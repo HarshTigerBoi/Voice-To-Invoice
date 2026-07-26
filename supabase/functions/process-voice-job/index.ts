@@ -31,7 +31,6 @@ const CORS_HEADERS = {
 // var (if set) is always tried first.
 const XAI_CHAT_MODELS: string[] = [
   Deno.env.get('XAI_CHAT_MODEL') || '',
-  'grok-4.5',
   'grok-2-latest',
   'grok-2-1212',
   'grok-beta',
@@ -51,6 +50,16 @@ const SARVAM_STT_MODELS: string[] = [
 // normalization — the closest thing to raw phones this API exposes.
 const SARVAM_STT_MODE = Deno.env.get('SARVAM_STT_MODE') || 'verbatim'
 const supportsModeParam = (model: string) => model.startsWith('saaras:v3')
+
+// grok-4.x defaults reasoning_effort to 'high' when the parameter is omitted. That is
+// almost certainly why step 4 kept timing out even after the budget was raised
+// 8s -> 20s in ISSUE-022 (trace e0b68f80) and STILL timed out at 20s in the very next
+// trace (0df2895e) — a reasoning pass over a short JSON-extraction prompt has no reason
+// to need 20+ seconds unless the model is doing multi-step reasoning it wasn't asked to
+// do. This is a pure structured-extraction task (pick the closest of N known words),
+// not a task that benefits from deep reasoning, so force it low. See ISSUE-023.
+const XAI_REASONING_EFFORT = Deno.env.get('XAI_REASONING_EFFORT') || 'low'
+const supportsReasoningEffort = (model: string) => model.startsWith('grok-4')
 
 // Once a model id is known to work in this isolate, stop paying for the discovery
 // round-trips. Reset naturally on cold start, which is how a newly-set env var or a
@@ -793,7 +802,8 @@ Parse this order.`
                 { role: 'user', content: userPrompt },
               ],
               response_format: { type: 'json_object' },
-              temperature: 0
+              temperature: 0,
+              ...(supportsReasoningEffort(model) ? { reasoning_effort: XAI_REASONING_EFFORT } : {}),
             }),
             signal: chatController.signal
           })
