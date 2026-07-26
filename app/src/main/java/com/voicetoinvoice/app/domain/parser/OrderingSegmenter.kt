@@ -579,7 +579,15 @@ class OrderingSegmenter {
             "साबुन", "Sabun", "शैम्पू", "Shampoo", "अगरबत्ती", "Agarbatti",
             "माचिस", "Machis", "बिस्कुट", "Biscuit", "ब्रेड", "Bread", "नमकीन", "Namkeen",
             // Precious metals (this shop books these too)
-            "सोना", "Sona", "चांदी", "Chaandi"
+            "सोना", "Sona", "चांदी", "Chaandi",
+            // Pooja / religious items — a real kirana category, and the ISSUE-023 gap:
+            // "चंदन" (chandan, sandalwood paste) was absent everywhere, so a mis-hearing
+            // of it ("संधन") had no correct target to fall back on and matched the
+            // phonetically-closer-but-wrong "संतरा" (Santra/orange) instead — 0.214
+            // normalized distance to the wrong word beat having no right word at all.
+            "चंदन", "Chandan", "कुमकुम", "Kumkum", "रोली", "Roli", "मौली", "Mouli",
+            "अक्षत", "Akshat", "कपूर", "Kapoor", "धूप", "Dhoop", "दीया", "Diya",
+            "रुई", "Rooi", "हवन सामग्री", "Havan Samagri", "गंगाजल", "Gangajal"
         )
 
         // Ambiguity gap below this threshold means the lattice decoder had a genuinely

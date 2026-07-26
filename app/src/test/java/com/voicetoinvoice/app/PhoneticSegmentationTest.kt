@@ -330,6 +330,36 @@ class PhoneticSegmentationTest {
         assertNotNull(SalePlausibility.reason("KG", 0.0, 0.0))
     }
 
+    // ---------- ISSUE-023: a missing vocab word loses to a wrong-but-present one ----------
+    //
+    // Production trace 0df2895e-9542-4e07-a10c-7bed88e2dfdf: shopkeeper said
+    // "पांच किलो चंदन" (5 kg chandan / sandalwood paste, a real pooja-item kirana sale).
+    // Sarvam heard "पांच कुल संधन". "संधन" is genuinely closer to चंदन (normalized 0.167)
+    // than to any other vocab word — but चंदन did not exist in the vocabulary at all, so
+    // the decoder matched the nearest word that DID exist: "संतरा"/Santra (orange) at
+    // 0.214. A worse-but-present word beat a better-but-absent one, and the shopkeeper's
+    // sandalwood was booked toward review as "Santra".
+
+    @Test
+    fun chandanIsInTheDefaultVocabulary() {
+        val keys = OrderingSegmenter.DEFAULT_ITEM_VOCAB.map { PhoneticKey.of(it) }
+        assertTrue("चंदन must be in the default item vocabulary", keys.contains(PhoneticKey.of("चंदन")))
+    }
+
+    @Test
+    fun chandanMisheardAsSandhanNowResolvesCorrectly() {
+        // "संधन" must now resolve to चंदन (dist 0.167), not संतरा (dist 0.214) — the
+        // closer word wins once it actually exists as a competing candidate.
+        val result = segmenter.segmentTranscript("पांच कुल संधन")
+        assertEquals(1, result.segments.size)
+        assertEquals(5.0, result.segments[0].quantity, 0.01)
+        assertEquals("KG", result.segments[0].unit)
+        assertTrue(
+            "expected चंदन, got ${result.segments[0].itemTokens} (norm=${result.segments[0].itemMatchNorm})",
+            result.segments[0].itemTokens.any { PhoneticKey.of(it) == PhoneticKey.of("चंदन") }
+        )
+    }
+
     @Test
     fun fusedKiloAmchoorIsRecoveredFromTheSarvamReading() {
         // Sarvam heard "सात गुलामचूर" — "kilo am-choor" fused into one token. With अमचूर
