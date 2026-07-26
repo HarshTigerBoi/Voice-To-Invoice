@@ -313,28 +313,38 @@ function scoreTranscript(transcript: string, catalogNames: string[]): { score: n
   const { segments } = segmentTranscript(transcript, catalogNames)
   if (!segments.length) return { score: 0, segments: [] }
 
-  // Heavily penalize English/Latin hallucinations ("Charles Xavier", "tinggal sebab")
-  // when Hindi speech recognition was requested. Pure Devanagari STT output should win.
   const hasLatinScript = /[a-zA-Z]/.test(transcript)
   const hasDevanagari = /[\u0900-\u097F]/.test(transcript)
 
   const itemKeys = new Set([...DEFAULT_ITEM_VOCAB, ...catalogNames].map(n => phoneticKey(n)).filter(Boolean))
 
   let score = 0
-  if (hasLatinScript && !hasDevanagari) {
-    score -= 5
-  }
+  let recognizedCount = 0
 
   for (const seg of segments) {
     // A recognized item is the strongest signal that the audio was understood.
     const name = seg.itemTokens.join(' ')
-    if (itemKeys.has(phoneticKey(name))) score += 3
+    if (itemKeys.has(phoneticKey(name))) {
+      score += 3
+      recognizedCount++
+    }
     // An explicit unit means the [QTY][UNIT][ITEM] frame was actually found, rather
     // than the segmenter falling back to its PACKET default.
-    if (seg.unit && seg.unit !== 'PACKET') score += 2
+    if (seg.unit && seg.unit !== 'PACKET') {
+      score += 2
+      recognizedCount++
+    }
     if (seg.quantity && seg.quantity !== 1.0) score += 1
     if (seg.isSanityFlagged) score -= 2
   }
+
+  // Only penalize Latin script transcripts if they contain ZERO recognized retail items or units.
+  // This suppresses random STT hallucinations ("Charles Xavier", "tinggal sebab") while
+  // preserving legitimate English/Hinglish orders ("4 Packet Maggie", "2 KG Sugar").
+  if (hasLatinScript && !hasDevanagari && recognizedCount === 0) {
+    score -= 5
+  }
+
   return { score, segments }
 }
 
