@@ -926,7 +926,12 @@ Parse this order.`
       if (!matched) matched = catalogByKey.get(phoneticKey(rawName))
 
       const qty = rawItem.quantity || 1.0
-      const priceAtSale = matched ? matched.price : (rawItem.price || 0.0)
+      const spokenPrice = (typeof rawItem.price_at_sale === 'number' && rawItem.price_at_sale > 0)
+        ? rawItem.price_at_sale
+        : (typeof rawItem.price === 'number' && rawItem.price > 0)
+          ? rawItem.price
+          : 0.0
+      const priceAtSale = spokenPrice > 0 ? spokenPrice : (matched ? matched.price : 0.0)
       const total = qty * priceAtSale
       const isCatalogMatched = matched !== undefined
       const unit = rawItem.unit || (matched ? matched.unit_id : "PACKET")
