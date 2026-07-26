@@ -778,12 +778,11 @@ Rules:
    wrong, especially for item names outside its vocabulary. Treat it as one
    hint among three. When it conflicts with what the raw STT transcripts plus
    your own phonetic/catalog reasoning suggest, trust your own reasoning.
-8. RATE UPDATES vs QUANTITY SALES: If an utterance states an item name followed by a price number and a Rupee word (e.g. "गोल्ड पचास रुपये", "आलू 50 रुपये", "प्याज 30 Rs"), this is a CATALOG PRICE UPDATE ("[ITEM] [PRICE] रुपये"), NOT a sale of 50 pieces!
-   When a price update is detected:
-   - set "price_at_sale": <number stated before रुपये, e.g. 50>
-   - set "quantity": 1
-   - set "total": <price_at_sale>
-   - set "confidence": 0.90
+8. RATE UPDATES vs BULK TOTAL SALES:
+   - RATE UPDATE (No leading quantity or unit, e.g. "गोल्ड पचास रुपये", "आलू 50 रुपये", "प्याज 30 Rs"):
+     This is setting a catalog price for future sales. Set "price_at_sale": 50, "quantity": 1, "total": 50, "confidence": 0.90.
+   - BULK TOTAL SALE (Has a leading quantity or unit BEFORE the item + total price at end, e.g. "पाँच पैकेट गोल्ड दो सौ पचास रुपये", "5 KG Aaloo 200 Rs"):
+     This is a bulk discounted sale with explicit total bill amount. Set "quantity": 5, "unit": "PACKET", "total": 250, "price_at_sale": 50 (total / quantity), "confidence": 0.90.
 
 Output ONLY valid JSON, no prose, in exactly this shape:
 {
