@@ -29,4 +29,12 @@ class PttWindowLedger {
         lastEndMs = 0L
         pressTimestamps.clear()
     }
+
+    companion object {
+        @Volatile private var instance: PttWindowLedger? = null
+        fun getInstance(): PttWindowLedger =
+            instance ?: synchronized(this) {
+                instance ?: PttWindowLedger().also { instance = it }
+            }
+    }
 }

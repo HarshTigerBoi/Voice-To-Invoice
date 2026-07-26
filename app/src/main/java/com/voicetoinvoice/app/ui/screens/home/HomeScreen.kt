@@ -84,7 +84,7 @@ fun HomeScreen(
     val db = remember { AppDatabase.getInstance(context) }
     val audioRecorder = remember { AudioRecorder(context) }
     val rollingAudioBuffer = remember { RollingAudioBuffer(context) }
-    val pttWindowLedger = remember { PttWindowLedger() }
+    val pttWindowLedger = remember { PttWindowLedger.getInstance() }
     val onDeviceRecognizer = remember { OnDeviceSpeechRecognizer(context) }
 
     // Start background circular audio buffer on screen launch for zero mic-warmup latency
