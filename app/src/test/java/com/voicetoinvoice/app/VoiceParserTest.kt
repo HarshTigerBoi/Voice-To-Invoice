@@ -209,4 +209,11 @@ class VoiceParserTest {
         assertEquals("Paneer", parsed.matchedItem?.name)
         assertEquals(false, parsed.matchedItem?.name?.lowercase()?.contains("rupaya") ?: true)
     }
+
+    @Test
+    fun testPriceIntent_RateUpdate_RupayeSpellingVariant() {
+        val parsed = voiceParser.parseUtterance("gold 50 रुपए", sampleCatalog)
+        assertEquals(com.voicetoinvoice.app.domain.parser.PriceIntent.RATE_UPDATE, parsed.priceIntent)
+        assertEquals(50.0, parsed.updatedUnitPrice, 0.01)
+    }
 }

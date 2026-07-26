@@ -129,16 +129,110 @@ const MIN_PLAUSIBLE_SALE_VALUE = 5.0
  *  often the pipeline loses its only arbitration stage. */
 const AI_CHAT_TIMEOUT_MS = Number(Deno.env.get('AI_CHAT_TIMEOUT_MS') || '45000')
 
+const RUPEE_WORDS = new Set([
+  'rs', 'rs.', '₹',
+  'rupay', 'rupaye', 'rupaya', 'rupaiya', 'rupaiye',
+  'rupee', 'rupees',
+  'रुपये', 'रुपया', 'रुपए', 'रु', 'रूपये', 'रूपए'
+])
+
+export type PriceIntent = 'NONE' | 'RATE_UPDATE' | 'BULK_SALE_TOTAL' | 'AMBIGUOUS_UNTRUSTED'
+
+interface DeterministicPriceDetection {
+  priceIntent: PriceIntent
+  spokenPrice: number | null
+  hasLeadingQty: boolean
+  hasAmbiguousPriceNumber: boolean
+}
+
+/**
+ * Server-side mirror of VoiceParser.kt's deterministic price intent classifier.
+ * Analyzes the raw transcript for Rupee words ("रुपये", "रुपए", "rs") and price numbers.
+ */
+function detectPriceIntent(transcript: string): DeterministicPriceDetection {
+  if (!transcript || !transcript.trim()) {
+    return { priceIntent: 'NONE', spokenPrice: null, hasLeadingQty: false, hasAmbiguousPriceNumber: false }
+  }
+
+  const clean = transcript
+    .replace(/।/g, ' ')
+    .replace(/[.,?!\-\\()]/g, ' ')
+    .toLowerCase()
+    .trim()
+
+  const tokens = clean.split(/\s+/).filter(t => t.length > 0)
+  if (!tokens.length) {
+    return { priceIntent: 'NONE', spokenPrice: null, hasLeadingQty: false, hasAmbiguousPriceNumber: false }
+  }
+
+  let rupeeWordIdx = -1
+  for (let i = 0; i < tokens.length; i++) {
+    if (RUPEE_WORDS.has(tokens[i])) {
+      rupeeWordIdx = i
+      break
+    }
+  }
+
+  // Extract trailing number before or after Rupee word
+  let spokenPrice: number | null = null
+  if (rupeeWordIdx !== -1) {
+    if (rupeeWordIdx > 0) {
+      const prevVal = parseHindiOrNumericValue(tokens[rupeeWordIdx - 1])
+      if (prevVal !== null && prevVal > 0) spokenPrice = prevVal
+    }
+    if (spokenPrice === null && rupeeWordIdx < tokens.length - 1) {
+      const nextVal = parseHindiOrNumericValue(tokens[rupeeWordIdx + 1])
+      if (nextVal !== null && nextVal > 0) spokenPrice = nextVal
+    }
+  }
+
+  // Check if there is a leading quantity before the item name (token 0 is a number/unit)
+  const firstTokenVal = parseHindiOrNumericValue(tokens[0])
+  const firstTokenIsUnit = UNIT_SET.includes(tokens[0])
+  const hasLeadingQty = (firstTokenVal !== null && firstTokenVal > 0) || firstTokenIsUnit
+
+  // Check for ambiguous price number (a number >= 10 at the end without a Rupee word)
+  let hasAmbiguousPriceNumber = false
+  if (rupeeWordIdx === -1 && tokens.length >= 2) {
+    const lastTokenVal = parseHindiOrNumericValue(tokens[tokens.length - 1])
+    if (lastTokenVal !== null && lastTokenVal >= 10) {
+      hasAmbiguousPriceNumber = true
+    }
+  }
+
+  let priceIntent: PriceIntent = 'NONE'
+  if (hasAmbiguousPriceNumber) {
+    priceIntent = 'AMBIGUOUS_UNTRUSTED'
+  } else if (spokenPrice !== null && spokenPrice > 0 && !hasLeadingQty) {
+    priceIntent = 'RATE_UPDATE'
+  } else if (spokenPrice !== null && spokenPrice > 0 && hasLeadingQty) {
+    priceIntent = 'BULK_SALE_TOTAL'
+  }
+
+  return { priceIntent, spokenPrice, hasLeadingQty, hasAmbiguousPriceNumber }
+}
+
+function parseHindiOrNumericValue(token: string): number | null {
+  if (!token) return null
+  const num = parseFloat(token)
+  if (!isNaN(num)) return num
+  const norm = token.toLowerCase()
+  if (HINDI_NUMBER_MAP[norm] !== undefined) return HINDI_NUMBER_MAP[norm]
+  return null
+}
+
 /**
  * Domain sanity, independent of transcript confidence. A shopkeeper does not sell
  * 7 grams of anything — weight-in-grams is sold in 50/100/250/500 steps, and a
- * quantity of 7 there is a mis-heard unit (almost always KG heard as GRAM, exactly as
- * in trace e0b68f80 where "गिलम" matched `gram` at 0.100 and beat `kilo` at 0.300).
+ * quantity of 7 there is a mis-heard unit (almost always KG heard as GRAM).
  *
- * Returns a human-readable reason, or null when the combination is plausible. This
- * never blocks a sale — it only withholds AUTO-CONFIRM and routes to review.
+ * Also checks numeric consistency: if a number >= 10 appears in the transcript but
+ * is neither reflected in quantity, price_at_sale, nor total, the transcript's numbers
+ * were silently dropped during parsing.
+ *
+ * Returns a human-readable reason, or null when the combination is plausible.
  */
-function implausibilityReason(unit: string, qty: number, total: number): string | null {
+function implausibilityReason(unit: string, qty: number, total: number, rawTranscript: string = '', priceAtSale: number = 0): string | null {
   const u = (unit || '').toUpperCase()
   if (!(qty > 0)) return `quantity ${qty} is not positive`
 
@@ -154,6 +248,23 @@ function implausibilityReason(unit: string, qty: number, total: number): string 
   if (total > 0 && total < MIN_PLAUSIBLE_SALE_VALUE) {
     return `sale value ₹${total.toFixed(2)} is below the ₹${MIN_PLAUSIBLE_SALE_VALUE} auto-confirm floor`
   }
+
+  // Numeric consistency guard: check if any number >= 10 in transcript was silently dropped
+  if (rawTranscript) {
+    const tokens = rawTranscript.toLowerCase().replace(/।/g, ' ').replace(/[.,?!\-\\()]/g, ' ').split(/\s+/)
+    for (const t of tokens) {
+      const val = parseHindiOrNumericValue(t)
+      if (val !== null && val >= 10) {
+        const matchesQty = Math.abs(qty - val) < 0.01
+        const matchesPrice = Math.abs(priceAtSale - val) < 0.01
+        const matchesTotal = Math.abs(total - val) < 0.01
+        if (!matchesQty && !matchesPrice && !matchesTotal) {
+          return `spoken number ${val} in '${rawTranscript}' was not reflected in qty (${qty}), price (${priceAtSale}), or total (${total})`
+        }
+      }
+    }
+  }
+
   return null
 }
 
@@ -778,11 +889,15 @@ Rules:
    wrong, especially for item names outside its vocabulary. Treat it as one
    hint among three. When it conflicts with what the raw STT transcripts plus
    your own phonetic/catalog reasoning suggest, trust your own reasoning.
-8. RATE UPDATES vs BULK TOTAL SALES:
-   - RATE UPDATE (No leading quantity or unit, e.g. "गोल्ड पचास रुपये", "आलू 50 रुपये", "प्याज 30 Rs"):
-     This is setting a catalog price for future sales. Set "price_at_sale": 50, "quantity": 1, "total": 50, "confidence": 0.90.
-   - BULK TOTAL SALE (Has a leading quantity or unit BEFORE the item + total price at end, e.g. "पाँच पैकेट गोल्ड दो सौ पचास रुपये", "5 KG Aaloo 200 Rs"):
-     This is a bulk discounted sale with explicit total bill amount. Set "quantity": 5, "unit": "PACKET", "total": 250, "price_at_sale": 50 (total / quantity), "confidence": 0.90.
+8. RATE UPDATES vs BULK TOTAL SALES vs AMBIGUOUS NUMBERS:
+   - RATE UPDATE (Item name + price number + Rupee word, e.g. "गोल्ड पचास रुपये", "आलू 50 रुपये", "प्याज 30 Rs", with NO quantity before item):
+     Set "price_intent": "RATE_UPDATE", "price_at_sale": 50, "quantity": 1, "total": 50, "confidence": 0.90.
+   - BULK TOTAL SALE (Quantity/unit before item + item name + total price + Rupee word at end, e.g. "पाँच पैकेट गोल्ड दो सौ पचास रुपये", "5 KG Aaloo 200 Rs"):
+     Set "price_intent": "BULK_SALE_TOTAL", "quantity": 5, "unit": "PACKET", "total": 250, "price_at_sale": 50 (total / quantity), "confidence": 0.90.
+   - STANDARD SALE (Quantity/unit + item name, no price or Rupee word, e.g. "पाँच आलू", "2 KG Pyaz"):
+     Set "price_intent": "NONE", "quantity": 5, "unit": "PIECE", "price_at_sale": 0, "total": 0, "confidence": 0.85+.
+   - AMBIGUOUS NUMBER (Number present at end without any Rupee word, e.g. "पाँच आलू पचास"):
+     Set "price_intent": "AMBIGUOUS_UNTRUSTED", "confidence": 0.40.
 
 Output ONLY valid JSON, no prose, in exactly this shape:
 {
@@ -791,6 +906,9 @@ Output ONLY valid JSON, no prose, in exactly this shape:
       "item_name": "<clean title-case Hinglish or English item name, e.g. Baingan, Sona, Aaloo, Paneer>",
       "quantity": <number>,
       "unit": "<KG|GRAM|LITRE|ML|PACKET|PIECE|DOZEN>",
+      "price_at_sale": <number, 0 if not spoken>,
+      "total": <number, 0 if not spoken>,
+      "price_intent": "<NONE|RATE_UPDATE|BULK_SALE_TOTAL|AMBIGUOUS_UNTRUSTED>",
       "confidence": <number 0.0 to 1.0>,
       "matched_catalog": <boolean>
     }
@@ -915,6 +1033,9 @@ Parse this order.`
       if (k && !catalogByKey.has(k)) catalogByKey.set(k, dbItem)
     }
 
+    // Run deterministic price intent detection on raw STT transcript (server-side mirror of VoiceParser.kt)
+    const deterministicPrice = detectPriceIntent(chosenRaw)
+
     const finalParsedItems: any[] = parsedRawItems.map(rawItem => {
       const rawName = (rawItem.item_name || "").trim()
       const lowerN = rawName.toLowerCase()
@@ -925,19 +1046,46 @@ Parse this order.`
       })
       if (!matched) matched = catalogByKey.get(phoneticKey(rawName))
 
-      const qty = rawItem.quantity || 1.0
-      const spokenPrice = (typeof rawItem.price_at_sale === 'number' && rawItem.price_at_sale > 0)
-        ? rawItem.price_at_sale
-        : (typeof rawItem.price === 'number' && rawItem.price > 0)
-          ? rawItem.price
-          : 0.0
-      const priceAtSale = spokenPrice > 0 ? spokenPrice : (matched ? matched.price : 0.0)
-      const total = qty * priceAtSale
+      // Price Intent Determination: Deterministic Pre-Check takes precedence over LLM guess
+      const intent: PriceIntent = deterministicPrice.priceIntent !== 'NONE'
+        ? deterministicPrice.priceIntent
+        : ((rawItem.price_intent as PriceIntent) || 'NONE')
+
+      let qty = rawItem.quantity || 1.0
+      let spokenPrice = deterministicPrice.spokenPrice ?? 0.0
+      if (spokenPrice === 0.0) {
+        spokenPrice = (typeof rawItem.price_at_sale === 'number' && rawItem.price_at_sale > 0)
+          ? rawItem.price_at_sale
+          : (typeof rawItem.price === 'number' && rawItem.price > 0)
+            ? rawItem.price
+            : 0.0
+      }
+
+      let priceAtSale = 0.0
+      let total = 0.0
+
+      if (intent === 'RATE_UPDATE') {
+        qty = 1.0
+        priceAtSale = spokenPrice
+        total = spokenPrice
+      } else if (intent === 'BULK_SALE_TOTAL') {
+        total = spokenPrice
+        priceAtSale = qty > 0 ? total / qty : total
+      } else if (intent === 'AMBIGUOUS_UNTRUSTED') {
+        priceAtSale = 0.0
+        total = 0.0
+      } else {
+        priceAtSale = spokenPrice > 0 ? spokenPrice : (matched ? matched.price : 0.0)
+        total = qty * priceAtSale
+      }
+
       const isCatalogMatched = matched !== undefined
       const unit = rawItem.unit || (matched ? matched.unit_id : "PACKET")
 
       let confidence: number
-      if (typeof rawItem.confidence === 'number') {
+      if (intent === 'AMBIGUOUS_UNTRUSTED') {
+        confidence = 0.40
+      } else if (typeof rawItem.confidence === 'number') {
         confidence = isCatalogMatched ? rawItem.confidence : Math.min(rawItem.confidence, 0.60)
       } else if (isCatalogMatched) {
         confidence = confidenceFromMatchNorm(rawItem.item_match_norm)
@@ -945,7 +1093,7 @@ Parse this order.`
         confidence = 0.60
       }
 
-      const implausibility = implausibilityReason(unit, qty, total)
+      const implausibility = implausibilityReason(unit, qty, total, chosenRaw, priceAtSale)
       if (implausibility) confidence = Math.min(confidence, IMPLAUSIBLE_CONFIDENCE_CAP)
 
       return {
@@ -955,6 +1103,7 @@ Parse this order.`
         unit,
         price_at_sale: priceAtSale,
         total: total,
+        price_intent: intent,
         confidence: confidence,
         is_matched_to_catalog: isCatalogMatched,
         // Surfaced in the trace so a review-queue entry explains itself (Phase 0a logging).
