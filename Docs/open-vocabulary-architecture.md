@@ -65,6 +65,43 @@ Every correction a shopkeeper makes today is thrown in the bin. The system has m
 
 ---
 
+## 1.5 A fifth defect, confirmed live: "raw" transcript isn't raw
+
+Found while reading trace `26ee5b12` (shopkeeper said "chaar kilo sabun" — no wait, said something Sarvam heard as `"चार किलो सोयाबीन"`, soyabean). Grok mis-heard it as `"Charles Xavier"` (scored 3); Sarvam correctly heard soyabean (scored 6) and was correctly selected. Yet the trace's `rawTranscript` field read `"चार किलो साबुन"` — **soap**, not soyabean. Sarvam did nothing wrong. Something downstream rewrote a correct transcript into a wrong one and then labelled it "raw."
+
+**Root cause**, confirmed against the code, not assumed:
+
+```ts
+// process-voice-job/index.ts
+let chosenRaw = grokScored.score >= sarvamScored.score ? rawGrokTranscript : rawSarvamTranscript
+let transcript = chosenRaw ? normalizeTranscript(chosenRaw, fullCatalogList) : ''
+...
+step_2_stt_proxy_response: { rawTranscript: transcript, ... }   // NOT chosenRaw!
+```
+
+`normalizeTranscript()` (`phonetic.ts`) reconstructs its output by calling `segmentTranscript()` again and joining each segment's `rawSegmentText`. Inside the matcher, when an ITEM token fuzzy-matches a vocabulary word, the emission's `surface` field is set to **the matched vocabulary entry's canonical name**, not the literal token that was heard:
+
+```ts
+// wholeTokenExpansions(), phonetic.ts
+const it = matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, { allowEcho: true })
+if (it) {
+  out.push({ emissions: [{ type: 'ITEM', cost, surface: it.entry.surface, ... }], ... })
+  //                                     ^^^^^^^^^^^^^^^^ the MATCHED word, not the heard one
+}
+```
+
+Measured directly: `सोयाबीन`(soyabean) vs `साबुन`(soap) → normalized distance **0.214** — under the 0.25 accept threshold, so soyabean silently became soap. Same fraction (`3/14`) as the चंदन→संतरा and अमचूर→चोर collisions — this is the fourth occurrence of the identical bug class, just surfacing through a different code path this time.
+
+**Why this is worth a fix on its own, independent of the open-vocab redesign:**
+
+- It does **not** change what gets booked. The actual matching pipeline (`step3Segments` → `itemTokens` → `item_name`) tokenizes `chosenRaw` directly and was never touched by this — `normalizeTranscript()` is a *second*, redundant re-tokenization done purely for display. So this trace's booking outcome (correctly routed to review, `item_name: "Soyabean"` from a working step-4 AI call) was unaffected.
+- It **does** actively defeat the one tool this entire debugging process depends on: reading the trace. Every issue in this document was diagnosed by reading a trace and trusting its field names. A "raw" field that has been silently run through a fuzzy matcher is a lie to whoever reads it next — including the next agent who opens this repo with no memory of this conversation.
+- It **does** pollute the step-4 AI's own input. The prompt sends this string as `"Preprocessed Transcript (rule-based phonetic segmenter, may be wrong — see rule 7)"`. Rule 7 tells the model not to fully trust it, which is a decent safety net — but there is no reason to hand the model a wrong guess dressed up as transcript text when the *actual* heard text is sitting right there, unused.
+
+**The fix must be additive, not a rename.** `rawSegmentText` (the field currently misused for this) has a live consumer: `MultiSaleDetector.kt:22` re-parses `seg.rawSegmentText` through `VoiceParser.parseUtterance()` against the shop catalog — a *third*, independent matcher. Changing what that field contains would silently change matching behaviour in code that has nothing to do with this bug. Add a new field; leave the old one exactly as it is.
+
+---
+
 ## 2. Target invariants
 
 Write these as tests. If any can be violated, the design is wrong.
@@ -442,6 +479,100 @@ You have no protection against re-breaking a past fix. The `kilometer`-in-`UNIT_
 ## 8. Implementation phases
 
 Ordered by **(impact ÷ effort)**. Phase 0 is most of the value.
+
+### Phase 0-pre — Fix the raw/resolved conflation (½ day) ⚠️ do this first, it's the cheapest and safest change in this whole document
+
+Root cause and full reasoning: §1.5. This phase is independent of the margin/lexicon work — do it regardless of whether you proceed with anything else in this document, because it fixes a bug in the tool you use to diagnose everything else.
+
+**1. `OrderingSegmenter.kt` and `phonetic.ts` — add `heardText`, touch nothing else.**
+
+Add a field that always carries the literal source token, in parallel with the existing `surface`/`canonicalUnit`/etc. fields (which keep meaning "resolved/canonical" exactly as today):
+
+```kotlin
+// Emission (private data class) — add:
+val heardText: String   // the literal raw token this emission was derived from — NEVER the matched vocab surface
+
+// DecodedToken (private data class) — add the same, propagated in decode()'s
+// backtrack loop exactly the way matchNorm/suspect already are.
+```
+
+Populate it at **every** emission construction site in `wholeTokenExpansions()` and `splitExpansions()` — exact NUM/UNIT lookups, fuzzy NUM/UNIT/ITEM matches, split parts, the distance-token fallback. In each case `heardText` = the actual substring of the transcript this emission came from (`raw`, or the sliced `fragment` for a split part) — **never** `it.entry.surface`. Mirror identically in `phonetic.ts`'s `Emission`/`DecodedToken` interfaces and their construction sites (`wholeTokenExpansions`, `splitExpansions`, `em()` helper).
+
+**2. `RawItemSegment` — add `heardSegmentText`, leave `rawSegmentText` untouched.**
+
+```kotlin
+data class RawItemSegment(
+    ...
+    val rawSegmentText: String,        // UNCHANGED — still resolved/canonical, still feeds
+                                        // MultiSaleDetector.kt:22's re-parse against the catalog
+    val heardSegmentText: String = "", // NEW — literal heard text, built the same way but from
+                                        // heardText instead of the resolved surface
+)
+```
+
+In `closeSegment()` (both engines), build `heardSegmentText` by joining each token's `heardText`, parallel to how `rawSegmentText` is already built from `currentSegmentTokens`. Do not change what populates `rawSegmentText` or `itemTokens` — every existing consumer (`MultiSaleDetector`, `BackgroundSttProcessor`'s trace logging, `index.ts`'s fallback `item_name` derivation) keeps its current behaviour unchanged. This field is purely additive.
+
+**3. `phonetic.ts` — fix `normalizeTranscript()` itself.**
+
+```ts
+export function normalizeTranscript(transcript: string, catalogNames: string[] = []): string {
+  const { segments } = segmentTranscript(transcript, catalogNames)
+  if (!segments.length) return transcript
+  return segments.map(s => s.heardSegmentText || s.rawSegmentText).join(' ')  // was: s.rawSegmentText
+}
+```
+
+This is the one-line fix that stops the function from doing what it was never supposed to do — canonicalizing NUM/UNIT tokens (the fused-token splitting `normalizeTranscript` is actually *for*, e.g. "चरगलो" → "चार किलो") is safe and should still happen via those tokens' resolved surfaces; substituting a *different* ITEM word is not "cleaning," it's a silent reinterpretation, and should never have shared a code path with the former.
+
+**4. `index.ts` — stop lying in the trace, and stop feeding the AI a polluted hint.**
+
+```ts
+let chosenRaw = grokScored.score >= sarvamScored.score ? rawGrokTranscript : rawSarvamTranscript
+let transcript = chosenRaw ? normalizeTranscript(chosenRaw, fullCatalogList) : ''
+// transcript is now genuinely "cleaned" (NUM/UNIT canonicalized, ITEM tokens preserved as heard)
+
+step_2_stt_proxy_response: {
+  rawTranscript: chosenRaw,        // CHANGED — the actual, untouched winning STT string
+  normalizedTranscript: transcript, // NEW — the cleaned/hint version, honestly labelled
+  grokTranscript: rawGrokTranscript,
+  sarvamTranscript: rawSarvamTranscript,
+  ...
+}
+```
+
+The step-4 prompt's `"Preprocessed Transcript"` line already reads from the `transcript` variable — no change needed there once (3) is fixed, since that variable's *content* improves automatically. Just double check the prompt still calls it "Preprocessed Transcript," not "raw," so its own internal labelling stays honest too.
+
+**5. `BackgroundSttProcessor.kt`** — alongside the existing `put("rawSegmentText", seg.rawSegmentText)` trace logging, add `put("heardSegmentText", seg.heardSegmentText)` so the client-side diagnostic logs get the same honesty upgrade as the server trace.
+
+**6. Test.** Add directly to `PhoneticSegmentationTest.kt`, using this exact production case as the golden example:
+
+```kotlin
+@Test
+fun heardTextSurvivesEvenWhenItemIsMisresolved() {
+    // Production trace 26ee5b12: Sarvam correctly heard "सोयाबीन" (soyabean); the
+    // segmenter's own vocabulary fuzzy-matched it to "साबुन" (soap) at norm 0.214.
+    // The RESOLVED item name is allowed to be wrong here (that's what margin-gating
+    // in Phase 0b is for) — what must NEVER happen is losing the fact that "सोयाबीन"
+    // is what was actually said.
+    val result = segmenter.segmentTranscript("चार किलो सोयाबीन")
+    assertEquals(1, result.segments.size)
+    val seg = result.segments[0]
+    assertTrue(
+        "resolved item may legitimately be wrong pending Phase 0b, got ${seg.itemTokens}",
+        seg.itemTokens.isNotEmpty()
+    )
+    assertTrue(
+        "heardSegmentText must preserve सोयाबीन verbatim regardless of what it resolved to, got '${seg.heardSegmentText}'",
+        seg.heardSegmentText.contains("सोयाबीन")
+    )
+}
+```
+
+(TypeScript side cannot be executed the same way — no Deno toolchain in this repo per every prior issue's verification notes. Hand-verify `normalizeTranscript`'s new line against the Kotlin test's expectations before deploying.)
+
+**Ordering note:** do this before or alongside whatever margin/top-3 instrumentation is already in progress (visible on disk as `CandidateRank`/`top3Candidates`/`itemMargin` at the time of writing) — not because it corrupts that data (the margin computation happens inside `segmentTranscript`'s own token loop, on `chosenRaw` directly, so it's unaffected by this bug), but because once `heardText` exists at the emission level, it is the natural field to carry into `top3Candidates` and later into `unknown_tokens.heard_surfaces` (§5) — building that once now avoids re-touching the same emission constructors twice.
+
+---
 
 ### Phase 0a — Instrument first (½ day) ⚠️ do this before anything else
 - Log `top3` candidates + distances + margin for every item resolution into the diagnostic trace.

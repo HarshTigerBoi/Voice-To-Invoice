@@ -17,6 +17,9 @@ interface SttJobDao {
     @Query("SELECT * FROM stt_jobs WHERE id = :jobId LIMIT 1")
     suspend fun getJobById(jobId: String): SttJobRecord?
 
+    @Query("SELECT * FROM stt_jobs ORDER BY recordedAtMs DESC LIMIT 1")
+    suspend fun getLatestJob(): SttJobRecord?
+
     @Query("SELECT * FROM stt_jobs WHERE status = 'QUEUED' ORDER BY recordedAtMs ASC")
     suspend fun getQueuedJobsList(): List<SttJobRecord>
 

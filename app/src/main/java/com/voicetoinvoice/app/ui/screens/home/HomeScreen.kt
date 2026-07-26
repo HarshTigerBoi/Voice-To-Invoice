@@ -32,7 +32,8 @@ import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.voicetoinvoice.app.audio.AudioRecorder
-import com.voicetoinvoice.app.audio.DirectAudioRecorder
+import com.voicetoinvoice.app.audio.OnDeviceSpeechRecognizer
+import com.voicetoinvoice.app.audio.PttWindowLedger
 import com.voicetoinvoice.app.audio.RollingAudioBuffer
 import com.voicetoinvoice.app.data.local.AppDatabase
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
@@ -83,12 +84,15 @@ fun HomeScreen(
     val db = remember { AppDatabase.getInstance(context) }
     val audioRecorder = remember { AudioRecorder(context) }
     val rollingAudioBuffer = remember { RollingAudioBuffer(context) }
+    val pttWindowLedger = remember { PttWindowLedger() }
+    val onDeviceRecognizer = remember { OnDeviceSpeechRecognizer(context) }
 
     // Start background circular audio buffer on screen launch for zero mic-warmup latency
     DisposableEffect(Unit) {
         rollingAudioBuffer.startRollingBuffer()
         onDispose {
             rollingAudioBuffer.stopRollingBuffer()
+            onDeviceRecognizer.release()
         }
     }
 
@@ -246,6 +250,9 @@ fun HomeScreen(
                                         isRecording = true
                                         audioRecorder.triggerHapticVibration()
 
+                                        pttWindowLedger.recordPress(pressTimestamp)
+                                        try { onDeviceRecognizer.startListening("hi-IN") } catch (e: Exception) {}
+
                                         tryAwaitRelease()
 
                                         val releaseTimestamp = System.currentTimeMillis()
@@ -258,38 +265,57 @@ fun HomeScreen(
                                         }
 
                                         isRecording = false
+                                        try { onDeviceRecognizer.finishListening() } catch (e: Exception) {}
 
                                         val pressTs = pressTimestamp
                                         val releaseTs = releaseTimestamp
-                                        // Pre-roll: speech onset routinely precedes the button-down event being
-                                        // delivered, and AudioRecord adds its own buffer latency on top, so a
-                                        // window starting exactly at pressTs clips the leading consonant burst.
-                                        // On a ~1s utterance that is enough to turn "तीन" into "een". The whole
-                                        // point of the 30s ring buffer is that this audio is already captured —
-                                        // it just was never being asked for. See ISSUE-020.
-                                        val audioStartMs = pressTs - PRE_ROLL_MS
-                                        val audioEndMs = releaseTs + POST_ROLL_MS
 
                                         scope.launch(Dispatchers.IO) {
                                             delay(POST_ROLL_MS) // let the tail phonemes land in the ring buffer
+
+                                            val lastEnd = pttWindowLedger.lastConsumedEndMs()
+                                            val nextPress = pttWindowLedger.nextPressAfter(releaseTs)
+                                            val clampedStartMs = Math.max(pressTs - PRE_ROLL_MS, lastEnd)
+                                            val rawEndMs = releaseTs + POST_ROLL_MS
+                                            val clampedEndMs = if (nextPress != null) Math.min(rawEndMs, nextPress) else rawEndMs
+
+                                            val lastJob = db.sttJobDao().getLatestJob()
+                                            val prevId = lastJob?.id
+                                            val gapMs = if (lastJob != null && lastJob.audioEndMs > 0L) Math.max(0L, pressTs - lastJob.audioEndMs) else -1L
+
                                             val targetFile = File.createTempFile("voice_record_", ".wav", context.cacheDir)
                                             val extractedAudio = rollingAudioBuffer.extractAudioWindow(
-                                                startMs = audioStartMs,
-                                                endMs = audioEndMs,
-                                                outputFile = targetFile
+                                                startMs = clampedStartMs,
+                                                endMs = clampedEndMs,
+                                                outputFile = targetFile,
+                                                floorStartMs = clampedStartMs
                                             )
 
                                             if (extractedAudio != null && extractedAudio.length() > 0) {
+                                                pttWindowLedger.commitWindow(clampedStartMs, clampedEndMs)
+
                                                 val job = SttJobRecord(
                                                     audioFilePath = extractedAudio.absolutePath,
                                                     status = SttJobStatus.QUEUED,
                                                     holdDurationMs = holdDurationMs,
                                                     pressStartMs = pressTs,
                                                     releaseMs = releaseTs,
-                                                    audioStartMs = audioStartMs,
-                                                    audioEndMs = audioEndMs
+                                                    audioStartMs = clampedStartMs,
+                                                    audioEndMs = clampedEndMs,
+                                                    previousJobId = prevId,
+                                                    precedingGapMs = gapMs
                                                 )
                                                 db.sttJobDao().insertJob(job)
+
+                                                // Backfill on-device speech transcript asynchronously
+                                                scope.launch(Dispatchers.IO) {
+                                                    val text = onDeviceRecognizer.awaitTranscript(4000L)
+                                                    if (text.isNotBlank()) {
+                                                        db.sttJobDao().getJobById(job.id)?.let { currentJob ->
+                                                            db.sttJobDao().updateJob(currentJob.copy(onDeviceTranscript = text))
+                                                        }
+                                                    }
+                                                }
 
                                                 // Expedited WorkManager execution for closed-app / server-first processing
                                                 try {

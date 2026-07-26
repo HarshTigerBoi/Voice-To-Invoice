@@ -25,7 +25,7 @@ import kotlinx.coroutines.launch
         SttJobRecord::class,
         SupplierRecord::class
     ],
-    version = 10, // Bumped: Added suppliers table and supplierId column to stock_in in v10
+    version = 11, // Bumped: Added onDeviceTranscript, previousJobId, precedingGapMs to stt_jobs in v11
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -189,6 +189,19 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        // V11: Added onDeviceTranscript, previousJobId, precedingGapMs to stt_jobs table
+        private val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("ALTER TABLE stt_jobs ADD COLUMN onDeviceTranscript TEXT NOT NULL DEFAULT ''")
+                    db.execSQL("ALTER TABLE stt_jobs ADD COLUMN previousJobId TEXT")
+                    db.execSQL("ALTER TABLE stt_jobs ADD COLUMN precedingGapMs INTEGER NOT NULL DEFAULT -1")
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildDatabase(context).also { INSTANCE = it }
@@ -201,7 +214,7 @@ abstract class AppDatabase : RoomDatabase() {
                 AppDatabase::class.java,
                 "voice_to_invoice_db"
             )
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11)
             .fallbackToDestructiveMigration()
             .addCallback(object : Callback() {
                 override fun onCreate(db: SupportSQLiteDatabase) {

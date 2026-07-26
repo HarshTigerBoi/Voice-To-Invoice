@@ -105,43 +105,60 @@ class RollingAudioBuffer(private val context: Context) {
 
     /**
      * Extracts exact audio window between startMs and endMs from circular ring buffer,
-     * writing a valid WAV file. Safely guarded against reading unwritten buffer regions.
+     * writing a valid WAV file. Absolute-time addressing prevents scheduled drift and
+     * floorStartMs prevents silent backward expansion into preceding recordings.
      */
-    fun extractAudioWindow(startMs: Long, endMs: Long, outputFile: File): File? {
+    fun extractAudioWindow(startMs: Long, endMs: Long, outputFile: File, floorStartMs: Long = startMs): File? {
         return try {
-            val durationMs = Math.max(endMs - startMs, 500L)
-            var extractedBytes: ByteArray
-
-            synchronized(ringBuffer) {
-                val availableBytes = Math.min(totalBytesWritten, bufferCapacity.toLong()).toInt()
-                if (availableBytes <= 0) {
-                    Log.w("RollingAudioBuffer", "No valid PCM audio recorded in ring buffer yet.")
-                    return null
-                }
-
-                val now = System.currentTimeMillis()
-                val bytesBack = (Math.max(now - endMs, 0L) * bytesPerSecond / 1000L).toInt()
-                val clampedBytesBack = Math.min(bytesBack, Math.max(availableBytes - 16000, 0))
-
-                val requestedBytes = (durationMs * bytesPerSecond / 1000L).toInt()
-                val actualBytesToExtract = Math.min(Math.max(requestedBytes, 16000), availableBytes - clampedBytesBack)
-
-                if (actualBytesToExtract <= 0) {
-                    Log.w("RollingAudioBuffer", "actualBytesToExtract <= 0 (availableBytes: $availableBytes)")
-                    return null
-                }
-
-                extractedBytes = ByteArray(actualBytesToExtract)
-                var readStart = (writeHead - clampedBytesBack - actualBytesToExtract) % bufferCapacity
-                if (readStart < 0) readStart += bufferCapacity
-
-                for (i in 0 until actualBytesToExtract) {
-                    extractedBytes[i] = ringBuffer[(readStart + i) % bufferCapacity]
-                }
+            val recStarted = recordingStartedAtMs
+            if (recStarted <= 0L) {
+                Log.w("RollingAudioBuffer", "Buffer recording has not started yet.")
+                return null
             }
 
-            AudioWavWriter.writePcmToWav(extractedBytes, outputFile, sampleRate = sampleRate)
-            outputFile
+            val effectiveStartMs = Math.max(startMs, floorStartMs)
+            if (endMs <= effectiveStartMs) {
+                Log.w("RollingAudioBuffer", "endMs ($endMs) <= effectiveStartMs ($effectiveStartMs)")
+                return null
+            }
+
+            synchronized(ringBuffer) {
+                val totalWritten = totalBytesWritten
+                if (totalWritten <= 0) {
+                    Log.w("RollingAudioBuffer", "No valid PCM audio written to buffer yet.")
+                    return null
+                }
+
+                // Absolute byte offsets since recordingStartedAtMs
+                val startByteOffset = Math.max(0L, (effectiveStartMs - recStarted) * bytesPerSecond / 1000L)
+                val endByteOffset = Math.max(startByteOffset, (endMs - recStarted) * bytesPerSecond / 1000L)
+                val requestedBytes = (endByteOffset - startByteOffset).toInt()
+
+                val minStartAllowed = Math.max(0L, totalWritten - bufferCapacity)
+                if (startByteOffset < minStartAllowed) {
+                    Log.w("RollingAudioBuffer", "Requested start time was overwritten in ring buffer (start: $startByteOffset, minAllowed: $minStartAllowed)")
+                    return null
+                }
+
+                val actualEndOffset = Math.min(endByteOffset, totalWritten)
+                val actualBytesToExtract = (actualEndOffset - startByteOffset).toInt()
+
+                // Minimum ~300ms window threshold (9600 bytes at 32,000 bytes/sec)
+                if (actualBytesToExtract < 9600) {
+                    Log.w("RollingAudioBuffer", "Audio window too short after clamping ($actualBytesToExtract bytes < 9600)")
+                    return null
+                }
+
+                val extractedBytes = ByteArray(actualBytesToExtract)
+                val startRingIndex = (startByteOffset % bufferCapacity).toInt()
+
+                for (i in 0 until actualBytesToExtract) {
+                    extractedBytes[i] = ringBuffer[(startRingIndex + i) % bufferCapacity]
+                }
+
+                AudioWavWriter.writePcmToWav(extractedBytes, outputFile, sampleRate = sampleRate)
+                outputFile
+            }
         } catch (e: Exception) {
             Log.e("RollingAudioBuffer", "Failed to extract audio window safely", e)
             null

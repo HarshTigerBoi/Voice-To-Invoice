@@ -113,7 +113,15 @@ class BackgroundSttProcessor(
             }
 
             // Step 2: STT Proxy Transcription
-            var sttResult = sttProxyClient.transcribeAudioProxy(audioFile, catalogNames)
+            // Note: pendingCarryoverQty / pendingCarryoverUnit are local to processSingleJob. Carryover is strictly intra-transcript and NEVER crosses recording jobs.
+            var sttResult = sttProxyClient.transcribeAudioProxy(
+                audioFile = audioFile,
+                catalogContext = catalogNames,
+                jobId = job.id,
+                onDeviceTranscript = job.onDeviceTranscript,
+                previousJobId = job.previousJobId,
+                precedingGapMs = job.precedingGapMs
+            )
 
             when (sttResult) {
                 is SttResult.Success -> {
@@ -248,7 +256,14 @@ class BackgroundSttProcessor(
                             outputFile = expandFile
                         ) ?: break
 
-                        val retryStt = sttProxyClient.transcribeAudioProxy(expandedAudio, catalogNames)
+                        val retryStt = sttProxyClient.transcribeAudioProxy(
+                            audioFile = expandedAudio,
+                            catalogContext = catalogNames,
+                            jobId = job.id,
+                            onDeviceTranscript = job.onDeviceTranscript,
+                            previousJobId = job.previousJobId,
+                            precedingGapMs = job.precedingGapMs
+                        )
                         val passObj = JSONObject().apply {
                             put("passNumber", pass)
                             put("expandedStartMs", currentStartMs)

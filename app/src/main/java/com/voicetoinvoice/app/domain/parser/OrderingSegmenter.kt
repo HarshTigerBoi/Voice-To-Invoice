@@ -139,9 +139,8 @@ private object GrammarLatticeDecoder {
      * quantity and unit with no item is a structurally incomplete reading, and should
      * lose to any reading that produces an item. Kept deliberately small: an exact
      * UNIT_SET match costs 0.0 and returns before any ITEM alternative is even offered,
-     * so a genuine trailing "चार किलो" (the carryover-to-next-recording case) has no
-     * competing path this could flip. It only breaks near-ties, which is precisely
-     * where the ISSUE-021 class of error lives.
+     * so a trailing "चार किलो" (which carries over to the next item within this transcript) has no
+     * competing path this could flip. Carryover is strictly intra-transcript and never crosses recordings.
      */
     private fun endCost(last: TokenType): Double = when (last) {
         TokenType.ITEM -> 0.0

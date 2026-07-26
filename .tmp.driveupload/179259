@@ -1,0 +1,517 @@
+package com.voicetoinvoice.app.data.local.dao;
+
+import android.database.Cursor;
+import android.os.CancellationSignal;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.room.CoroutinesRoom;
+import androidx.room.EntityInsertionAdapter;
+import androidx.room.RoomDatabase;
+import androidx.room.RoomSQLiteQuery;
+import androidx.room.SharedSQLiteStatement;
+import androidx.room.util.CursorUtil;
+import androidx.room.util.DBUtil;
+import androidx.room.util.StringUtil;
+import androidx.sqlite.db.SupportSQLiteStatement;
+import com.voicetoinvoice.app.data.local.entity.CatalogItem;
+import java.lang.Class;
+import java.lang.Double;
+import java.lang.Exception;
+import java.lang.Object;
+import java.lang.Override;
+import java.lang.String;
+import java.lang.StringBuilder;
+import java.lang.SuppressWarnings;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+import javax.annotation.processing.Generated;
+import kotlin.Unit;
+import kotlin.coroutines.Continuation;
+import kotlinx.coroutines.flow.Flow;
+
+@Generated("androidx.room.RoomProcessor")
+@SuppressWarnings({"unchecked", "deprecation"})
+public final class CatalogDao_Impl implements CatalogDao {
+  private final RoomDatabase __db;
+
+  private final EntityInsertionAdapter<CatalogItem> __insertionAdapterOfCatalogItem;
+
+  private final SharedSQLiteStatement __preparedStmtOfUpdatePrice;
+
+  private final SharedSQLiteStatement __preparedStmtOfUpdateLowStockThreshold;
+
+  public CatalogDao_Impl(@NonNull final RoomDatabase __db) {
+    this.__db = __db;
+    this.__insertionAdapterOfCatalogItem = new EntityInsertionAdapter<CatalogItem>(__db) {
+      @Override
+      @NonNull
+      protected String createQuery() {
+        return "INSERT OR REPLACE INTO `catalog_items` (`id`,`shopId`,`name`,`unitId`,`price`,`active`,`updatedAt`,`synced`,`lowStockThreshold`) VALUES (?,?,?,?,?,?,?,?,?)";
+      }
+
+      @Override
+      protected void bind(@NonNull final SupportSQLiteStatement statement,
+          @NonNull final CatalogItem entity) {
+        statement.bindString(1, entity.getId());
+        statement.bindString(2, entity.getShopId());
+        statement.bindString(3, entity.getName());
+        statement.bindString(4, entity.getUnitId());
+        statement.bindDouble(5, entity.getPrice());
+        final int _tmp = entity.getActive() ? 1 : 0;
+        statement.bindLong(6, _tmp);
+        statement.bindLong(7, entity.getUpdatedAt());
+        final int _tmp_1 = entity.getSynced() ? 1 : 0;
+        statement.bindLong(8, _tmp_1);
+        if (entity.getLowStockThreshold() == null) {
+          statement.bindNull(9);
+        } else {
+          statement.bindDouble(9, entity.getLowStockThreshold());
+        }
+      }
+    };
+    this.__preparedStmtOfUpdatePrice = new SharedSQLiteStatement(__db) {
+      @Override
+      @NonNull
+      public String createQuery() {
+        final String _query = "UPDATE catalog_items SET price = ?, updatedAt = ?, synced = 0 WHERE id = ?";
+        return _query;
+      }
+    };
+    this.__preparedStmtOfUpdateLowStockThreshold = new SharedSQLiteStatement(__db) {
+      @Override
+      @NonNull
+      public String createQuery() {
+        final String _query = "UPDATE catalog_items SET lowStockThreshold = ? WHERE id = ?";
+        return _query;
+      }
+    };
+  }
+
+  @Override
+  public Object insertOrUpdate(final CatalogItem item,
+      final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        __db.beginTransaction();
+        try {
+          __insertionAdapterOfCatalogItem.insert(item);
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object insertAll(final List<CatalogItem> items,
+      final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        __db.beginTransaction();
+        try {
+          __insertionAdapterOfCatalogItem.insert(items);
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object updatePrice(final String id, final double newPrice, final long timestamp,
+      final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final SupportSQLiteStatement _stmt = __preparedStmtOfUpdatePrice.acquire();
+        int _argIndex = 1;
+        _stmt.bindDouble(_argIndex, newPrice);
+        _argIndex = 2;
+        _stmt.bindLong(_argIndex, timestamp);
+        _argIndex = 3;
+        _stmt.bindString(_argIndex, id);
+        try {
+          __db.beginTransaction();
+          try {
+            _stmt.executeUpdateDelete();
+            __db.setTransactionSuccessful();
+            return Unit.INSTANCE;
+          } finally {
+            __db.endTransaction();
+          }
+        } finally {
+          __preparedStmtOfUpdatePrice.release(_stmt);
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object updateLowStockThreshold(final String id, final Double threshold,
+      final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final SupportSQLiteStatement _stmt = __preparedStmtOfUpdateLowStockThreshold.acquire();
+        int _argIndex = 1;
+        if (threshold == null) {
+          _stmt.bindNull(_argIndex);
+        } else {
+          _stmt.bindDouble(_argIndex, threshold);
+        }
+        _argIndex = 2;
+        _stmt.bindString(_argIndex, id);
+        try {
+          __db.beginTransaction();
+          try {
+            _stmt.executeUpdateDelete();
+            __db.setTransactionSuccessful();
+            return Unit.INSTANCE;
+          } finally {
+            __db.endTransaction();
+          }
+        } finally {
+          __preparedStmtOfUpdateLowStockThreshold.release(_stmt);
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Flow<List<CatalogItem>> getActiveCatalog() {
+    final String _sql = "SELECT * FROM catalog_items WHERE active = 1 ORDER BY name ASC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    return CoroutinesRoom.createFlow(__db, false, new String[] {"catalog_items"}, new Callable<List<CatalogItem>>() {
+      @Override
+      @NonNull
+      public List<CatalogItem> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfName = CursorUtil.getColumnIndexOrThrow(_cursor, "name");
+          final int _cursorIndexOfUnitId = CursorUtil.getColumnIndexOrThrow(_cursor, "unitId");
+          final int _cursorIndexOfPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "price");
+          final int _cursorIndexOfActive = CursorUtil.getColumnIndexOrThrow(_cursor, "active");
+          final int _cursorIndexOfUpdatedAt = CursorUtil.getColumnIndexOrThrow(_cursor, "updatedAt");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final int _cursorIndexOfLowStockThreshold = CursorUtil.getColumnIndexOrThrow(_cursor, "lowStockThreshold");
+          final List<CatalogItem> _result = new ArrayList<CatalogItem>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final CatalogItem _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpName;
+            _tmpName = _cursor.getString(_cursorIndexOfName);
+            final String _tmpUnitId;
+            _tmpUnitId = _cursor.getString(_cursorIndexOfUnitId);
+            final double _tmpPrice;
+            _tmpPrice = _cursor.getDouble(_cursorIndexOfPrice);
+            final boolean _tmpActive;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfActive);
+            _tmpActive = _tmp != 0;
+            final long _tmpUpdatedAt;
+            _tmpUpdatedAt = _cursor.getLong(_cursorIndexOfUpdatedAt);
+            final boolean _tmpSynced;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_1 != 0;
+            final Double _tmpLowStockThreshold;
+            if (_cursor.isNull(_cursorIndexOfLowStockThreshold)) {
+              _tmpLowStockThreshold = null;
+            } else {
+              _tmpLowStockThreshold = _cursor.getDouble(_cursorIndexOfLowStockThreshold);
+            }
+            _item = new CatalogItem(_tmpId,_tmpShopId,_tmpName,_tmpUnitId,_tmpPrice,_tmpActive,_tmpUpdatedAt,_tmpSynced,_tmpLowStockThreshold);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+        }
+      }
+
+      @Override
+      protected void finalize() {
+        _statement.release();
+      }
+    });
+  }
+
+  @Override
+  public Object getActiveCatalogList(final Continuation<? super List<CatalogItem>> $completion) {
+    final String _sql = "SELECT * FROM catalog_items WHERE active = 1 ORDER BY name ASC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<CatalogItem>>() {
+      @Override
+      @NonNull
+      public List<CatalogItem> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfName = CursorUtil.getColumnIndexOrThrow(_cursor, "name");
+          final int _cursorIndexOfUnitId = CursorUtil.getColumnIndexOrThrow(_cursor, "unitId");
+          final int _cursorIndexOfPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "price");
+          final int _cursorIndexOfActive = CursorUtil.getColumnIndexOrThrow(_cursor, "active");
+          final int _cursorIndexOfUpdatedAt = CursorUtil.getColumnIndexOrThrow(_cursor, "updatedAt");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final int _cursorIndexOfLowStockThreshold = CursorUtil.getColumnIndexOrThrow(_cursor, "lowStockThreshold");
+          final List<CatalogItem> _result = new ArrayList<CatalogItem>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final CatalogItem _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpName;
+            _tmpName = _cursor.getString(_cursorIndexOfName);
+            final String _tmpUnitId;
+            _tmpUnitId = _cursor.getString(_cursorIndexOfUnitId);
+            final double _tmpPrice;
+            _tmpPrice = _cursor.getDouble(_cursorIndexOfPrice);
+            final boolean _tmpActive;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfActive);
+            _tmpActive = _tmp != 0;
+            final long _tmpUpdatedAt;
+            _tmpUpdatedAt = _cursor.getLong(_cursorIndexOfUpdatedAt);
+            final boolean _tmpSynced;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_1 != 0;
+            final Double _tmpLowStockThreshold;
+            if (_cursor.isNull(_cursorIndexOfLowStockThreshold)) {
+              _tmpLowStockThreshold = null;
+            } else {
+              _tmpLowStockThreshold = _cursor.getDouble(_cursorIndexOfLowStockThreshold);
+            }
+            _item = new CatalogItem(_tmpId,_tmpShopId,_tmpName,_tmpUnitId,_tmpPrice,_tmpActive,_tmpUpdatedAt,_tmpSynced,_tmpLowStockThreshold);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object getById(final String id, final Continuation<? super CatalogItem> $completion) {
+    final String _sql = "SELECT * FROM catalog_items WHERE id = ? LIMIT 1";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 1);
+    int _argIndex = 1;
+    _statement.bindString(_argIndex, id);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<CatalogItem>() {
+      @Override
+      @Nullable
+      public CatalogItem call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfName = CursorUtil.getColumnIndexOrThrow(_cursor, "name");
+          final int _cursorIndexOfUnitId = CursorUtil.getColumnIndexOrThrow(_cursor, "unitId");
+          final int _cursorIndexOfPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "price");
+          final int _cursorIndexOfActive = CursorUtil.getColumnIndexOrThrow(_cursor, "active");
+          final int _cursorIndexOfUpdatedAt = CursorUtil.getColumnIndexOrThrow(_cursor, "updatedAt");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final int _cursorIndexOfLowStockThreshold = CursorUtil.getColumnIndexOrThrow(_cursor, "lowStockThreshold");
+          final CatalogItem _result;
+          if (_cursor.moveToFirst()) {
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpName;
+            _tmpName = _cursor.getString(_cursorIndexOfName);
+            final String _tmpUnitId;
+            _tmpUnitId = _cursor.getString(_cursorIndexOfUnitId);
+            final double _tmpPrice;
+            _tmpPrice = _cursor.getDouble(_cursorIndexOfPrice);
+            final boolean _tmpActive;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfActive);
+            _tmpActive = _tmp != 0;
+            final long _tmpUpdatedAt;
+            _tmpUpdatedAt = _cursor.getLong(_cursorIndexOfUpdatedAt);
+            final boolean _tmpSynced;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_1 != 0;
+            final Double _tmpLowStockThreshold;
+            if (_cursor.isNull(_cursorIndexOfLowStockThreshold)) {
+              _tmpLowStockThreshold = null;
+            } else {
+              _tmpLowStockThreshold = _cursor.getDouble(_cursorIndexOfLowStockThreshold);
+            }
+            _result = new CatalogItem(_tmpId,_tmpShopId,_tmpName,_tmpUnitId,_tmpPrice,_tmpActive,_tmpUpdatedAt,_tmpSynced,_tmpLowStockThreshold);
+          } else {
+            _result = null;
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object getUnsyncedCatalog(final Continuation<? super List<CatalogItem>> $completion) {
+    final String _sql = "SELECT * FROM catalog_items WHERE synced = 0";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<CatalogItem>>() {
+      @Override
+      @NonNull
+      public List<CatalogItem> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfName = CursorUtil.getColumnIndexOrThrow(_cursor, "name");
+          final int _cursorIndexOfUnitId = CursorUtil.getColumnIndexOrThrow(_cursor, "unitId");
+          final int _cursorIndexOfPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "price");
+          final int _cursorIndexOfActive = CursorUtil.getColumnIndexOrThrow(_cursor, "active");
+          final int _cursorIndexOfUpdatedAt = CursorUtil.getColumnIndexOrThrow(_cursor, "updatedAt");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final int _cursorIndexOfLowStockThreshold = CursorUtil.getColumnIndexOrThrow(_cursor, "lowStockThreshold");
+          final List<CatalogItem> _result = new ArrayList<CatalogItem>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final CatalogItem _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpName;
+            _tmpName = _cursor.getString(_cursorIndexOfName);
+            final String _tmpUnitId;
+            _tmpUnitId = _cursor.getString(_cursorIndexOfUnitId);
+            final double _tmpPrice;
+            _tmpPrice = _cursor.getDouble(_cursorIndexOfPrice);
+            final boolean _tmpActive;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfActive);
+            _tmpActive = _tmp != 0;
+            final long _tmpUpdatedAt;
+            _tmpUpdatedAt = _cursor.getLong(_cursorIndexOfUpdatedAt);
+            final boolean _tmpSynced;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_1 != 0;
+            final Double _tmpLowStockThreshold;
+            if (_cursor.isNull(_cursorIndexOfLowStockThreshold)) {
+              _tmpLowStockThreshold = null;
+            } else {
+              _tmpLowStockThreshold = _cursor.getDouble(_cursorIndexOfLowStockThreshold);
+            }
+            _item = new CatalogItem(_tmpId,_tmpShopId,_tmpName,_tmpUnitId,_tmpPrice,_tmpActive,_tmpUpdatedAt,_tmpSynced,_tmpLowStockThreshold);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Flow<List<StockLevel>> getStockLevels() {
+    final String _sql = "\n"
+            + "        SELECT c.id as itemId,\n"
+            + "          COALESCE((SELECT SUM(s.quantity) FROM stock_in s WHERE s.itemId = c.id), 0.0) -\n"
+            + "          COALESCE((SELECT SUM(t.quantity) FROM transactions t WHERE t.itemId = c.id), 0.0) as onHand\n"
+            + "        FROM catalog_items c\n"
+            + "        WHERE c.active = 1\n"
+            + "    ";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    return CoroutinesRoom.createFlow(__db, false, new String[] {"stock_in", "transactions",
+        "catalog_items"}, new Callable<List<StockLevel>>() {
+      @Override
+      @NonNull
+      public List<StockLevel> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfItemId = 0;
+          final int _cursorIndexOfOnHand = 1;
+          final List<StockLevel> _result = new ArrayList<StockLevel>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final StockLevel _item;
+            final String _tmpItemId;
+            _tmpItemId = _cursor.getString(_cursorIndexOfItemId);
+            final double _tmpOnHand;
+            _tmpOnHand = _cursor.getDouble(_cursorIndexOfOnHand);
+            _item = new StockLevel(_tmpItemId,_tmpOnHand);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+        }
+      }
+
+      @Override
+      protected void finalize() {
+        _statement.release();
+      }
+    });
+  }
+
+  @Override
+  public Object markSynced(final List<String> ids, final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final StringBuilder _stringBuilder = StringUtil.newStringBuilder();
+        _stringBuilder.append("UPDATE catalog_items SET synced = 1 WHERE id IN (");
+        final int _inputSize = ids.size();
+        StringUtil.appendPlaceholders(_stringBuilder, _inputSize);
+        _stringBuilder.append(")");
+        final String _sql = _stringBuilder.toString();
+        final SupportSQLiteStatement _stmt = __db.compileStatement(_sql);
+        int _argIndex = 1;
+        for (String _item : ids) {
+          _stmt.bindString(_argIndex, _item);
+          _argIndex++;
+        }
+        __db.beginTransaction();
+        try {
+          _stmt.executeUpdateDelete();
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @NonNull
+  public static List<Class<?>> getRequiredConverters() {
+    return Collections.emptyList();
+  }
+}

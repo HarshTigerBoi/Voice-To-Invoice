@@ -1,0 +1,766 @@
+package com.voicetoinvoice.app.data.local.dao;
+
+import android.database.Cursor;
+import android.os.CancellationSignal;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.room.CoroutinesRoom;
+import androidx.room.EntityInsertionAdapter;
+import androidx.room.RoomDatabase;
+import androidx.room.RoomSQLiteQuery;
+import androidx.room.SharedSQLiteStatement;
+import androidx.room.util.CursorUtil;
+import androidx.room.util.DBUtil;
+import androidx.room.util.StringUtil;
+import androidx.sqlite.db.SupportSQLiteStatement;
+import com.voicetoinvoice.app.data.local.Converters;
+import com.voicetoinvoice.app.data.local.entity.PaymentMode;
+import com.voicetoinvoice.app.data.local.entity.TransactionRecord;
+import com.voicetoinvoice.app.data.local.entity.TransactionSource;
+import java.lang.Class;
+import java.lang.Double;
+import java.lang.Exception;
+import java.lang.Object;
+import java.lang.Override;
+import java.lang.String;
+import java.lang.StringBuilder;
+import java.lang.SuppressWarnings;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+import javax.annotation.processing.Generated;
+import kotlin.Unit;
+import kotlin.coroutines.Continuation;
+import kotlinx.coroutines.flow.Flow;
+
+@Generated("androidx.room.RoomProcessor")
+@SuppressWarnings({"unchecked", "deprecation"})
+public final class TransactionDao_Impl implements TransactionDao {
+  private final RoomDatabase __db;
+
+  private final EntityInsertionAdapter<TransactionRecord> __insertionAdapterOfTransactionRecord;
+
+  private final Converters __converters = new Converters();
+
+  private final SharedSQLiteStatement __preparedStmtOfMarkTransactionPaidViaUpi;
+
+  public TransactionDao_Impl(@NonNull final RoomDatabase __db) {
+    this.__db = __db;
+    this.__insertionAdapterOfTransactionRecord = new EntityInsertionAdapter<TransactionRecord>(__db) {
+      @Override
+      @NonNull
+      protected String createQuery() {
+        return "INSERT OR REPLACE INTO `transactions` (`id`,`shopId`,`itemId`,`itemName`,`quantity`,`priceAtSale`,`total`,`paymentMode`,`timestamp`,`source`,`deviceId`,`synced`,`rawTranscript`,`audioFilePath`,`jobId`,`audioCloudUrl`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+      }
+
+      @Override
+      protected void bind(@NonNull final SupportSQLiteStatement statement,
+          @NonNull final TransactionRecord entity) {
+        statement.bindString(1, entity.getId());
+        statement.bindString(2, entity.getShopId());
+        statement.bindString(3, entity.getItemId());
+        statement.bindString(4, entity.getItemName());
+        statement.bindDouble(5, entity.getQuantity());
+        statement.bindDouble(6, entity.getPriceAtSale());
+        statement.bindDouble(7, entity.getTotal());
+        final String _tmp = __converters.fromPaymentMode(entity.getPaymentMode());
+        statement.bindString(8, _tmp);
+        statement.bindLong(9, entity.getTimestamp());
+        final String _tmp_1 = __converters.fromTransactionSource(entity.getSource());
+        statement.bindString(10, _tmp_1);
+        statement.bindString(11, entity.getDeviceId());
+        final int _tmp_2 = entity.getSynced() ? 1 : 0;
+        statement.bindLong(12, _tmp_2);
+        statement.bindString(13, entity.getRawTranscript());
+        statement.bindString(14, entity.getAudioFilePath());
+        if (entity.getJobId() == null) {
+          statement.bindNull(15);
+        } else {
+          statement.bindString(15, entity.getJobId());
+        }
+        if (entity.getAudioCloudUrl() == null) {
+          statement.bindNull(16);
+        } else {
+          statement.bindString(16, entity.getAudioCloudUrl());
+        }
+      }
+    };
+    this.__preparedStmtOfMarkTransactionPaidViaUpi = new SharedSQLiteStatement(__db) {
+      @Override
+      @NonNull
+      public String createQuery() {
+        final String _query = "UPDATE transactions SET paymentMode = 'UPI', synced = 0 WHERE id = ?";
+        return _query;
+      }
+    };
+  }
+
+  @Override
+  public Object insert(final TransactionRecord transaction,
+      final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        __db.beginTransaction();
+        try {
+          __insertionAdapterOfTransactionRecord.insert(transaction);
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object markTransactionPaidViaUpi(final String txId,
+      final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final SupportSQLiteStatement _stmt = __preparedStmtOfMarkTransactionPaidViaUpi.acquire();
+        int _argIndex = 1;
+        _stmt.bindString(_argIndex, txId);
+        try {
+          __db.beginTransaction();
+          try {
+            _stmt.executeUpdateDelete();
+            __db.setTransactionSuccessful();
+            return Unit.INSTANCE;
+          } finally {
+            __db.endTransaction();
+          }
+        } finally {
+          __preparedStmtOfMarkTransactionPaidViaUpi.release(_stmt);
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Flow<List<TransactionRecord>> getAllTransactions() {
+    final String _sql = "SELECT * FROM transactions ORDER BY timestamp DESC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    return CoroutinesRoom.createFlow(__db, false, new String[] {"transactions"}, new Callable<List<TransactionRecord>>() {
+      @Override
+      @NonNull
+      public List<TransactionRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "itemId");
+          final int _cursorIndexOfItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "itemName");
+          final int _cursorIndexOfQuantity = CursorUtil.getColumnIndexOrThrow(_cursor, "quantity");
+          final int _cursorIndexOfPriceAtSale = CursorUtil.getColumnIndexOrThrow(_cursor, "priceAtSale");
+          final int _cursorIndexOfTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "total");
+          final int _cursorIndexOfPaymentMode = CursorUtil.getColumnIndexOrThrow(_cursor, "paymentMode");
+          final int _cursorIndexOfTimestamp = CursorUtil.getColumnIndexOrThrow(_cursor, "timestamp");
+          final int _cursorIndexOfSource = CursorUtil.getColumnIndexOrThrow(_cursor, "source");
+          final int _cursorIndexOfDeviceId = CursorUtil.getColumnIndexOrThrow(_cursor, "deviceId");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "jobId");
+          final int _cursorIndexOfAudioCloudUrl = CursorUtil.getColumnIndexOrThrow(_cursor, "audioCloudUrl");
+          final List<TransactionRecord> _result = new ArrayList<TransactionRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final TransactionRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpItemId;
+            _tmpItemId = _cursor.getString(_cursorIndexOfItemId);
+            final String _tmpItemName;
+            _tmpItemName = _cursor.getString(_cursorIndexOfItemName);
+            final double _tmpQuantity;
+            _tmpQuantity = _cursor.getDouble(_cursorIndexOfQuantity);
+            final double _tmpPriceAtSale;
+            _tmpPriceAtSale = _cursor.getDouble(_cursorIndexOfPriceAtSale);
+            final double _tmpTotal;
+            _tmpTotal = _cursor.getDouble(_cursorIndexOfTotal);
+            final PaymentMode _tmpPaymentMode;
+            final String _tmp;
+            _tmp = _cursor.getString(_cursorIndexOfPaymentMode);
+            _tmpPaymentMode = __converters.toPaymentMode(_tmp);
+            final long _tmpTimestamp;
+            _tmpTimestamp = _cursor.getLong(_cursorIndexOfTimestamp);
+            final TransactionSource _tmpSource;
+            final String _tmp_1;
+            _tmp_1 = _cursor.getString(_cursorIndexOfSource);
+            _tmpSource = __converters.toTransactionSource(_tmp_1);
+            final String _tmpDeviceId;
+            _tmpDeviceId = _cursor.getString(_cursorIndexOfDeviceId);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final String _tmpJobId;
+            if (_cursor.isNull(_cursorIndexOfJobId)) {
+              _tmpJobId = null;
+            } else {
+              _tmpJobId = _cursor.getString(_cursorIndexOfJobId);
+            }
+            final String _tmpAudioCloudUrl;
+            if (_cursor.isNull(_cursorIndexOfAudioCloudUrl)) {
+              _tmpAudioCloudUrl = null;
+            } else {
+              _tmpAudioCloudUrl = _cursor.getString(_cursorIndexOfAudioCloudUrl);
+            }
+            _item = new TransactionRecord(_tmpId,_tmpShopId,_tmpItemId,_tmpItemName,_tmpQuantity,_tmpPriceAtSale,_tmpTotal,_tmpPaymentMode,_tmpTimestamp,_tmpSource,_tmpDeviceId,_tmpSynced,_tmpRawTranscript,_tmpAudioFilePath,_tmpJobId,_tmpAudioCloudUrl);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+        }
+      }
+
+      @Override
+      protected void finalize() {
+        _statement.release();
+      }
+    });
+  }
+
+  @Override
+  public Object getAllTransactionsList(
+      final Continuation<? super List<TransactionRecord>> $completion) {
+    final String _sql = "SELECT * FROM transactions ORDER BY timestamp DESC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<TransactionRecord>>() {
+      @Override
+      @NonNull
+      public List<TransactionRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "itemId");
+          final int _cursorIndexOfItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "itemName");
+          final int _cursorIndexOfQuantity = CursorUtil.getColumnIndexOrThrow(_cursor, "quantity");
+          final int _cursorIndexOfPriceAtSale = CursorUtil.getColumnIndexOrThrow(_cursor, "priceAtSale");
+          final int _cursorIndexOfTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "total");
+          final int _cursorIndexOfPaymentMode = CursorUtil.getColumnIndexOrThrow(_cursor, "paymentMode");
+          final int _cursorIndexOfTimestamp = CursorUtil.getColumnIndexOrThrow(_cursor, "timestamp");
+          final int _cursorIndexOfSource = CursorUtil.getColumnIndexOrThrow(_cursor, "source");
+          final int _cursorIndexOfDeviceId = CursorUtil.getColumnIndexOrThrow(_cursor, "deviceId");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "jobId");
+          final int _cursorIndexOfAudioCloudUrl = CursorUtil.getColumnIndexOrThrow(_cursor, "audioCloudUrl");
+          final List<TransactionRecord> _result = new ArrayList<TransactionRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final TransactionRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpItemId;
+            _tmpItemId = _cursor.getString(_cursorIndexOfItemId);
+            final String _tmpItemName;
+            _tmpItemName = _cursor.getString(_cursorIndexOfItemName);
+            final double _tmpQuantity;
+            _tmpQuantity = _cursor.getDouble(_cursorIndexOfQuantity);
+            final double _tmpPriceAtSale;
+            _tmpPriceAtSale = _cursor.getDouble(_cursorIndexOfPriceAtSale);
+            final double _tmpTotal;
+            _tmpTotal = _cursor.getDouble(_cursorIndexOfTotal);
+            final PaymentMode _tmpPaymentMode;
+            final String _tmp;
+            _tmp = _cursor.getString(_cursorIndexOfPaymentMode);
+            _tmpPaymentMode = __converters.toPaymentMode(_tmp);
+            final long _tmpTimestamp;
+            _tmpTimestamp = _cursor.getLong(_cursorIndexOfTimestamp);
+            final TransactionSource _tmpSource;
+            final String _tmp_1;
+            _tmp_1 = _cursor.getString(_cursorIndexOfSource);
+            _tmpSource = __converters.toTransactionSource(_tmp_1);
+            final String _tmpDeviceId;
+            _tmpDeviceId = _cursor.getString(_cursorIndexOfDeviceId);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final String _tmpJobId;
+            if (_cursor.isNull(_cursorIndexOfJobId)) {
+              _tmpJobId = null;
+            } else {
+              _tmpJobId = _cursor.getString(_cursorIndexOfJobId);
+            }
+            final String _tmpAudioCloudUrl;
+            if (_cursor.isNull(_cursorIndexOfAudioCloudUrl)) {
+              _tmpAudioCloudUrl = null;
+            } else {
+              _tmpAudioCloudUrl = _cursor.getString(_cursorIndexOfAudioCloudUrl);
+            }
+            _item = new TransactionRecord(_tmpId,_tmpShopId,_tmpItemId,_tmpItemName,_tmpQuantity,_tmpPriceAtSale,_tmpTotal,_tmpPaymentMode,_tmpTimestamp,_tmpSource,_tmpDeviceId,_tmpSynced,_tmpRawTranscript,_tmpAudioFilePath,_tmpJobId,_tmpAudioCloudUrl);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Flow<List<TransactionRecord>> getTodayTransactions(final long startTimeOfDay) {
+    final String _sql = "SELECT * FROM transactions WHERE timestamp >= ? ORDER BY timestamp DESC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 1);
+    int _argIndex = 1;
+    _statement.bindLong(_argIndex, startTimeOfDay);
+    return CoroutinesRoom.createFlow(__db, false, new String[] {"transactions"}, new Callable<List<TransactionRecord>>() {
+      @Override
+      @NonNull
+      public List<TransactionRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "itemId");
+          final int _cursorIndexOfItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "itemName");
+          final int _cursorIndexOfQuantity = CursorUtil.getColumnIndexOrThrow(_cursor, "quantity");
+          final int _cursorIndexOfPriceAtSale = CursorUtil.getColumnIndexOrThrow(_cursor, "priceAtSale");
+          final int _cursorIndexOfTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "total");
+          final int _cursorIndexOfPaymentMode = CursorUtil.getColumnIndexOrThrow(_cursor, "paymentMode");
+          final int _cursorIndexOfTimestamp = CursorUtil.getColumnIndexOrThrow(_cursor, "timestamp");
+          final int _cursorIndexOfSource = CursorUtil.getColumnIndexOrThrow(_cursor, "source");
+          final int _cursorIndexOfDeviceId = CursorUtil.getColumnIndexOrThrow(_cursor, "deviceId");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "jobId");
+          final int _cursorIndexOfAudioCloudUrl = CursorUtil.getColumnIndexOrThrow(_cursor, "audioCloudUrl");
+          final List<TransactionRecord> _result = new ArrayList<TransactionRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final TransactionRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpItemId;
+            _tmpItemId = _cursor.getString(_cursorIndexOfItemId);
+            final String _tmpItemName;
+            _tmpItemName = _cursor.getString(_cursorIndexOfItemName);
+            final double _tmpQuantity;
+            _tmpQuantity = _cursor.getDouble(_cursorIndexOfQuantity);
+            final double _tmpPriceAtSale;
+            _tmpPriceAtSale = _cursor.getDouble(_cursorIndexOfPriceAtSale);
+            final double _tmpTotal;
+            _tmpTotal = _cursor.getDouble(_cursorIndexOfTotal);
+            final PaymentMode _tmpPaymentMode;
+            final String _tmp;
+            _tmp = _cursor.getString(_cursorIndexOfPaymentMode);
+            _tmpPaymentMode = __converters.toPaymentMode(_tmp);
+            final long _tmpTimestamp;
+            _tmpTimestamp = _cursor.getLong(_cursorIndexOfTimestamp);
+            final TransactionSource _tmpSource;
+            final String _tmp_1;
+            _tmp_1 = _cursor.getString(_cursorIndexOfSource);
+            _tmpSource = __converters.toTransactionSource(_tmp_1);
+            final String _tmpDeviceId;
+            _tmpDeviceId = _cursor.getString(_cursorIndexOfDeviceId);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final String _tmpJobId;
+            if (_cursor.isNull(_cursorIndexOfJobId)) {
+              _tmpJobId = null;
+            } else {
+              _tmpJobId = _cursor.getString(_cursorIndexOfJobId);
+            }
+            final String _tmpAudioCloudUrl;
+            if (_cursor.isNull(_cursorIndexOfAudioCloudUrl)) {
+              _tmpAudioCloudUrl = null;
+            } else {
+              _tmpAudioCloudUrl = _cursor.getString(_cursorIndexOfAudioCloudUrl);
+            }
+            _item = new TransactionRecord(_tmpId,_tmpShopId,_tmpItemId,_tmpItemName,_tmpQuantity,_tmpPriceAtSale,_tmpTotal,_tmpPaymentMode,_tmpTimestamp,_tmpSource,_tmpDeviceId,_tmpSynced,_tmpRawTranscript,_tmpAudioFilePath,_tmpJobId,_tmpAudioCloudUrl);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+        }
+      }
+
+      @Override
+      protected void finalize() {
+        _statement.release();
+      }
+    });
+  }
+
+  @Override
+  public Flow<List<TransactionRecord>> getTransactionsBetween(final long startMs,
+      final long endMs) {
+    final String _sql = "SELECT * FROM transactions WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp DESC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 2);
+    int _argIndex = 1;
+    _statement.bindLong(_argIndex, startMs);
+    _argIndex = 2;
+    _statement.bindLong(_argIndex, endMs);
+    return CoroutinesRoom.createFlow(__db, false, new String[] {"transactions"}, new Callable<List<TransactionRecord>>() {
+      @Override
+      @NonNull
+      public List<TransactionRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "itemId");
+          final int _cursorIndexOfItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "itemName");
+          final int _cursorIndexOfQuantity = CursorUtil.getColumnIndexOrThrow(_cursor, "quantity");
+          final int _cursorIndexOfPriceAtSale = CursorUtil.getColumnIndexOrThrow(_cursor, "priceAtSale");
+          final int _cursorIndexOfTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "total");
+          final int _cursorIndexOfPaymentMode = CursorUtil.getColumnIndexOrThrow(_cursor, "paymentMode");
+          final int _cursorIndexOfTimestamp = CursorUtil.getColumnIndexOrThrow(_cursor, "timestamp");
+          final int _cursorIndexOfSource = CursorUtil.getColumnIndexOrThrow(_cursor, "source");
+          final int _cursorIndexOfDeviceId = CursorUtil.getColumnIndexOrThrow(_cursor, "deviceId");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "jobId");
+          final int _cursorIndexOfAudioCloudUrl = CursorUtil.getColumnIndexOrThrow(_cursor, "audioCloudUrl");
+          final List<TransactionRecord> _result = new ArrayList<TransactionRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final TransactionRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpItemId;
+            _tmpItemId = _cursor.getString(_cursorIndexOfItemId);
+            final String _tmpItemName;
+            _tmpItemName = _cursor.getString(_cursorIndexOfItemName);
+            final double _tmpQuantity;
+            _tmpQuantity = _cursor.getDouble(_cursorIndexOfQuantity);
+            final double _tmpPriceAtSale;
+            _tmpPriceAtSale = _cursor.getDouble(_cursorIndexOfPriceAtSale);
+            final double _tmpTotal;
+            _tmpTotal = _cursor.getDouble(_cursorIndexOfTotal);
+            final PaymentMode _tmpPaymentMode;
+            final String _tmp;
+            _tmp = _cursor.getString(_cursorIndexOfPaymentMode);
+            _tmpPaymentMode = __converters.toPaymentMode(_tmp);
+            final long _tmpTimestamp;
+            _tmpTimestamp = _cursor.getLong(_cursorIndexOfTimestamp);
+            final TransactionSource _tmpSource;
+            final String _tmp_1;
+            _tmp_1 = _cursor.getString(_cursorIndexOfSource);
+            _tmpSource = __converters.toTransactionSource(_tmp_1);
+            final String _tmpDeviceId;
+            _tmpDeviceId = _cursor.getString(_cursorIndexOfDeviceId);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final String _tmpJobId;
+            if (_cursor.isNull(_cursorIndexOfJobId)) {
+              _tmpJobId = null;
+            } else {
+              _tmpJobId = _cursor.getString(_cursorIndexOfJobId);
+            }
+            final String _tmpAudioCloudUrl;
+            if (_cursor.isNull(_cursorIndexOfAudioCloudUrl)) {
+              _tmpAudioCloudUrl = null;
+            } else {
+              _tmpAudioCloudUrl = _cursor.getString(_cursorIndexOfAudioCloudUrl);
+            }
+            _item = new TransactionRecord(_tmpId,_tmpShopId,_tmpItemId,_tmpItemName,_tmpQuantity,_tmpPriceAtSale,_tmpTotal,_tmpPaymentMode,_tmpTimestamp,_tmpSource,_tmpDeviceId,_tmpSynced,_tmpRawTranscript,_tmpAudioFilePath,_tmpJobId,_tmpAudioCloudUrl);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+        }
+      }
+
+      @Override
+      protected void finalize() {
+        _statement.release();
+      }
+    });
+  }
+
+  @Override
+  public Flow<Double> getTodayTotalSales(final long startTimeOfDay) {
+    final String _sql = "SELECT SUM(total) FROM transactions WHERE timestamp >= ?";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 1);
+    int _argIndex = 1;
+    _statement.bindLong(_argIndex, startTimeOfDay);
+    return CoroutinesRoom.createFlow(__db, false, new String[] {"transactions"}, new Callable<Double>() {
+      @Override
+      @Nullable
+      public Double call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final Double _result;
+          if (_cursor.moveToFirst()) {
+            final Double _tmp;
+            if (_cursor.isNull(0)) {
+              _tmp = null;
+            } else {
+              _tmp = _cursor.getDouble(0);
+            }
+            _result = _tmp;
+          } else {
+            _result = null;
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+        }
+      }
+
+      @Override
+      protected void finalize() {
+        _statement.release();
+      }
+    });
+  }
+
+  @Override
+  public Object getUnsyncedTransactions(
+      final Continuation<? super List<TransactionRecord>> $completion) {
+    final String _sql = "SELECT * FROM transactions WHERE synced = 0";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<TransactionRecord>>() {
+      @Override
+      @NonNull
+      public List<TransactionRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "itemId");
+          final int _cursorIndexOfItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "itemName");
+          final int _cursorIndexOfQuantity = CursorUtil.getColumnIndexOrThrow(_cursor, "quantity");
+          final int _cursorIndexOfPriceAtSale = CursorUtil.getColumnIndexOrThrow(_cursor, "priceAtSale");
+          final int _cursorIndexOfTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "total");
+          final int _cursorIndexOfPaymentMode = CursorUtil.getColumnIndexOrThrow(_cursor, "paymentMode");
+          final int _cursorIndexOfTimestamp = CursorUtil.getColumnIndexOrThrow(_cursor, "timestamp");
+          final int _cursorIndexOfSource = CursorUtil.getColumnIndexOrThrow(_cursor, "source");
+          final int _cursorIndexOfDeviceId = CursorUtil.getColumnIndexOrThrow(_cursor, "deviceId");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "jobId");
+          final int _cursorIndexOfAudioCloudUrl = CursorUtil.getColumnIndexOrThrow(_cursor, "audioCloudUrl");
+          final List<TransactionRecord> _result = new ArrayList<TransactionRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final TransactionRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpItemId;
+            _tmpItemId = _cursor.getString(_cursorIndexOfItemId);
+            final String _tmpItemName;
+            _tmpItemName = _cursor.getString(_cursorIndexOfItemName);
+            final double _tmpQuantity;
+            _tmpQuantity = _cursor.getDouble(_cursorIndexOfQuantity);
+            final double _tmpPriceAtSale;
+            _tmpPriceAtSale = _cursor.getDouble(_cursorIndexOfPriceAtSale);
+            final double _tmpTotal;
+            _tmpTotal = _cursor.getDouble(_cursorIndexOfTotal);
+            final PaymentMode _tmpPaymentMode;
+            final String _tmp;
+            _tmp = _cursor.getString(_cursorIndexOfPaymentMode);
+            _tmpPaymentMode = __converters.toPaymentMode(_tmp);
+            final long _tmpTimestamp;
+            _tmpTimestamp = _cursor.getLong(_cursorIndexOfTimestamp);
+            final TransactionSource _tmpSource;
+            final String _tmp_1;
+            _tmp_1 = _cursor.getString(_cursorIndexOfSource);
+            _tmpSource = __converters.toTransactionSource(_tmp_1);
+            final String _tmpDeviceId;
+            _tmpDeviceId = _cursor.getString(_cursorIndexOfDeviceId);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final String _tmpJobId;
+            if (_cursor.isNull(_cursorIndexOfJobId)) {
+              _tmpJobId = null;
+            } else {
+              _tmpJobId = _cursor.getString(_cursorIndexOfJobId);
+            }
+            final String _tmpAudioCloudUrl;
+            if (_cursor.isNull(_cursorIndexOfAudioCloudUrl)) {
+              _tmpAudioCloudUrl = null;
+            } else {
+              _tmpAudioCloudUrl = _cursor.getString(_cursorIndexOfAudioCloudUrl);
+            }
+            _item = new TransactionRecord(_tmpId,_tmpShopId,_tmpItemId,_tmpItemName,_tmpQuantity,_tmpPriceAtSale,_tmpTotal,_tmpPaymentMode,_tmpTimestamp,_tmpSource,_tmpDeviceId,_tmpSynced,_tmpRawTranscript,_tmpAudioFilePath,_tmpJobId,_tmpAudioCloudUrl);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object getRecentTransactionsByAmount(final double amount, final long sinceMs,
+      final Continuation<? super List<TransactionRecord>> $completion) {
+    final String _sql = "SELECT * FROM transactions WHERE total = ? AND timestamp >= ? AND paymentMode != 'UPI' ORDER BY timestamp DESC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 2);
+    int _argIndex = 1;
+    _statement.bindDouble(_argIndex, amount);
+    _argIndex = 2;
+    _statement.bindLong(_argIndex, sinceMs);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<TransactionRecord>>() {
+      @Override
+      @NonNull
+      public List<TransactionRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "itemId");
+          final int _cursorIndexOfItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "itemName");
+          final int _cursorIndexOfQuantity = CursorUtil.getColumnIndexOrThrow(_cursor, "quantity");
+          final int _cursorIndexOfPriceAtSale = CursorUtil.getColumnIndexOrThrow(_cursor, "priceAtSale");
+          final int _cursorIndexOfTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "total");
+          final int _cursorIndexOfPaymentMode = CursorUtil.getColumnIndexOrThrow(_cursor, "paymentMode");
+          final int _cursorIndexOfTimestamp = CursorUtil.getColumnIndexOrThrow(_cursor, "timestamp");
+          final int _cursorIndexOfSource = CursorUtil.getColumnIndexOrThrow(_cursor, "source");
+          final int _cursorIndexOfDeviceId = CursorUtil.getColumnIndexOrThrow(_cursor, "deviceId");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "jobId");
+          final int _cursorIndexOfAudioCloudUrl = CursorUtil.getColumnIndexOrThrow(_cursor, "audioCloudUrl");
+          final List<TransactionRecord> _result = new ArrayList<TransactionRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final TransactionRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpItemId;
+            _tmpItemId = _cursor.getString(_cursorIndexOfItemId);
+            final String _tmpItemName;
+            _tmpItemName = _cursor.getString(_cursorIndexOfItemName);
+            final double _tmpQuantity;
+            _tmpQuantity = _cursor.getDouble(_cursorIndexOfQuantity);
+            final double _tmpPriceAtSale;
+            _tmpPriceAtSale = _cursor.getDouble(_cursorIndexOfPriceAtSale);
+            final double _tmpTotal;
+            _tmpTotal = _cursor.getDouble(_cursorIndexOfTotal);
+            final PaymentMode _tmpPaymentMode;
+            final String _tmp;
+            _tmp = _cursor.getString(_cursorIndexOfPaymentMode);
+            _tmpPaymentMode = __converters.toPaymentMode(_tmp);
+            final long _tmpTimestamp;
+            _tmpTimestamp = _cursor.getLong(_cursorIndexOfTimestamp);
+            final TransactionSource _tmpSource;
+            final String _tmp_1;
+            _tmp_1 = _cursor.getString(_cursorIndexOfSource);
+            _tmpSource = __converters.toTransactionSource(_tmp_1);
+            final String _tmpDeviceId;
+            _tmpDeviceId = _cursor.getString(_cursorIndexOfDeviceId);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final String _tmpJobId;
+            if (_cursor.isNull(_cursorIndexOfJobId)) {
+              _tmpJobId = null;
+            } else {
+              _tmpJobId = _cursor.getString(_cursorIndexOfJobId);
+            }
+            final String _tmpAudioCloudUrl;
+            if (_cursor.isNull(_cursorIndexOfAudioCloudUrl)) {
+              _tmpAudioCloudUrl = null;
+            } else {
+              _tmpAudioCloudUrl = _cursor.getString(_cursorIndexOfAudioCloudUrl);
+            }
+            _item = new TransactionRecord(_tmpId,_tmpShopId,_tmpItemId,_tmpItemName,_tmpQuantity,_tmpPriceAtSale,_tmpTotal,_tmpPaymentMode,_tmpTimestamp,_tmpSource,_tmpDeviceId,_tmpSynced,_tmpRawTranscript,_tmpAudioFilePath,_tmpJobId,_tmpAudioCloudUrl);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object markSynced(final List<String> ids, final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final StringBuilder _stringBuilder = StringUtil.newStringBuilder();
+        _stringBuilder.append("UPDATE transactions SET synced = 1 WHERE id IN (");
+        final int _inputSize = ids.size();
+        StringUtil.appendPlaceholders(_stringBuilder, _inputSize);
+        _stringBuilder.append(")");
+        final String _sql = _stringBuilder.toString();
+        final SupportSQLiteStatement _stmt = __db.compileStatement(_sql);
+        int _argIndex = 1;
+        for (String _item : ids) {
+          _stmt.bindString(_argIndex, _item);
+          _argIndex++;
+        }
+        __db.beginTransaction();
+        try {
+          _stmt.executeUpdateDelete();
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @NonNull
+  public static List<Class<?>> getRequiredConverters() {
+    return Collections.emptyList();
+  }
+}

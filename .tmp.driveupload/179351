@@ -1,0 +1,371 @@
+package com.voicetoinvoice.app.data.local.dao;
+
+import android.database.Cursor;
+import android.os.CancellationSignal;
+import androidx.annotation.NonNull;
+import androidx.room.CoroutinesRoom;
+import androidx.room.EntityInsertionAdapter;
+import androidx.room.RoomDatabase;
+import androidx.room.RoomSQLiteQuery;
+import androidx.room.SharedSQLiteStatement;
+import androidx.room.util.CursorUtil;
+import androidx.room.util.DBUtil;
+import androidx.room.util.StringUtil;
+import androidx.sqlite.db.SupportSQLiteStatement;
+import com.voicetoinvoice.app.data.local.Converters;
+import com.voicetoinvoice.app.data.local.entity.CreditRecord;
+import com.voicetoinvoice.app.data.local.entity.CreditStatus;
+import java.lang.Class;
+import java.lang.Exception;
+import java.lang.Long;
+import java.lang.Object;
+import java.lang.Override;
+import java.lang.String;
+import java.lang.StringBuilder;
+import java.lang.SuppressWarnings;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+import javax.annotation.processing.Generated;
+import kotlin.Unit;
+import kotlin.coroutines.Continuation;
+import kotlinx.coroutines.flow.Flow;
+
+@Generated("androidx.room.RoomProcessor")
+@SuppressWarnings({"unchecked", "deprecation"})
+public final class CreditDao_Impl implements CreditDao {
+  private final RoomDatabase __db;
+
+  private final EntityInsertionAdapter<CreditRecord> __insertionAdapterOfCreditRecord;
+
+  private final Converters __converters = new Converters();
+
+  private final SharedSQLiteStatement __preparedStmtOfUpdateStatus;
+
+  public CreditDao_Impl(@NonNull final RoomDatabase __db) {
+    this.__db = __db;
+    this.__insertionAdapterOfCreditRecord = new EntityInsertionAdapter<CreditRecord>(__db) {
+      @Override
+      @NonNull
+      protected String createQuery() {
+        return "INSERT OR REPLACE INTO `credits` (`id`,`shopId`,`customerName`,`amount`,`dueDate`,`status`,`linkedTransactionId`,`updatedAt`,`synced`) VALUES (?,?,?,?,?,?,?,?,?)";
+      }
+
+      @Override
+      protected void bind(@NonNull final SupportSQLiteStatement statement,
+          @NonNull final CreditRecord entity) {
+        statement.bindString(1, entity.getId());
+        statement.bindString(2, entity.getShopId());
+        statement.bindString(3, entity.getCustomerName());
+        statement.bindDouble(4, entity.getAmount());
+        if (entity.getDueDate() == null) {
+          statement.bindNull(5);
+        } else {
+          statement.bindLong(5, entity.getDueDate());
+        }
+        final String _tmp = __converters.fromCreditStatus(entity.getStatus());
+        statement.bindString(6, _tmp);
+        if (entity.getLinkedTransactionId() == null) {
+          statement.bindNull(7);
+        } else {
+          statement.bindString(7, entity.getLinkedTransactionId());
+        }
+        statement.bindLong(8, entity.getUpdatedAt());
+        final int _tmp_1 = entity.getSynced() ? 1 : 0;
+        statement.bindLong(9, _tmp_1);
+      }
+    };
+    this.__preparedStmtOfUpdateStatus = new SharedSQLiteStatement(__db) {
+      @Override
+      @NonNull
+      public String createQuery() {
+        final String _query = "UPDATE credits SET status = ?, updatedAt = ?, synced = 0 WHERE id = ?";
+        return _query;
+      }
+    };
+  }
+
+  @Override
+  public Object insertOrUpdate(final CreditRecord credit,
+      final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        __db.beginTransaction();
+        try {
+          __insertionAdapterOfCreditRecord.insert(credit);
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object updateStatus(final String id, final CreditStatus status, final long timestamp,
+      final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final SupportSQLiteStatement _stmt = __preparedStmtOfUpdateStatus.acquire();
+        int _argIndex = 1;
+        final String _tmp = __converters.fromCreditStatus(status);
+        _stmt.bindString(_argIndex, _tmp);
+        _argIndex = 2;
+        _stmt.bindLong(_argIndex, timestamp);
+        _argIndex = 3;
+        _stmt.bindString(_argIndex, id);
+        try {
+          __db.beginTransaction();
+          try {
+            _stmt.executeUpdateDelete();
+            __db.setTransactionSuccessful();
+            return Unit.INSTANCE;
+          } finally {
+            __db.endTransaction();
+          }
+        } finally {
+          __preparedStmtOfUpdateStatus.release(_stmt);
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Flow<List<CreditRecord>> getAllCredits() {
+    final String _sql = "SELECT * FROM credits ORDER BY status ASC, dueDate ASC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    return CoroutinesRoom.createFlow(__db, false, new String[] {"credits"}, new Callable<List<CreditRecord>>() {
+      @Override
+      @NonNull
+      public List<CreditRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfCustomerName = CursorUtil.getColumnIndexOrThrow(_cursor, "customerName");
+          final int _cursorIndexOfAmount = CursorUtil.getColumnIndexOrThrow(_cursor, "amount");
+          final int _cursorIndexOfDueDate = CursorUtil.getColumnIndexOrThrow(_cursor, "dueDate");
+          final int _cursorIndexOfStatus = CursorUtil.getColumnIndexOrThrow(_cursor, "status");
+          final int _cursorIndexOfLinkedTransactionId = CursorUtil.getColumnIndexOrThrow(_cursor, "linkedTransactionId");
+          final int _cursorIndexOfUpdatedAt = CursorUtil.getColumnIndexOrThrow(_cursor, "updatedAt");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final List<CreditRecord> _result = new ArrayList<CreditRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final CreditRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpCustomerName;
+            _tmpCustomerName = _cursor.getString(_cursorIndexOfCustomerName);
+            final double _tmpAmount;
+            _tmpAmount = _cursor.getDouble(_cursorIndexOfAmount);
+            final Long _tmpDueDate;
+            if (_cursor.isNull(_cursorIndexOfDueDate)) {
+              _tmpDueDate = null;
+            } else {
+              _tmpDueDate = _cursor.getLong(_cursorIndexOfDueDate);
+            }
+            final CreditStatus _tmpStatus;
+            final String _tmp;
+            _tmp = _cursor.getString(_cursorIndexOfStatus);
+            _tmpStatus = __converters.toCreditStatus(_tmp);
+            final String _tmpLinkedTransactionId;
+            if (_cursor.isNull(_cursorIndexOfLinkedTransactionId)) {
+              _tmpLinkedTransactionId = null;
+            } else {
+              _tmpLinkedTransactionId = _cursor.getString(_cursorIndexOfLinkedTransactionId);
+            }
+            final long _tmpUpdatedAt;
+            _tmpUpdatedAt = _cursor.getLong(_cursorIndexOfUpdatedAt);
+            final boolean _tmpSynced;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_1 != 0;
+            _item = new CreditRecord(_tmpId,_tmpShopId,_tmpCustomerName,_tmpAmount,_tmpDueDate,_tmpStatus,_tmpLinkedTransactionId,_tmpUpdatedAt,_tmpSynced);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+        }
+      }
+
+      @Override
+      protected void finalize() {
+        _statement.release();
+      }
+    });
+  }
+
+  @Override
+  public Object getAllCreditsList(final Continuation<? super List<CreditRecord>> $completion) {
+    final String _sql = "SELECT * FROM credits ORDER BY status ASC, dueDate ASC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<CreditRecord>>() {
+      @Override
+      @NonNull
+      public List<CreditRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfCustomerName = CursorUtil.getColumnIndexOrThrow(_cursor, "customerName");
+          final int _cursorIndexOfAmount = CursorUtil.getColumnIndexOrThrow(_cursor, "amount");
+          final int _cursorIndexOfDueDate = CursorUtil.getColumnIndexOrThrow(_cursor, "dueDate");
+          final int _cursorIndexOfStatus = CursorUtil.getColumnIndexOrThrow(_cursor, "status");
+          final int _cursorIndexOfLinkedTransactionId = CursorUtil.getColumnIndexOrThrow(_cursor, "linkedTransactionId");
+          final int _cursorIndexOfUpdatedAt = CursorUtil.getColumnIndexOrThrow(_cursor, "updatedAt");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final List<CreditRecord> _result = new ArrayList<CreditRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final CreditRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpCustomerName;
+            _tmpCustomerName = _cursor.getString(_cursorIndexOfCustomerName);
+            final double _tmpAmount;
+            _tmpAmount = _cursor.getDouble(_cursorIndexOfAmount);
+            final Long _tmpDueDate;
+            if (_cursor.isNull(_cursorIndexOfDueDate)) {
+              _tmpDueDate = null;
+            } else {
+              _tmpDueDate = _cursor.getLong(_cursorIndexOfDueDate);
+            }
+            final CreditStatus _tmpStatus;
+            final String _tmp;
+            _tmp = _cursor.getString(_cursorIndexOfStatus);
+            _tmpStatus = __converters.toCreditStatus(_tmp);
+            final String _tmpLinkedTransactionId;
+            if (_cursor.isNull(_cursorIndexOfLinkedTransactionId)) {
+              _tmpLinkedTransactionId = null;
+            } else {
+              _tmpLinkedTransactionId = _cursor.getString(_cursorIndexOfLinkedTransactionId);
+            }
+            final long _tmpUpdatedAt;
+            _tmpUpdatedAt = _cursor.getLong(_cursorIndexOfUpdatedAt);
+            final boolean _tmpSynced;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_1 != 0;
+            _item = new CreditRecord(_tmpId,_tmpShopId,_tmpCustomerName,_tmpAmount,_tmpDueDate,_tmpStatus,_tmpLinkedTransactionId,_tmpUpdatedAt,_tmpSynced);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object getUnsyncedCredits(final Continuation<? super List<CreditRecord>> $completion) {
+    final String _sql = "SELECT * FROM credits WHERE synced = 0";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<CreditRecord>>() {
+      @Override
+      @NonNull
+      public List<CreditRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfShopId = CursorUtil.getColumnIndexOrThrow(_cursor, "shopId");
+          final int _cursorIndexOfCustomerName = CursorUtil.getColumnIndexOrThrow(_cursor, "customerName");
+          final int _cursorIndexOfAmount = CursorUtil.getColumnIndexOrThrow(_cursor, "amount");
+          final int _cursorIndexOfDueDate = CursorUtil.getColumnIndexOrThrow(_cursor, "dueDate");
+          final int _cursorIndexOfStatus = CursorUtil.getColumnIndexOrThrow(_cursor, "status");
+          final int _cursorIndexOfLinkedTransactionId = CursorUtil.getColumnIndexOrThrow(_cursor, "linkedTransactionId");
+          final int _cursorIndexOfUpdatedAt = CursorUtil.getColumnIndexOrThrow(_cursor, "updatedAt");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final List<CreditRecord> _result = new ArrayList<CreditRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final CreditRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpShopId;
+            _tmpShopId = _cursor.getString(_cursorIndexOfShopId);
+            final String _tmpCustomerName;
+            _tmpCustomerName = _cursor.getString(_cursorIndexOfCustomerName);
+            final double _tmpAmount;
+            _tmpAmount = _cursor.getDouble(_cursorIndexOfAmount);
+            final Long _tmpDueDate;
+            if (_cursor.isNull(_cursorIndexOfDueDate)) {
+              _tmpDueDate = null;
+            } else {
+              _tmpDueDate = _cursor.getLong(_cursorIndexOfDueDate);
+            }
+            final CreditStatus _tmpStatus;
+            final String _tmp;
+            _tmp = _cursor.getString(_cursorIndexOfStatus);
+            _tmpStatus = __converters.toCreditStatus(_tmp);
+            final String _tmpLinkedTransactionId;
+            if (_cursor.isNull(_cursorIndexOfLinkedTransactionId)) {
+              _tmpLinkedTransactionId = null;
+            } else {
+              _tmpLinkedTransactionId = _cursor.getString(_cursorIndexOfLinkedTransactionId);
+            }
+            final long _tmpUpdatedAt;
+            _tmpUpdatedAt = _cursor.getLong(_cursorIndexOfUpdatedAt);
+            final boolean _tmpSynced;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_1 != 0;
+            _item = new CreditRecord(_tmpId,_tmpShopId,_tmpCustomerName,_tmpAmount,_tmpDueDate,_tmpStatus,_tmpLinkedTransactionId,_tmpUpdatedAt,_tmpSynced);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object markSynced(final List<String> ids, final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final StringBuilder _stringBuilder = StringUtil.newStringBuilder();
+        _stringBuilder.append("UPDATE credits SET synced = 1 WHERE id IN (");
+        final int _inputSize = ids.size();
+        StringUtil.appendPlaceholders(_stringBuilder, _inputSize);
+        _stringBuilder.append(")");
+        final String _sql = _stringBuilder.toString();
+        final SupportSQLiteStatement _stmt = __db.compileStatement(_sql);
+        int _argIndex = 1;
+        for (String _item : ids) {
+          _stmt.bindString(_argIndex, _item);
+          _argIndex++;
+        }
+        __db.beginTransaction();
+        try {
+          _stmt.executeUpdateDelete();
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @NonNull
+  public static List<Class<?>> getRequiredConverters() {
+    return Collections.emptyList();
+  }
+}

@@ -13,6 +13,7 @@ import {
   detectPriceIntent,
   parseCompoundNumberSequence,
   implausibilityReason,
+  extractSpokenNumbers,
   type PriceIntent,
 } from './price_intent.ts'
 
@@ -381,6 +382,10 @@ serve(async (req) => {
     const catalogNamesRaw = formData.get('catalogNames') as string | null
     const metadataRaw = formData.get('metadata') as string | null
     const shopId = formData.get('shopId') as string | null
+    const onDeviceTranscript = (formData.get('onDeviceTranscript') as string | null) || ''
+    const previousJobId = formData.get('previousJobId') as string | null
+    const precedingGapMsRaw = formData.get('precedingGapMs') as string | null
+    const precedingGapMs = precedingGapMsRaw ? parseInt(precedingGapMsRaw, 10) : -1
 
     if (!audioFile || !jobId) {
       return new Response(JSON.stringify({ error: 'Missing required parameters (file, jobId)' }), {
@@ -495,6 +500,9 @@ serve(async (req) => {
         audioBuffer,
         audioCloudUrl,
         catalogNamesRaw,
+        onDeviceTranscript,
+        previousJobId,
+        precedingGapMs,
         supabase
       })
     )
@@ -528,9 +536,12 @@ async function processVoiceJob(args: {
   audioBuffer: ArrayBuffer
   audioCloudUrl: string
   catalogNamesRaw: string | null
+  onDeviceTranscript?: string
+  previousJobId?: string | null
+  precedingGapMs?: number
   supabase: ReturnType<typeof createClient>
 }) {
-  const { jobId, shopId, metadata, audioBuffer, audioCloudUrl, catalogNamesRaw, supabase } = args
+  const { jobId, shopId, metadata, audioBuffer, audioCloudUrl, catalogNamesRaw, onDeviceTranscript = '', previousJobId = null, precedingGapMs = -1, supabase } = args
   const resolvedShopId = getNullSafeShopId(shopId)
 
   try {
@@ -565,9 +576,6 @@ async function processVoiceJob(args: {
 
     const fullCatalogList = Array.from(new Set([...catalogNames, ...defaultCatalogFallback]))
 
-    // Keyterm biasing only works if the terms are in the script STT is going to emit.
-    // Sending English-only keyterms while asking for Hindi meant the bias was largely
-    // wasted, so send the Devanagari forms too (DEFAULT_ITEM_VOCAB carries both).
     const keyterms = Array.from(new Set([
       ...fullCatalogList,
       ...DEFAULT_ITEM_VOCAB,
@@ -575,7 +583,7 @@ async function processVoiceJob(args: {
       ...UNIT_SET,
     ])).slice(0, 100)
 
-    // Step 2: Dual concurrent STT (Grok + Sarvam), 8s timeout each, run in parallel
+    // Step 2: Dual concurrent STT (Grok + Sarvam), 8s timeout each
     const xaiApiKey = Deno.env.get('XAI_API_KEY') || ''
     const sarvamApiKey = Deno.env.get('SARVAM_API_KEY') || ''
 
@@ -593,30 +601,51 @@ async function processVoiceJob(args: {
 
     let rawGrokTranscript = grokOutcome.transcript
     let rawSarvamTranscript = sarvamOutcome.transcript
+    let rawOnDeviceTranscript = onDeviceTranscript ? onDeviceTranscript.trim() : ''
 
-    const providerOf = (g: string, s: string) =>
-      g && s ? 'grok+sarvam' : g ? 'grok' : s ? 'sarvam' : 'none'
-    let sttProvider = providerOf(rawGrokTranscript, rawSarvamTranscript)
+    const providerOf = (g: string, s: string, o: string) => {
+      const parts = []
+      if (g) parts.push('grok')
+      if (s) parts.push('sarvam')
+      if (o) parts.push('ondevice')
+      return parts.length > 0 ? parts.join('+') : 'none'
+    }
+    let sttProvider = providerOf(rawGrokTranscript, rawSarvamTranscript, rawOnDeviceTranscript)
 
-    // Step 3: Phonetic, grammar-aware segmentation (replaces the old Devanagari-only
-    // orthographic fuzzy segmenter — see phonetic.ts header and ISSUE-020).
+    // Step 3: Phonetic, grammar-aware segmentation across all transcripts
     const grokScored = scoreTranscript(rawGrokTranscript, fullCatalogList)
     const sarvamScored = scoreTranscript(rawSarvamTranscript, fullCatalogList)
+    const onDeviceScored = scoreTranscript(rawOnDeviceTranscript, fullCatalogList)
 
-    // Pick whichever STT stream actually parses as a shopkeeper order. Sarvam (saaras:v3)
-    // is explicitly tuned for Indic verbatim speech. When Sarvam parses a valid order
-    // structure (or ties with Grok), Sarvam wins. Grok frequently introduces spurious spaces
-    // ("दो किलो करों जा") which trick segmenters into scoring unlisted words as multi-tokens.
-    let chosenRaw = (sarvamScored.score >= grokScored.score && rawSarvamTranscript)
-      ? rawSarvamTranscript
-      : (grokScored.score > sarvamScored.score && rawGrokTranscript)
-        ? rawGrokTranscript
-        : (rawSarvamTranscript || rawGrokTranscript)
+    let chosenRaw = ''
+    const serverMaxScore = Math.max(grokScored.score, sarvamScored.score)
 
-    let step3Segments: RawItemSegment[] = chosenRaw === rawSarvamTranscript ? sarvamScored.segments : grokScored.segments
-    let bestScore = Math.max(grokScored.score, sarvamScored.score)
-    // IMPORTANT: transcript MUST remain the pure, untouched verbatim text from STT (chosenRaw).
-    // It must NEVER be mutated or dictionary-replaced by normalizeTranscript!
+    if (onDeviceScored.score > serverMaxScore && rawOnDeviceTranscript) {
+      const onDevNums = extractSpokenNumbers(rawOnDeviceTranscript)
+      const grokNums = extractSpokenNumbers(rawGrokTranscript)
+      const sarvamNums = extractSpokenNumbers(rawSarvamTranscript)
+      const serverNums = Array.from(new Set([...grokNums, ...sarvamNums]))
+
+      const hasNumericDisagreement = onDevNums.some(n => !serverNums.includes(n))
+      if (!hasNumericDisagreement || serverNums.length === 0) {
+        chosenRaw = rawOnDeviceTranscript
+      } else {
+        chosenRaw = (sarvamScored.score >= grokScored.score && rawSarvamTranscript) ? rawSarvamTranscript : (rawGrokTranscript || rawOnDeviceTranscript)
+      }
+    } else if (sarvamScored.score >= grokScored.score && rawSarvamTranscript) {
+      chosenRaw = rawSarvamTranscript
+    } else if (grokScored.score > sarvamScored.score && rawGrokTranscript) {
+      chosenRaw = rawGrokTranscript
+    } else {
+      chosenRaw = rawSarvamTranscript || rawGrokTranscript || rawOnDeviceTranscript
+    }
+
+    let step3Segments: RawItemSegment[] =
+      chosenRaw === rawSarvamTranscript ? sarvamScored.segments :
+      chosenRaw === rawGrokTranscript ? grokScored.segments :
+      onDeviceScored.segments
+
+    let bestScore = Math.max(grokScored.score, sarvamScored.score, onDeviceScored.score)
     let transcript = chosenRaw || ''
 
     // Step 5 (runs before AI interpretation so the AI sees the best available audio
@@ -893,6 +922,25 @@ Parse this order.`
       })
     }
 
+    // Fetch previous job transcript & parsed item for A4 duplicate guard & A5 orphan suggestion
+    const MAX_ADJACENT_JOB_GAP_MS = 1500
+    let prevJobTranscript = ''
+    let prevJobItemName = ''
+
+    if (previousJobId && precedingGapMs >= 0 && precedingGapMs <= MAX_ADJACENT_JOB_GAP_MS) {
+      try {
+        const { data: prevJobLog } = await supabase
+          .from('stt_job_logs')
+          .select('raw_transcript, parsed_item_name')
+          .eq('job_id', previousJobId)
+          .maybeSingle()
+        if (prevJobLog) {
+          prevJobTranscript = prevJobLog.raw_transcript || ''
+          prevJobItemName = prevJobLog.parsed_item_name || ''
+        }
+      } catch (_) {}
+    }
+
     // Catalog matching & price computation. Matching is phonetic so a Hindi-spoken
     // item resolves to its English catalog row (सेब -> "Seb"), which plain substring
     // matching could never do.
@@ -962,7 +1010,30 @@ Parse this order.`
         confidence = 0.60
       }
 
-      const implausibility = implausibilityReason(unit, qty, total, chosenRaw, priceAtSale)
+      let implausibility = implausibilityReason(unit, qty, total, chosenRaw, priceAtSale)
+
+      // A4: Cross-job duplicate number guard
+      if (prevJobTranscript) {
+        const prevNumbers = extractSpokenNumbers(prevJobTranscript)
+        const currNumbers = extractSpokenNumbers(chosenRaw)
+        const sharedNumbers = currNumbers.filter(n => prevNumbers.includes(n))
+
+        if (sharedNumbers.length > 0) {
+          const loadBearingCollision = sharedNumbers.find(n => Math.abs(qty - n) < 0.01 || Math.abs(priceAtSale - n) < 0.01 || Math.abs(total - n) < 0.01)
+          if (loadBearingCollision !== undefined) {
+            const dupReason = `Spoken number ${loadBearingCollision} collides with adjacent job ${previousJobId} (gap ${precedingGapMs}ms)`
+            implausibility = implausibility ? `${implausibility} | ${dupReason}` : dupReason
+          }
+        }
+      }
+
+      // A5: Orphan classification (price/quantity without matched catalog item)
+      const isOrphan = !isCatalogMatched && (priceAtSale > 0 || total > 0 || qty > 0) && intent !== 'RATE_UPDATE'
+      if (isOrphan) {
+        const orphanReason = `Price/quantity specified without a recognized catalog item (orphan sale)`
+        implausibility = implausibility ? `${implausibility} | ${orphanReason}` : orphanReason
+      }
+
       if (implausibility) confidence = Math.min(confidence, IMPLAUSIBLE_CONFIDENCE_CAP)
 
       return {
@@ -975,6 +1046,8 @@ Parse this order.`
         price_intent: intent,
         confidence: confidence,
         is_matched_to_catalog: isCatalogMatched,
+        is_orphan: isOrphan,
+        suggested_item_name: isOrphan && prevJobItemName ? prevJobItemName : null,
         // Surfaced in the trace so a review-queue entry explains itself (Phase 0a logging).
         item_match_norm: rawItem.item_match_norm ?? null,
         item_margin: rawItem.item_margin ?? null,
@@ -984,12 +1057,28 @@ Parse this order.`
       }
     })
 
+    // RATE_UPDATE items never become sale transactions — a bare "<item> <price> रुपये" with
+    // no quantity is a standing-price announcement, not a sale (mirrors VoiceParser.kt / the
+    // RATE_UPDATE branch in BackgroundSttProcessor.kt, which writes catalogDao().insertOrUpdate()
+    // and explicitly sets autoConfirmedToLedger=false). Without this split every rate update was
+    // being inserted into `transactions` as a fake qty=1 sale (see ISSUE-025 follow-up).
+    const rateUpdateItems = finalParsedItems.filter(item => item.price_intent === 'RATE_UPDATE')
+    const saleItems = finalParsedItems.filter(item => item.price_intent !== 'RATE_UPDATE')
+
+    const isValidRateUpdate = (item: any) =>
+      item.item_id != null &&
+      item.confidence >= 0.80 &&
+      item.price_at_sale > 0.0 &&
+      item.implausibility_reason === null
+    const validRateUpdates = rateUpdateItems.filter(isValidRateUpdate)
+    const rateUpdatesHandled = rateUpdateItems.length > 0 && validRateUpdates.length === rateUpdateItems.length
+
     // Smart Auto-Confirm Gate: Item is auto-confirmed ONLY IF:
     // 1. confidence >= 0.80 (which now encodes match quality, not just match existence)
     // 2. price_at_sale > 0.0 and total > 0.0 (No ₹0 sales in confirmed ledger!)
     // 3. valid, non-empty item name
     // 4. quantity/unit/value are plausible for a kirana shop
-    const isAutoConfirmed = finalParsedItems.length > 0 && finalParsedItems.every(item =>
+    const isAutoConfirmed = saleItems.length > 0 && saleItems.every(item =>
       item.confidence >= 0.80 &&
       item.price_at_sale > 0.0 &&
       item.total > 0.0 &&
@@ -998,7 +1087,7 @@ Parse this order.`
       item.item_name !== "Unrecognized Item" &&
       item.implausibility_reason === null
     )
-    const finalStatus = isAutoConfirmed ? "AUTO_CONFIRMED" : "PARSED"
+    const finalStatus = isAutoConfirmed ? "AUTO_CONFIRMED" : (rateUpdatesHandled ? "RATE_UPDATED" : "PARSED")
 
     // Assemble diagnostic trace
     const traceObj = {
@@ -1064,17 +1153,21 @@ Parse this order.`
       },
       step_4_ai_error: aiError,
       step_4_ai_model: aiModelUsed,
-      step_6_final_outcome: finalParsedItems.map(item => ({
-        itemName: item.item_name,
-        matchedCatalogId: item.item_id,
-        quantity: item.quantity,
-        unit: item.unit,
-        priceAtSale: item.price_at_sale,
-        estimatedTotal: item.total,
-        confidence: item.confidence,
-        isSanityFlagged: !isAutoConfirmed,
-        autoConfirmedToLedger: isAutoConfirmed
-      }))
+      step_6_final_outcome: finalParsedItems.map(item => {
+        const isRateUpdate = item.price_intent === 'RATE_UPDATE'
+        return {
+          itemName: item.item_name,
+          matchedCatalogId: item.item_id,
+          quantity: item.quantity,
+          unit: item.unit,
+          priceAtSale: item.price_at_sale,
+          estimatedTotal: item.total,
+          confidence: item.confidence,
+          isSanityFlagged: isRateUpdate ? !isValidRateUpdate(item) : !isAutoConfirmed,
+          // Rate updates are never written to the transactions ledger — see rateUpdatesHandled above.
+          autoConfirmedToLedger: isRateUpdate ? false : isAutoConfirmed
+        }
+      })
     }
 
     const firstItem = finalParsedItems[0] || null
@@ -1098,7 +1191,7 @@ Parse this order.`
       parsed_qty: firstItem ? firstItem.quantity : 1.0,
       parsed_unit: firstItem ? firstItem.unit : "PACKET",
       parsed_total: firstItem ? firstItem.total : 0.0,
-      is_sanity_flagged: !isAutoConfirmed,
+      is_sanity_flagged: !isAutoConfirmed && !rateUpdatesHandled,
       error_message: transcript ? sttErrorSummary : (sttErrorSummary || "Empty transcript from STT"),
       diagnostic_trace_json: JSON.stringify(traceObj),
       audio_cloud_url: audioCloudUrl
@@ -1106,9 +1199,9 @@ Parse this order.`
 
     await supabase.from('stt_job_logs').upsert([logPayload], { onConflict: 'job_id' })
 
-    // Write to transactions ONLY if auto-confirmed
-    if (isAutoConfirmed && finalParsedItems.length > 0) {
-      const txInserts = finalParsedItems.map(item => ({
+    // Write to transactions ONLY for actual sale items (RATE_UPDATE never reaches here)
+    if (isAutoConfirmed && saleItems.length > 0) {
+      const txInserts = saleItems.map(item => ({
         job_id: jobId,
         shop_id: resolvedShopId,
         item_id: item.item_id,
@@ -1126,8 +1219,23 @@ Parse this order.`
       console.log(`Inserted ${txInserts.length} auto-confirmed transactions for job ${jobId}`)
     }
 
-    // Always keep permanent record in unmatched_queue if not auto-confirmed (status: PENDING)
-    if (!isAutoConfirmed || finalParsedItems.length === 0) {
+    // RATE_UPDATE: update the catalog's standing price directly, no transaction created.
+    if (validRateUpdates.length > 0) {
+      for (const item of validRateUpdates) {
+        const { error: rateUpdateError } = await supabase
+          .from('catalog_items')
+          .update({ price: item.price_at_sale, updated_at: new Date().toISOString() })
+          .eq('id', item.item_id)
+        if (rateUpdateError) {
+          console.log(`Failed to apply rate update for catalog item ${item.item_id} on job ${jobId}: ${rateUpdateError.message}`)
+        }
+      }
+      console.log(`Applied ${validRateUpdates.length} rate update(s) to catalog_items for job ${jobId}`)
+    }
+
+    // Always keep permanent record in unmatched_queue if the job wasn't fully resolved
+    // (either as a confirmed sale or as a fully-applied rate update)
+    if ((!isAutoConfirmed && !rateUpdatesHandled) || finalParsedItems.length === 0) {
       await supabase.from('unmatched_queue').upsert([{
         job_id: jobId,
         shop_id: resolvedShopId,

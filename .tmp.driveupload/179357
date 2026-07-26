@@ -1,0 +1,1178 @@
+package com.voicetoinvoice.app.data.local.dao;
+
+import android.database.Cursor;
+import android.os.CancellationSignal;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.room.CoroutinesRoom;
+import androidx.room.EntityDeletionOrUpdateAdapter;
+import androidx.room.EntityInsertionAdapter;
+import androidx.room.RoomDatabase;
+import androidx.room.RoomSQLiteQuery;
+import androidx.room.SharedSQLiteStatement;
+import androidx.room.util.CursorUtil;
+import androidx.room.util.DBUtil;
+import androidx.room.util.StringUtil;
+import androidx.sqlite.db.SupportSQLiteStatement;
+import com.voicetoinvoice.app.data.local.entity.SttJobRecord;
+import com.voicetoinvoice.app.data.local.entity.SttJobStatus;
+import java.lang.Class;
+import java.lang.Exception;
+import java.lang.IllegalArgumentException;
+import java.lang.Integer;
+import java.lang.Object;
+import java.lang.Override;
+import java.lang.String;
+import java.lang.StringBuilder;
+import java.lang.SuppressWarnings;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+import javax.annotation.processing.Generated;
+import kotlin.Unit;
+import kotlin.coroutines.Continuation;
+import kotlinx.coroutines.flow.Flow;
+
+@Generated("androidx.room.RoomProcessor")
+@SuppressWarnings({"unchecked", "deprecation"})
+public final class SttJobDao_Impl implements SttJobDao {
+  private final RoomDatabase __db;
+
+  private final EntityInsertionAdapter<SttJobRecord> __insertionAdapterOfSttJobRecord;
+
+  private final EntityDeletionOrUpdateAdapter<SttJobRecord> __updateAdapterOfSttJobRecord;
+
+  private final SharedSQLiteStatement __preparedStmtOfMarkStuckJobsAsFailed;
+
+  private final SharedSQLiteStatement __preparedStmtOfDeleteJob;
+
+  private final SharedSQLiteStatement __preparedStmtOfPurgeConfirmedJobs;
+
+  private final SharedSQLiteStatement __preparedStmtOfClearAllJobsLogs;
+
+  public SttJobDao_Impl(@NonNull final RoomDatabase __db) {
+    this.__db = __db;
+    this.__insertionAdapterOfSttJobRecord = new EntityInsertionAdapter<SttJobRecord>(__db) {
+      @Override
+      @NonNull
+      protected String createQuery() {
+        return "INSERT OR REPLACE INTO `stt_jobs` (`id`,`audioFilePath`,`status`,`rawTranscript`,`parsedItemId`,`parsedItemName`,`parsedQty`,`parsedUnit`,`parsedTotal`,`parsedIsPendingPrice`,`isSanityFlagged`,`errorMessage`,`recordedAtMs`,`holdDurationMs`,`pressStartMs`,`releaseMs`,`audioStartMs`,`audioEndMs`,`diagnosticTraceJson`,`onDeviceTranscript`,`previousJobId`,`precedingGapMs`,`synced`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+      }
+
+      @Override
+      protected void bind(@NonNull final SupportSQLiteStatement statement,
+          @NonNull final SttJobRecord entity) {
+        statement.bindString(1, entity.getId());
+        statement.bindString(2, entity.getAudioFilePath());
+        statement.bindString(3, __SttJobStatus_enumToString(entity.getStatus()));
+        statement.bindString(4, entity.getRawTranscript());
+        if (entity.getParsedItemId() == null) {
+          statement.bindNull(5);
+        } else {
+          statement.bindString(5, entity.getParsedItemId());
+        }
+        statement.bindString(6, entity.getParsedItemName());
+        statement.bindDouble(7, entity.getParsedQty());
+        statement.bindString(8, entity.getParsedUnit());
+        statement.bindDouble(9, entity.getParsedTotal());
+        final int _tmp = entity.getParsedIsPendingPrice() ? 1 : 0;
+        statement.bindLong(10, _tmp);
+        final int _tmp_1 = entity.isSanityFlagged() ? 1 : 0;
+        statement.bindLong(11, _tmp_1);
+        statement.bindString(12, entity.getErrorMessage());
+        statement.bindLong(13, entity.getRecordedAtMs());
+        statement.bindLong(14, entity.getHoldDurationMs());
+        statement.bindLong(15, entity.getPressStartMs());
+        statement.bindLong(16, entity.getReleaseMs());
+        statement.bindLong(17, entity.getAudioStartMs());
+        statement.bindLong(18, entity.getAudioEndMs());
+        statement.bindString(19, entity.getDiagnosticTraceJson());
+        statement.bindString(20, entity.getOnDeviceTranscript());
+        if (entity.getPreviousJobId() == null) {
+          statement.bindNull(21);
+        } else {
+          statement.bindString(21, entity.getPreviousJobId());
+        }
+        statement.bindLong(22, entity.getPrecedingGapMs());
+        final int _tmp_2 = entity.getSynced() ? 1 : 0;
+        statement.bindLong(23, _tmp_2);
+      }
+    };
+    this.__updateAdapterOfSttJobRecord = new EntityDeletionOrUpdateAdapter<SttJobRecord>(__db) {
+      @Override
+      @NonNull
+      protected String createQuery() {
+        return "UPDATE OR ABORT `stt_jobs` SET `id` = ?,`audioFilePath` = ?,`status` = ?,`rawTranscript` = ?,`parsedItemId` = ?,`parsedItemName` = ?,`parsedQty` = ?,`parsedUnit` = ?,`parsedTotal` = ?,`parsedIsPendingPrice` = ?,`isSanityFlagged` = ?,`errorMessage` = ?,`recordedAtMs` = ?,`holdDurationMs` = ?,`pressStartMs` = ?,`releaseMs` = ?,`audioStartMs` = ?,`audioEndMs` = ?,`diagnosticTraceJson` = ?,`onDeviceTranscript` = ?,`previousJobId` = ?,`precedingGapMs` = ?,`synced` = ? WHERE `id` = ?";
+      }
+
+      @Override
+      protected void bind(@NonNull final SupportSQLiteStatement statement,
+          @NonNull final SttJobRecord entity) {
+        statement.bindString(1, entity.getId());
+        statement.bindString(2, entity.getAudioFilePath());
+        statement.bindString(3, __SttJobStatus_enumToString(entity.getStatus()));
+        statement.bindString(4, entity.getRawTranscript());
+        if (entity.getParsedItemId() == null) {
+          statement.bindNull(5);
+        } else {
+          statement.bindString(5, entity.getParsedItemId());
+        }
+        statement.bindString(6, entity.getParsedItemName());
+        statement.bindDouble(7, entity.getParsedQty());
+        statement.bindString(8, entity.getParsedUnit());
+        statement.bindDouble(9, entity.getParsedTotal());
+        final int _tmp = entity.getParsedIsPendingPrice() ? 1 : 0;
+        statement.bindLong(10, _tmp);
+        final int _tmp_1 = entity.isSanityFlagged() ? 1 : 0;
+        statement.bindLong(11, _tmp_1);
+        statement.bindString(12, entity.getErrorMessage());
+        statement.bindLong(13, entity.getRecordedAtMs());
+        statement.bindLong(14, entity.getHoldDurationMs());
+        statement.bindLong(15, entity.getPressStartMs());
+        statement.bindLong(16, entity.getReleaseMs());
+        statement.bindLong(17, entity.getAudioStartMs());
+        statement.bindLong(18, entity.getAudioEndMs());
+        statement.bindString(19, entity.getDiagnosticTraceJson());
+        statement.bindString(20, entity.getOnDeviceTranscript());
+        if (entity.getPreviousJobId() == null) {
+          statement.bindNull(21);
+        } else {
+          statement.bindString(21, entity.getPreviousJobId());
+        }
+        statement.bindLong(22, entity.getPrecedingGapMs());
+        final int _tmp_2 = entity.getSynced() ? 1 : 0;
+        statement.bindLong(23, _tmp_2);
+        statement.bindString(24, entity.getId());
+      }
+    };
+    this.__preparedStmtOfMarkStuckJobsAsFailed = new SharedSQLiteStatement(__db) {
+      @Override
+      @NonNull
+      public String createQuery() {
+        final String _query = "UPDATE stt_jobs SET status = 'PARSED', rawTranscript = 'Voice Recording (Server Timeout)', errorMessage = 'Server Timeout', isSanityFlagged = 1 WHERE status IN ('QUEUED', 'TRANSCRIBING') AND recordedAtMs < ?";
+        return _query;
+      }
+    };
+    this.__preparedStmtOfDeleteJob = new SharedSQLiteStatement(__db) {
+      @Override
+      @NonNull
+      public String createQuery() {
+        final String _query = "DELETE FROM stt_jobs WHERE id = ?";
+        return _query;
+      }
+    };
+    this.__preparedStmtOfPurgeConfirmedJobs = new SharedSQLiteStatement(__db) {
+      @Override
+      @NonNull
+      public String createQuery() {
+        final String _query = "DELETE FROM stt_jobs WHERE status = 'CONFIRMED'";
+        return _query;
+      }
+    };
+    this.__preparedStmtOfClearAllJobsLogs = new SharedSQLiteStatement(__db) {
+      @Override
+      @NonNull
+      public String createQuery() {
+        final String _query = "DELETE FROM stt_jobs";
+        return _query;
+      }
+    };
+  }
+
+  @Override
+  public Object insertJob(final SttJobRecord job, final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        __db.beginTransaction();
+        try {
+          __insertionAdapterOfSttJobRecord.insert(job);
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object updateJob(final SttJobRecord job, final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        __db.beginTransaction();
+        try {
+          __updateAdapterOfSttJobRecord.handle(job);
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object markStuckJobsAsFailed(final long thresholdMs,
+      final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final SupportSQLiteStatement _stmt = __preparedStmtOfMarkStuckJobsAsFailed.acquire();
+        int _argIndex = 1;
+        _stmt.bindLong(_argIndex, thresholdMs);
+        try {
+          __db.beginTransaction();
+          try {
+            _stmt.executeUpdateDelete();
+            __db.setTransactionSuccessful();
+            return Unit.INSTANCE;
+          } finally {
+            __db.endTransaction();
+          }
+        } finally {
+          __preparedStmtOfMarkStuckJobsAsFailed.release(_stmt);
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object deleteJob(final String jobId, final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final SupportSQLiteStatement _stmt = __preparedStmtOfDeleteJob.acquire();
+        int _argIndex = 1;
+        _stmt.bindString(_argIndex, jobId);
+        try {
+          __db.beginTransaction();
+          try {
+            _stmt.executeUpdateDelete();
+            __db.setTransactionSuccessful();
+            return Unit.INSTANCE;
+          } finally {
+            __db.endTransaction();
+          }
+        } finally {
+          __preparedStmtOfDeleteJob.release(_stmt);
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object purgeConfirmedJobs(final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final SupportSQLiteStatement _stmt = __preparedStmtOfPurgeConfirmedJobs.acquire();
+        try {
+          __db.beginTransaction();
+          try {
+            _stmt.executeUpdateDelete();
+            __db.setTransactionSuccessful();
+            return Unit.INSTANCE;
+          } finally {
+            __db.endTransaction();
+          }
+        } finally {
+          __preparedStmtOfPurgeConfirmedJobs.release(_stmt);
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object clearAllJobsLogs(final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final SupportSQLiteStatement _stmt = __preparedStmtOfClearAllJobsLogs.acquire();
+        try {
+          __db.beginTransaction();
+          try {
+            _stmt.executeUpdateDelete();
+            __db.setTransactionSuccessful();
+            return Unit.INSTANCE;
+          } finally {
+            __db.endTransaction();
+          }
+        } finally {
+          __preparedStmtOfClearAllJobsLogs.release(_stmt);
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object getJobById(final String jobId,
+      final Continuation<? super SttJobRecord> $completion) {
+    final String _sql = "SELECT * FROM stt_jobs WHERE id = ? LIMIT 1";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 1);
+    int _argIndex = 1;
+    _statement.bindString(_argIndex, jobId);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<SttJobRecord>() {
+      @Override
+      @Nullable
+      public SttJobRecord call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfStatus = CursorUtil.getColumnIndexOrThrow(_cursor, "status");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfParsedItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemId");
+          final int _cursorIndexOfParsedItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemName");
+          final int _cursorIndexOfParsedQty = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedQty");
+          final int _cursorIndexOfParsedUnit = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedUnit");
+          final int _cursorIndexOfParsedTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedTotal");
+          final int _cursorIndexOfParsedIsPendingPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedIsPendingPrice");
+          final int _cursorIndexOfIsSanityFlagged = CursorUtil.getColumnIndexOrThrow(_cursor, "isSanityFlagged");
+          final int _cursorIndexOfErrorMessage = CursorUtil.getColumnIndexOrThrow(_cursor, "errorMessage");
+          final int _cursorIndexOfRecordedAtMs = CursorUtil.getColumnIndexOrThrow(_cursor, "recordedAtMs");
+          final int _cursorIndexOfHoldDurationMs = CursorUtil.getColumnIndexOrThrow(_cursor, "holdDurationMs");
+          final int _cursorIndexOfPressStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "pressStartMs");
+          final int _cursorIndexOfReleaseMs = CursorUtil.getColumnIndexOrThrow(_cursor, "releaseMs");
+          final int _cursorIndexOfAudioStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioStartMs");
+          final int _cursorIndexOfAudioEndMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioEndMs");
+          final int _cursorIndexOfDiagnosticTraceJson = CursorUtil.getColumnIndexOrThrow(_cursor, "diagnosticTraceJson");
+          final int _cursorIndexOfOnDeviceTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "onDeviceTranscript");
+          final int _cursorIndexOfPreviousJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "previousJobId");
+          final int _cursorIndexOfPrecedingGapMs = CursorUtil.getColumnIndexOrThrow(_cursor, "precedingGapMs");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final SttJobRecord _result;
+          if (_cursor.moveToFirst()) {
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final SttJobStatus _tmpStatus;
+            _tmpStatus = __SttJobStatus_stringToEnum(_cursor.getString(_cursorIndexOfStatus));
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpParsedItemId;
+            if (_cursor.isNull(_cursorIndexOfParsedItemId)) {
+              _tmpParsedItemId = null;
+            } else {
+              _tmpParsedItemId = _cursor.getString(_cursorIndexOfParsedItemId);
+            }
+            final String _tmpParsedItemName;
+            _tmpParsedItemName = _cursor.getString(_cursorIndexOfParsedItemName);
+            final double _tmpParsedQty;
+            _tmpParsedQty = _cursor.getDouble(_cursorIndexOfParsedQty);
+            final String _tmpParsedUnit;
+            _tmpParsedUnit = _cursor.getString(_cursorIndexOfParsedUnit);
+            final double _tmpParsedTotal;
+            _tmpParsedTotal = _cursor.getDouble(_cursorIndexOfParsedTotal);
+            final boolean _tmpParsedIsPendingPrice;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfParsedIsPendingPrice);
+            _tmpParsedIsPendingPrice = _tmp != 0;
+            final boolean _tmpIsSanityFlagged;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfIsSanityFlagged);
+            _tmpIsSanityFlagged = _tmp_1 != 0;
+            final String _tmpErrorMessage;
+            _tmpErrorMessage = _cursor.getString(_cursorIndexOfErrorMessage);
+            final long _tmpRecordedAtMs;
+            _tmpRecordedAtMs = _cursor.getLong(_cursorIndexOfRecordedAtMs);
+            final long _tmpHoldDurationMs;
+            _tmpHoldDurationMs = _cursor.getLong(_cursorIndexOfHoldDurationMs);
+            final long _tmpPressStartMs;
+            _tmpPressStartMs = _cursor.getLong(_cursorIndexOfPressStartMs);
+            final long _tmpReleaseMs;
+            _tmpReleaseMs = _cursor.getLong(_cursorIndexOfReleaseMs);
+            final long _tmpAudioStartMs;
+            _tmpAudioStartMs = _cursor.getLong(_cursorIndexOfAudioStartMs);
+            final long _tmpAudioEndMs;
+            _tmpAudioEndMs = _cursor.getLong(_cursorIndexOfAudioEndMs);
+            final String _tmpDiagnosticTraceJson;
+            _tmpDiagnosticTraceJson = _cursor.getString(_cursorIndexOfDiagnosticTraceJson);
+            final String _tmpOnDeviceTranscript;
+            _tmpOnDeviceTranscript = _cursor.getString(_cursorIndexOfOnDeviceTranscript);
+            final String _tmpPreviousJobId;
+            if (_cursor.isNull(_cursorIndexOfPreviousJobId)) {
+              _tmpPreviousJobId = null;
+            } else {
+              _tmpPreviousJobId = _cursor.getString(_cursorIndexOfPreviousJobId);
+            }
+            final long _tmpPrecedingGapMs;
+            _tmpPrecedingGapMs = _cursor.getLong(_cursorIndexOfPrecedingGapMs);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            _result = new SttJobRecord(_tmpId,_tmpAudioFilePath,_tmpStatus,_tmpRawTranscript,_tmpParsedItemId,_tmpParsedItemName,_tmpParsedQty,_tmpParsedUnit,_tmpParsedTotal,_tmpParsedIsPendingPrice,_tmpIsSanityFlagged,_tmpErrorMessage,_tmpRecordedAtMs,_tmpHoldDurationMs,_tmpPressStartMs,_tmpReleaseMs,_tmpAudioStartMs,_tmpAudioEndMs,_tmpDiagnosticTraceJson,_tmpOnDeviceTranscript,_tmpPreviousJobId,_tmpPrecedingGapMs,_tmpSynced);
+          } else {
+            _result = null;
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object getLatestJob(final Continuation<? super SttJobRecord> $completion) {
+    final String _sql = "SELECT * FROM stt_jobs ORDER BY recordedAtMs DESC LIMIT 1";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<SttJobRecord>() {
+      @Override
+      @Nullable
+      public SttJobRecord call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfStatus = CursorUtil.getColumnIndexOrThrow(_cursor, "status");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfParsedItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemId");
+          final int _cursorIndexOfParsedItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemName");
+          final int _cursorIndexOfParsedQty = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedQty");
+          final int _cursorIndexOfParsedUnit = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedUnit");
+          final int _cursorIndexOfParsedTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedTotal");
+          final int _cursorIndexOfParsedIsPendingPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedIsPendingPrice");
+          final int _cursorIndexOfIsSanityFlagged = CursorUtil.getColumnIndexOrThrow(_cursor, "isSanityFlagged");
+          final int _cursorIndexOfErrorMessage = CursorUtil.getColumnIndexOrThrow(_cursor, "errorMessage");
+          final int _cursorIndexOfRecordedAtMs = CursorUtil.getColumnIndexOrThrow(_cursor, "recordedAtMs");
+          final int _cursorIndexOfHoldDurationMs = CursorUtil.getColumnIndexOrThrow(_cursor, "holdDurationMs");
+          final int _cursorIndexOfPressStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "pressStartMs");
+          final int _cursorIndexOfReleaseMs = CursorUtil.getColumnIndexOrThrow(_cursor, "releaseMs");
+          final int _cursorIndexOfAudioStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioStartMs");
+          final int _cursorIndexOfAudioEndMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioEndMs");
+          final int _cursorIndexOfDiagnosticTraceJson = CursorUtil.getColumnIndexOrThrow(_cursor, "diagnosticTraceJson");
+          final int _cursorIndexOfOnDeviceTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "onDeviceTranscript");
+          final int _cursorIndexOfPreviousJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "previousJobId");
+          final int _cursorIndexOfPrecedingGapMs = CursorUtil.getColumnIndexOrThrow(_cursor, "precedingGapMs");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final SttJobRecord _result;
+          if (_cursor.moveToFirst()) {
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final SttJobStatus _tmpStatus;
+            _tmpStatus = __SttJobStatus_stringToEnum(_cursor.getString(_cursorIndexOfStatus));
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpParsedItemId;
+            if (_cursor.isNull(_cursorIndexOfParsedItemId)) {
+              _tmpParsedItemId = null;
+            } else {
+              _tmpParsedItemId = _cursor.getString(_cursorIndexOfParsedItemId);
+            }
+            final String _tmpParsedItemName;
+            _tmpParsedItemName = _cursor.getString(_cursorIndexOfParsedItemName);
+            final double _tmpParsedQty;
+            _tmpParsedQty = _cursor.getDouble(_cursorIndexOfParsedQty);
+            final String _tmpParsedUnit;
+            _tmpParsedUnit = _cursor.getString(_cursorIndexOfParsedUnit);
+            final double _tmpParsedTotal;
+            _tmpParsedTotal = _cursor.getDouble(_cursorIndexOfParsedTotal);
+            final boolean _tmpParsedIsPendingPrice;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfParsedIsPendingPrice);
+            _tmpParsedIsPendingPrice = _tmp != 0;
+            final boolean _tmpIsSanityFlagged;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfIsSanityFlagged);
+            _tmpIsSanityFlagged = _tmp_1 != 0;
+            final String _tmpErrorMessage;
+            _tmpErrorMessage = _cursor.getString(_cursorIndexOfErrorMessage);
+            final long _tmpRecordedAtMs;
+            _tmpRecordedAtMs = _cursor.getLong(_cursorIndexOfRecordedAtMs);
+            final long _tmpHoldDurationMs;
+            _tmpHoldDurationMs = _cursor.getLong(_cursorIndexOfHoldDurationMs);
+            final long _tmpPressStartMs;
+            _tmpPressStartMs = _cursor.getLong(_cursorIndexOfPressStartMs);
+            final long _tmpReleaseMs;
+            _tmpReleaseMs = _cursor.getLong(_cursorIndexOfReleaseMs);
+            final long _tmpAudioStartMs;
+            _tmpAudioStartMs = _cursor.getLong(_cursorIndexOfAudioStartMs);
+            final long _tmpAudioEndMs;
+            _tmpAudioEndMs = _cursor.getLong(_cursorIndexOfAudioEndMs);
+            final String _tmpDiagnosticTraceJson;
+            _tmpDiagnosticTraceJson = _cursor.getString(_cursorIndexOfDiagnosticTraceJson);
+            final String _tmpOnDeviceTranscript;
+            _tmpOnDeviceTranscript = _cursor.getString(_cursorIndexOfOnDeviceTranscript);
+            final String _tmpPreviousJobId;
+            if (_cursor.isNull(_cursorIndexOfPreviousJobId)) {
+              _tmpPreviousJobId = null;
+            } else {
+              _tmpPreviousJobId = _cursor.getString(_cursorIndexOfPreviousJobId);
+            }
+            final long _tmpPrecedingGapMs;
+            _tmpPrecedingGapMs = _cursor.getLong(_cursorIndexOfPrecedingGapMs);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            _result = new SttJobRecord(_tmpId,_tmpAudioFilePath,_tmpStatus,_tmpRawTranscript,_tmpParsedItemId,_tmpParsedItemName,_tmpParsedQty,_tmpParsedUnit,_tmpParsedTotal,_tmpParsedIsPendingPrice,_tmpIsSanityFlagged,_tmpErrorMessage,_tmpRecordedAtMs,_tmpHoldDurationMs,_tmpPressStartMs,_tmpReleaseMs,_tmpAudioStartMs,_tmpAudioEndMs,_tmpDiagnosticTraceJson,_tmpOnDeviceTranscript,_tmpPreviousJobId,_tmpPrecedingGapMs,_tmpSynced);
+          } else {
+            _result = null;
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object getQueuedJobsList(final Continuation<? super List<SttJobRecord>> $completion) {
+    final String _sql = "SELECT * FROM stt_jobs WHERE status = 'QUEUED' ORDER BY recordedAtMs ASC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<SttJobRecord>>() {
+      @Override
+      @NonNull
+      public List<SttJobRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfStatus = CursorUtil.getColumnIndexOrThrow(_cursor, "status");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfParsedItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemId");
+          final int _cursorIndexOfParsedItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemName");
+          final int _cursorIndexOfParsedQty = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedQty");
+          final int _cursorIndexOfParsedUnit = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedUnit");
+          final int _cursorIndexOfParsedTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedTotal");
+          final int _cursorIndexOfParsedIsPendingPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedIsPendingPrice");
+          final int _cursorIndexOfIsSanityFlagged = CursorUtil.getColumnIndexOrThrow(_cursor, "isSanityFlagged");
+          final int _cursorIndexOfErrorMessage = CursorUtil.getColumnIndexOrThrow(_cursor, "errorMessage");
+          final int _cursorIndexOfRecordedAtMs = CursorUtil.getColumnIndexOrThrow(_cursor, "recordedAtMs");
+          final int _cursorIndexOfHoldDurationMs = CursorUtil.getColumnIndexOrThrow(_cursor, "holdDurationMs");
+          final int _cursorIndexOfPressStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "pressStartMs");
+          final int _cursorIndexOfReleaseMs = CursorUtil.getColumnIndexOrThrow(_cursor, "releaseMs");
+          final int _cursorIndexOfAudioStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioStartMs");
+          final int _cursorIndexOfAudioEndMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioEndMs");
+          final int _cursorIndexOfDiagnosticTraceJson = CursorUtil.getColumnIndexOrThrow(_cursor, "diagnosticTraceJson");
+          final int _cursorIndexOfOnDeviceTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "onDeviceTranscript");
+          final int _cursorIndexOfPreviousJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "previousJobId");
+          final int _cursorIndexOfPrecedingGapMs = CursorUtil.getColumnIndexOrThrow(_cursor, "precedingGapMs");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final List<SttJobRecord> _result = new ArrayList<SttJobRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final SttJobRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final SttJobStatus _tmpStatus;
+            _tmpStatus = __SttJobStatus_stringToEnum(_cursor.getString(_cursorIndexOfStatus));
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpParsedItemId;
+            if (_cursor.isNull(_cursorIndexOfParsedItemId)) {
+              _tmpParsedItemId = null;
+            } else {
+              _tmpParsedItemId = _cursor.getString(_cursorIndexOfParsedItemId);
+            }
+            final String _tmpParsedItemName;
+            _tmpParsedItemName = _cursor.getString(_cursorIndexOfParsedItemName);
+            final double _tmpParsedQty;
+            _tmpParsedQty = _cursor.getDouble(_cursorIndexOfParsedQty);
+            final String _tmpParsedUnit;
+            _tmpParsedUnit = _cursor.getString(_cursorIndexOfParsedUnit);
+            final double _tmpParsedTotal;
+            _tmpParsedTotal = _cursor.getDouble(_cursorIndexOfParsedTotal);
+            final boolean _tmpParsedIsPendingPrice;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfParsedIsPendingPrice);
+            _tmpParsedIsPendingPrice = _tmp != 0;
+            final boolean _tmpIsSanityFlagged;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfIsSanityFlagged);
+            _tmpIsSanityFlagged = _tmp_1 != 0;
+            final String _tmpErrorMessage;
+            _tmpErrorMessage = _cursor.getString(_cursorIndexOfErrorMessage);
+            final long _tmpRecordedAtMs;
+            _tmpRecordedAtMs = _cursor.getLong(_cursorIndexOfRecordedAtMs);
+            final long _tmpHoldDurationMs;
+            _tmpHoldDurationMs = _cursor.getLong(_cursorIndexOfHoldDurationMs);
+            final long _tmpPressStartMs;
+            _tmpPressStartMs = _cursor.getLong(_cursorIndexOfPressStartMs);
+            final long _tmpReleaseMs;
+            _tmpReleaseMs = _cursor.getLong(_cursorIndexOfReleaseMs);
+            final long _tmpAudioStartMs;
+            _tmpAudioStartMs = _cursor.getLong(_cursorIndexOfAudioStartMs);
+            final long _tmpAudioEndMs;
+            _tmpAudioEndMs = _cursor.getLong(_cursorIndexOfAudioEndMs);
+            final String _tmpDiagnosticTraceJson;
+            _tmpDiagnosticTraceJson = _cursor.getString(_cursorIndexOfDiagnosticTraceJson);
+            final String _tmpOnDeviceTranscript;
+            _tmpOnDeviceTranscript = _cursor.getString(_cursorIndexOfOnDeviceTranscript);
+            final String _tmpPreviousJobId;
+            if (_cursor.isNull(_cursorIndexOfPreviousJobId)) {
+              _tmpPreviousJobId = null;
+            } else {
+              _tmpPreviousJobId = _cursor.getString(_cursorIndexOfPreviousJobId);
+            }
+            final long _tmpPrecedingGapMs;
+            _tmpPrecedingGapMs = _cursor.getLong(_cursorIndexOfPrecedingGapMs);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            _item = new SttJobRecord(_tmpId,_tmpAudioFilePath,_tmpStatus,_tmpRawTranscript,_tmpParsedItemId,_tmpParsedItemName,_tmpParsedQty,_tmpParsedUnit,_tmpParsedTotal,_tmpParsedIsPendingPrice,_tmpIsSanityFlagged,_tmpErrorMessage,_tmpRecordedAtMs,_tmpHoldDurationMs,_tmpPressStartMs,_tmpReleaseMs,_tmpAudioStartMs,_tmpAudioEndMs,_tmpDiagnosticTraceJson,_tmpOnDeviceTranscript,_tmpPreviousJobId,_tmpPrecedingGapMs,_tmpSynced);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Flow<List<SttJobRecord>> getParsedJobsFlow() {
+    final String _sql = "SELECT * FROM stt_jobs WHERE status = 'PARSED' ORDER BY recordedAtMs DESC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    return CoroutinesRoom.createFlow(__db, false, new String[] {"stt_jobs"}, new Callable<List<SttJobRecord>>() {
+      @Override
+      @NonNull
+      public List<SttJobRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfStatus = CursorUtil.getColumnIndexOrThrow(_cursor, "status");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfParsedItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemId");
+          final int _cursorIndexOfParsedItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemName");
+          final int _cursorIndexOfParsedQty = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedQty");
+          final int _cursorIndexOfParsedUnit = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedUnit");
+          final int _cursorIndexOfParsedTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedTotal");
+          final int _cursorIndexOfParsedIsPendingPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedIsPendingPrice");
+          final int _cursorIndexOfIsSanityFlagged = CursorUtil.getColumnIndexOrThrow(_cursor, "isSanityFlagged");
+          final int _cursorIndexOfErrorMessage = CursorUtil.getColumnIndexOrThrow(_cursor, "errorMessage");
+          final int _cursorIndexOfRecordedAtMs = CursorUtil.getColumnIndexOrThrow(_cursor, "recordedAtMs");
+          final int _cursorIndexOfHoldDurationMs = CursorUtil.getColumnIndexOrThrow(_cursor, "holdDurationMs");
+          final int _cursorIndexOfPressStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "pressStartMs");
+          final int _cursorIndexOfReleaseMs = CursorUtil.getColumnIndexOrThrow(_cursor, "releaseMs");
+          final int _cursorIndexOfAudioStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioStartMs");
+          final int _cursorIndexOfAudioEndMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioEndMs");
+          final int _cursorIndexOfDiagnosticTraceJson = CursorUtil.getColumnIndexOrThrow(_cursor, "diagnosticTraceJson");
+          final int _cursorIndexOfOnDeviceTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "onDeviceTranscript");
+          final int _cursorIndexOfPreviousJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "previousJobId");
+          final int _cursorIndexOfPrecedingGapMs = CursorUtil.getColumnIndexOrThrow(_cursor, "precedingGapMs");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final List<SttJobRecord> _result = new ArrayList<SttJobRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final SttJobRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final SttJobStatus _tmpStatus;
+            _tmpStatus = __SttJobStatus_stringToEnum(_cursor.getString(_cursorIndexOfStatus));
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpParsedItemId;
+            if (_cursor.isNull(_cursorIndexOfParsedItemId)) {
+              _tmpParsedItemId = null;
+            } else {
+              _tmpParsedItemId = _cursor.getString(_cursorIndexOfParsedItemId);
+            }
+            final String _tmpParsedItemName;
+            _tmpParsedItemName = _cursor.getString(_cursorIndexOfParsedItemName);
+            final double _tmpParsedQty;
+            _tmpParsedQty = _cursor.getDouble(_cursorIndexOfParsedQty);
+            final String _tmpParsedUnit;
+            _tmpParsedUnit = _cursor.getString(_cursorIndexOfParsedUnit);
+            final double _tmpParsedTotal;
+            _tmpParsedTotal = _cursor.getDouble(_cursorIndexOfParsedTotal);
+            final boolean _tmpParsedIsPendingPrice;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfParsedIsPendingPrice);
+            _tmpParsedIsPendingPrice = _tmp != 0;
+            final boolean _tmpIsSanityFlagged;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfIsSanityFlagged);
+            _tmpIsSanityFlagged = _tmp_1 != 0;
+            final String _tmpErrorMessage;
+            _tmpErrorMessage = _cursor.getString(_cursorIndexOfErrorMessage);
+            final long _tmpRecordedAtMs;
+            _tmpRecordedAtMs = _cursor.getLong(_cursorIndexOfRecordedAtMs);
+            final long _tmpHoldDurationMs;
+            _tmpHoldDurationMs = _cursor.getLong(_cursorIndexOfHoldDurationMs);
+            final long _tmpPressStartMs;
+            _tmpPressStartMs = _cursor.getLong(_cursorIndexOfPressStartMs);
+            final long _tmpReleaseMs;
+            _tmpReleaseMs = _cursor.getLong(_cursorIndexOfReleaseMs);
+            final long _tmpAudioStartMs;
+            _tmpAudioStartMs = _cursor.getLong(_cursorIndexOfAudioStartMs);
+            final long _tmpAudioEndMs;
+            _tmpAudioEndMs = _cursor.getLong(_cursorIndexOfAudioEndMs);
+            final String _tmpDiagnosticTraceJson;
+            _tmpDiagnosticTraceJson = _cursor.getString(_cursorIndexOfDiagnosticTraceJson);
+            final String _tmpOnDeviceTranscript;
+            _tmpOnDeviceTranscript = _cursor.getString(_cursorIndexOfOnDeviceTranscript);
+            final String _tmpPreviousJobId;
+            if (_cursor.isNull(_cursorIndexOfPreviousJobId)) {
+              _tmpPreviousJobId = null;
+            } else {
+              _tmpPreviousJobId = _cursor.getString(_cursorIndexOfPreviousJobId);
+            }
+            final long _tmpPrecedingGapMs;
+            _tmpPrecedingGapMs = _cursor.getLong(_cursorIndexOfPrecedingGapMs);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            _item = new SttJobRecord(_tmpId,_tmpAudioFilePath,_tmpStatus,_tmpRawTranscript,_tmpParsedItemId,_tmpParsedItemName,_tmpParsedQty,_tmpParsedUnit,_tmpParsedTotal,_tmpParsedIsPendingPrice,_tmpIsSanityFlagged,_tmpErrorMessage,_tmpRecordedAtMs,_tmpHoldDurationMs,_tmpPressStartMs,_tmpReleaseMs,_tmpAudioStartMs,_tmpAudioEndMs,_tmpDiagnosticTraceJson,_tmpOnDeviceTranscript,_tmpPreviousJobId,_tmpPrecedingGapMs,_tmpSynced);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+        }
+      }
+
+      @Override
+      protected void finalize() {
+        _statement.release();
+      }
+    });
+  }
+
+  @Override
+  public Flow<Integer> getParsedJobsCountFlow() {
+    final String _sql = "SELECT COUNT(*) FROM stt_jobs WHERE status = 'PARSED'";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    return CoroutinesRoom.createFlow(__db, false, new String[] {"stt_jobs"}, new Callable<Integer>() {
+      @Override
+      @NonNull
+      public Integer call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final Integer _result;
+          if (_cursor.moveToFirst()) {
+            final int _tmp;
+            _tmp = _cursor.getInt(0);
+            _result = _tmp;
+          } else {
+            _result = 0;
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+        }
+      }
+
+      @Override
+      protected void finalize() {
+        _statement.release();
+      }
+    });
+  }
+
+  @Override
+  public Flow<List<SttJobRecord>> getAllJobsTraceLogsFlow() {
+    final String _sql = "SELECT * FROM stt_jobs ORDER BY recordedAtMs DESC LIMIT 200";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    return CoroutinesRoom.createFlow(__db, false, new String[] {"stt_jobs"}, new Callable<List<SttJobRecord>>() {
+      @Override
+      @NonNull
+      public List<SttJobRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfStatus = CursorUtil.getColumnIndexOrThrow(_cursor, "status");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfParsedItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemId");
+          final int _cursorIndexOfParsedItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemName");
+          final int _cursorIndexOfParsedQty = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedQty");
+          final int _cursorIndexOfParsedUnit = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedUnit");
+          final int _cursorIndexOfParsedTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedTotal");
+          final int _cursorIndexOfParsedIsPendingPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedIsPendingPrice");
+          final int _cursorIndexOfIsSanityFlagged = CursorUtil.getColumnIndexOrThrow(_cursor, "isSanityFlagged");
+          final int _cursorIndexOfErrorMessage = CursorUtil.getColumnIndexOrThrow(_cursor, "errorMessage");
+          final int _cursorIndexOfRecordedAtMs = CursorUtil.getColumnIndexOrThrow(_cursor, "recordedAtMs");
+          final int _cursorIndexOfHoldDurationMs = CursorUtil.getColumnIndexOrThrow(_cursor, "holdDurationMs");
+          final int _cursorIndexOfPressStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "pressStartMs");
+          final int _cursorIndexOfReleaseMs = CursorUtil.getColumnIndexOrThrow(_cursor, "releaseMs");
+          final int _cursorIndexOfAudioStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioStartMs");
+          final int _cursorIndexOfAudioEndMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioEndMs");
+          final int _cursorIndexOfDiagnosticTraceJson = CursorUtil.getColumnIndexOrThrow(_cursor, "diagnosticTraceJson");
+          final int _cursorIndexOfOnDeviceTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "onDeviceTranscript");
+          final int _cursorIndexOfPreviousJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "previousJobId");
+          final int _cursorIndexOfPrecedingGapMs = CursorUtil.getColumnIndexOrThrow(_cursor, "precedingGapMs");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final List<SttJobRecord> _result = new ArrayList<SttJobRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final SttJobRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final SttJobStatus _tmpStatus;
+            _tmpStatus = __SttJobStatus_stringToEnum(_cursor.getString(_cursorIndexOfStatus));
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpParsedItemId;
+            if (_cursor.isNull(_cursorIndexOfParsedItemId)) {
+              _tmpParsedItemId = null;
+            } else {
+              _tmpParsedItemId = _cursor.getString(_cursorIndexOfParsedItemId);
+            }
+            final String _tmpParsedItemName;
+            _tmpParsedItemName = _cursor.getString(_cursorIndexOfParsedItemName);
+            final double _tmpParsedQty;
+            _tmpParsedQty = _cursor.getDouble(_cursorIndexOfParsedQty);
+            final String _tmpParsedUnit;
+            _tmpParsedUnit = _cursor.getString(_cursorIndexOfParsedUnit);
+            final double _tmpParsedTotal;
+            _tmpParsedTotal = _cursor.getDouble(_cursorIndexOfParsedTotal);
+            final boolean _tmpParsedIsPendingPrice;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfParsedIsPendingPrice);
+            _tmpParsedIsPendingPrice = _tmp != 0;
+            final boolean _tmpIsSanityFlagged;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfIsSanityFlagged);
+            _tmpIsSanityFlagged = _tmp_1 != 0;
+            final String _tmpErrorMessage;
+            _tmpErrorMessage = _cursor.getString(_cursorIndexOfErrorMessage);
+            final long _tmpRecordedAtMs;
+            _tmpRecordedAtMs = _cursor.getLong(_cursorIndexOfRecordedAtMs);
+            final long _tmpHoldDurationMs;
+            _tmpHoldDurationMs = _cursor.getLong(_cursorIndexOfHoldDurationMs);
+            final long _tmpPressStartMs;
+            _tmpPressStartMs = _cursor.getLong(_cursorIndexOfPressStartMs);
+            final long _tmpReleaseMs;
+            _tmpReleaseMs = _cursor.getLong(_cursorIndexOfReleaseMs);
+            final long _tmpAudioStartMs;
+            _tmpAudioStartMs = _cursor.getLong(_cursorIndexOfAudioStartMs);
+            final long _tmpAudioEndMs;
+            _tmpAudioEndMs = _cursor.getLong(_cursorIndexOfAudioEndMs);
+            final String _tmpDiagnosticTraceJson;
+            _tmpDiagnosticTraceJson = _cursor.getString(_cursorIndexOfDiagnosticTraceJson);
+            final String _tmpOnDeviceTranscript;
+            _tmpOnDeviceTranscript = _cursor.getString(_cursorIndexOfOnDeviceTranscript);
+            final String _tmpPreviousJobId;
+            if (_cursor.isNull(_cursorIndexOfPreviousJobId)) {
+              _tmpPreviousJobId = null;
+            } else {
+              _tmpPreviousJobId = _cursor.getString(_cursorIndexOfPreviousJobId);
+            }
+            final long _tmpPrecedingGapMs;
+            _tmpPrecedingGapMs = _cursor.getLong(_cursorIndexOfPrecedingGapMs);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            _item = new SttJobRecord(_tmpId,_tmpAudioFilePath,_tmpStatus,_tmpRawTranscript,_tmpParsedItemId,_tmpParsedItemName,_tmpParsedQty,_tmpParsedUnit,_tmpParsedTotal,_tmpParsedIsPendingPrice,_tmpIsSanityFlagged,_tmpErrorMessage,_tmpRecordedAtMs,_tmpHoldDurationMs,_tmpPressStartMs,_tmpReleaseMs,_tmpAudioStartMs,_tmpAudioEndMs,_tmpDiagnosticTraceJson,_tmpOnDeviceTranscript,_tmpPreviousJobId,_tmpPrecedingGapMs,_tmpSynced);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+        }
+      }
+
+      @Override
+      protected void finalize() {
+        _statement.release();
+      }
+    });
+  }
+
+  @Override
+  public Object getAllJobsTraceLogsList(
+      final Continuation<? super List<SttJobRecord>> $completion) {
+    final String _sql = "SELECT * FROM stt_jobs ORDER BY recordedAtMs DESC LIMIT 200";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<SttJobRecord>>() {
+      @Override
+      @NonNull
+      public List<SttJobRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfStatus = CursorUtil.getColumnIndexOrThrow(_cursor, "status");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfParsedItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemId");
+          final int _cursorIndexOfParsedItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemName");
+          final int _cursorIndexOfParsedQty = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedQty");
+          final int _cursorIndexOfParsedUnit = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedUnit");
+          final int _cursorIndexOfParsedTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedTotal");
+          final int _cursorIndexOfParsedIsPendingPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedIsPendingPrice");
+          final int _cursorIndexOfIsSanityFlagged = CursorUtil.getColumnIndexOrThrow(_cursor, "isSanityFlagged");
+          final int _cursorIndexOfErrorMessage = CursorUtil.getColumnIndexOrThrow(_cursor, "errorMessage");
+          final int _cursorIndexOfRecordedAtMs = CursorUtil.getColumnIndexOrThrow(_cursor, "recordedAtMs");
+          final int _cursorIndexOfHoldDurationMs = CursorUtil.getColumnIndexOrThrow(_cursor, "holdDurationMs");
+          final int _cursorIndexOfPressStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "pressStartMs");
+          final int _cursorIndexOfReleaseMs = CursorUtil.getColumnIndexOrThrow(_cursor, "releaseMs");
+          final int _cursorIndexOfAudioStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioStartMs");
+          final int _cursorIndexOfAudioEndMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioEndMs");
+          final int _cursorIndexOfDiagnosticTraceJson = CursorUtil.getColumnIndexOrThrow(_cursor, "diagnosticTraceJson");
+          final int _cursorIndexOfOnDeviceTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "onDeviceTranscript");
+          final int _cursorIndexOfPreviousJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "previousJobId");
+          final int _cursorIndexOfPrecedingGapMs = CursorUtil.getColumnIndexOrThrow(_cursor, "precedingGapMs");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final List<SttJobRecord> _result = new ArrayList<SttJobRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final SttJobRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final SttJobStatus _tmpStatus;
+            _tmpStatus = __SttJobStatus_stringToEnum(_cursor.getString(_cursorIndexOfStatus));
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpParsedItemId;
+            if (_cursor.isNull(_cursorIndexOfParsedItemId)) {
+              _tmpParsedItemId = null;
+            } else {
+              _tmpParsedItemId = _cursor.getString(_cursorIndexOfParsedItemId);
+            }
+            final String _tmpParsedItemName;
+            _tmpParsedItemName = _cursor.getString(_cursorIndexOfParsedItemName);
+            final double _tmpParsedQty;
+            _tmpParsedQty = _cursor.getDouble(_cursorIndexOfParsedQty);
+            final String _tmpParsedUnit;
+            _tmpParsedUnit = _cursor.getString(_cursorIndexOfParsedUnit);
+            final double _tmpParsedTotal;
+            _tmpParsedTotal = _cursor.getDouble(_cursorIndexOfParsedTotal);
+            final boolean _tmpParsedIsPendingPrice;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfParsedIsPendingPrice);
+            _tmpParsedIsPendingPrice = _tmp != 0;
+            final boolean _tmpIsSanityFlagged;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfIsSanityFlagged);
+            _tmpIsSanityFlagged = _tmp_1 != 0;
+            final String _tmpErrorMessage;
+            _tmpErrorMessage = _cursor.getString(_cursorIndexOfErrorMessage);
+            final long _tmpRecordedAtMs;
+            _tmpRecordedAtMs = _cursor.getLong(_cursorIndexOfRecordedAtMs);
+            final long _tmpHoldDurationMs;
+            _tmpHoldDurationMs = _cursor.getLong(_cursorIndexOfHoldDurationMs);
+            final long _tmpPressStartMs;
+            _tmpPressStartMs = _cursor.getLong(_cursorIndexOfPressStartMs);
+            final long _tmpReleaseMs;
+            _tmpReleaseMs = _cursor.getLong(_cursorIndexOfReleaseMs);
+            final long _tmpAudioStartMs;
+            _tmpAudioStartMs = _cursor.getLong(_cursorIndexOfAudioStartMs);
+            final long _tmpAudioEndMs;
+            _tmpAudioEndMs = _cursor.getLong(_cursorIndexOfAudioEndMs);
+            final String _tmpDiagnosticTraceJson;
+            _tmpDiagnosticTraceJson = _cursor.getString(_cursorIndexOfDiagnosticTraceJson);
+            final String _tmpOnDeviceTranscript;
+            _tmpOnDeviceTranscript = _cursor.getString(_cursorIndexOfOnDeviceTranscript);
+            final String _tmpPreviousJobId;
+            if (_cursor.isNull(_cursorIndexOfPreviousJobId)) {
+              _tmpPreviousJobId = null;
+            } else {
+              _tmpPreviousJobId = _cursor.getString(_cursorIndexOfPreviousJobId);
+            }
+            final long _tmpPrecedingGapMs;
+            _tmpPrecedingGapMs = _cursor.getLong(_cursorIndexOfPrecedingGapMs);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            _item = new SttJobRecord(_tmpId,_tmpAudioFilePath,_tmpStatus,_tmpRawTranscript,_tmpParsedItemId,_tmpParsedItemName,_tmpParsedQty,_tmpParsedUnit,_tmpParsedTotal,_tmpParsedIsPendingPrice,_tmpIsSanityFlagged,_tmpErrorMessage,_tmpRecordedAtMs,_tmpHoldDurationMs,_tmpPressStartMs,_tmpReleaseMs,_tmpAudioStartMs,_tmpAudioEndMs,_tmpDiagnosticTraceJson,_tmpOnDeviceTranscript,_tmpPreviousJobId,_tmpPrecedingGapMs,_tmpSynced);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object getUnsyncedJobs(final Continuation<? super List<SttJobRecord>> $completion) {
+    final String _sql = "SELECT * FROM stt_jobs WHERE synced = 0 AND status IN ('CONFIRMED', 'AUTO_CONFIRMED', 'PARSED', 'FAILED')";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<SttJobRecord>>() {
+      @Override
+      @NonNull
+      public List<SttJobRecord> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfAudioFilePath = CursorUtil.getColumnIndexOrThrow(_cursor, "audioFilePath");
+          final int _cursorIndexOfStatus = CursorUtil.getColumnIndexOrThrow(_cursor, "status");
+          final int _cursorIndexOfRawTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "rawTranscript");
+          final int _cursorIndexOfParsedItemId = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemId");
+          final int _cursorIndexOfParsedItemName = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedItemName");
+          final int _cursorIndexOfParsedQty = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedQty");
+          final int _cursorIndexOfParsedUnit = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedUnit");
+          final int _cursorIndexOfParsedTotal = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedTotal");
+          final int _cursorIndexOfParsedIsPendingPrice = CursorUtil.getColumnIndexOrThrow(_cursor, "parsedIsPendingPrice");
+          final int _cursorIndexOfIsSanityFlagged = CursorUtil.getColumnIndexOrThrow(_cursor, "isSanityFlagged");
+          final int _cursorIndexOfErrorMessage = CursorUtil.getColumnIndexOrThrow(_cursor, "errorMessage");
+          final int _cursorIndexOfRecordedAtMs = CursorUtil.getColumnIndexOrThrow(_cursor, "recordedAtMs");
+          final int _cursorIndexOfHoldDurationMs = CursorUtil.getColumnIndexOrThrow(_cursor, "holdDurationMs");
+          final int _cursorIndexOfPressStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "pressStartMs");
+          final int _cursorIndexOfReleaseMs = CursorUtil.getColumnIndexOrThrow(_cursor, "releaseMs");
+          final int _cursorIndexOfAudioStartMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioStartMs");
+          final int _cursorIndexOfAudioEndMs = CursorUtil.getColumnIndexOrThrow(_cursor, "audioEndMs");
+          final int _cursorIndexOfDiagnosticTraceJson = CursorUtil.getColumnIndexOrThrow(_cursor, "diagnosticTraceJson");
+          final int _cursorIndexOfOnDeviceTranscript = CursorUtil.getColumnIndexOrThrow(_cursor, "onDeviceTranscript");
+          final int _cursorIndexOfPreviousJobId = CursorUtil.getColumnIndexOrThrow(_cursor, "previousJobId");
+          final int _cursorIndexOfPrecedingGapMs = CursorUtil.getColumnIndexOrThrow(_cursor, "precedingGapMs");
+          final int _cursorIndexOfSynced = CursorUtil.getColumnIndexOrThrow(_cursor, "synced");
+          final List<SttJobRecord> _result = new ArrayList<SttJobRecord>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final SttJobRecord _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpAudioFilePath;
+            _tmpAudioFilePath = _cursor.getString(_cursorIndexOfAudioFilePath);
+            final SttJobStatus _tmpStatus;
+            _tmpStatus = __SttJobStatus_stringToEnum(_cursor.getString(_cursorIndexOfStatus));
+            final String _tmpRawTranscript;
+            _tmpRawTranscript = _cursor.getString(_cursorIndexOfRawTranscript);
+            final String _tmpParsedItemId;
+            if (_cursor.isNull(_cursorIndexOfParsedItemId)) {
+              _tmpParsedItemId = null;
+            } else {
+              _tmpParsedItemId = _cursor.getString(_cursorIndexOfParsedItemId);
+            }
+            final String _tmpParsedItemName;
+            _tmpParsedItemName = _cursor.getString(_cursorIndexOfParsedItemName);
+            final double _tmpParsedQty;
+            _tmpParsedQty = _cursor.getDouble(_cursorIndexOfParsedQty);
+            final String _tmpParsedUnit;
+            _tmpParsedUnit = _cursor.getString(_cursorIndexOfParsedUnit);
+            final double _tmpParsedTotal;
+            _tmpParsedTotal = _cursor.getDouble(_cursorIndexOfParsedTotal);
+            final boolean _tmpParsedIsPendingPrice;
+            final int _tmp;
+            _tmp = _cursor.getInt(_cursorIndexOfParsedIsPendingPrice);
+            _tmpParsedIsPendingPrice = _tmp != 0;
+            final boolean _tmpIsSanityFlagged;
+            final int _tmp_1;
+            _tmp_1 = _cursor.getInt(_cursorIndexOfIsSanityFlagged);
+            _tmpIsSanityFlagged = _tmp_1 != 0;
+            final String _tmpErrorMessage;
+            _tmpErrorMessage = _cursor.getString(_cursorIndexOfErrorMessage);
+            final long _tmpRecordedAtMs;
+            _tmpRecordedAtMs = _cursor.getLong(_cursorIndexOfRecordedAtMs);
+            final long _tmpHoldDurationMs;
+            _tmpHoldDurationMs = _cursor.getLong(_cursorIndexOfHoldDurationMs);
+            final long _tmpPressStartMs;
+            _tmpPressStartMs = _cursor.getLong(_cursorIndexOfPressStartMs);
+            final long _tmpReleaseMs;
+            _tmpReleaseMs = _cursor.getLong(_cursorIndexOfReleaseMs);
+            final long _tmpAudioStartMs;
+            _tmpAudioStartMs = _cursor.getLong(_cursorIndexOfAudioStartMs);
+            final long _tmpAudioEndMs;
+            _tmpAudioEndMs = _cursor.getLong(_cursorIndexOfAudioEndMs);
+            final String _tmpDiagnosticTraceJson;
+            _tmpDiagnosticTraceJson = _cursor.getString(_cursorIndexOfDiagnosticTraceJson);
+            final String _tmpOnDeviceTranscript;
+            _tmpOnDeviceTranscript = _cursor.getString(_cursorIndexOfOnDeviceTranscript);
+            final String _tmpPreviousJobId;
+            if (_cursor.isNull(_cursorIndexOfPreviousJobId)) {
+              _tmpPreviousJobId = null;
+            } else {
+              _tmpPreviousJobId = _cursor.getString(_cursorIndexOfPreviousJobId);
+            }
+            final long _tmpPrecedingGapMs;
+            _tmpPrecedingGapMs = _cursor.getLong(_cursorIndexOfPrecedingGapMs);
+            final boolean _tmpSynced;
+            final int _tmp_2;
+            _tmp_2 = _cursor.getInt(_cursorIndexOfSynced);
+            _tmpSynced = _tmp_2 != 0;
+            _item = new SttJobRecord(_tmpId,_tmpAudioFilePath,_tmpStatus,_tmpRawTranscript,_tmpParsedItemId,_tmpParsedItemName,_tmpParsedQty,_tmpParsedUnit,_tmpParsedTotal,_tmpParsedIsPendingPrice,_tmpIsSanityFlagged,_tmpErrorMessage,_tmpRecordedAtMs,_tmpHoldDurationMs,_tmpPressStartMs,_tmpReleaseMs,_tmpAudioStartMs,_tmpAudioEndMs,_tmpDiagnosticTraceJson,_tmpOnDeviceTranscript,_tmpPreviousJobId,_tmpPrecedingGapMs,_tmpSynced);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object markSynced(final List<String> ids, final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        final StringBuilder _stringBuilder = StringUtil.newStringBuilder();
+        _stringBuilder.append("UPDATE stt_jobs SET synced = 1 WHERE id IN (");
+        final int _inputSize = ids.size();
+        StringUtil.appendPlaceholders(_stringBuilder, _inputSize);
+        _stringBuilder.append(")");
+        final String _sql = _stringBuilder.toString();
+        final SupportSQLiteStatement _stmt = __db.compileStatement(_sql);
+        int _argIndex = 1;
+        for (String _item : ids) {
+          _stmt.bindString(_argIndex, _item);
+          _argIndex++;
+        }
+        __db.beginTransaction();
+        try {
+          _stmt.executeUpdateDelete();
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @NonNull
+  public static List<Class<?>> getRequiredConverters() {
+    return Collections.emptyList();
+  }
+
+  private String __SttJobStatus_enumToString(@NonNull final SttJobStatus _value) {
+    switch (_value) {
+      case QUEUED: return "QUEUED";
+      case TRANSCRIBING: return "TRANSCRIBING";
+      case PARSED: return "PARSED";
+      case CONFIRMED: return "CONFIRMED";
+      case AUTO_CONFIRMED: return "AUTO_CONFIRMED";
+      case FAILED: return "FAILED";
+      default: throw new IllegalArgumentException("Can't convert enum to string, unknown enum value: " + _value);
+    }
+  }
+
+  private SttJobStatus __SttJobStatus_stringToEnum(@NonNull final String _value) {
+    switch (_value) {
+      case "QUEUED": return SttJobStatus.QUEUED;
+      case "TRANSCRIBING": return SttJobStatus.TRANSCRIBING;
+      case "PARSED": return SttJobStatus.PARSED;
+      case "CONFIRMED": return SttJobStatus.CONFIRMED;
+      case "AUTO_CONFIRMED": return SttJobStatus.AUTO_CONFIRMED;
+      case "FAILED": return SttJobStatus.FAILED;
+      default: throw new IllegalArgumentException("Can't convert value to enum, unknown value: " + _value);
+    }
+  }
+}

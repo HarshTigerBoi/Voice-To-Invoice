@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Mukta", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Baloo 2", "Mukta", ui-sans-serif, sans-serif;
+}
+
+html {
+  font-family: var(--font-sans);
+}
+
+body {
+  background-color: #f7f4ee;
+  color: #292524;
+  -webkit-font-smoothing: antialiased;
+}

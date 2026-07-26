@@ -157,6 +157,35 @@ export function parseHindiOrNumericValue(token: string): number | null {
   return null
 }
 
+/**
+ * Extracts all resolved compound numbers >= 10 from a raw transcript string.
+ */
+export function extractSpokenNumbers(transcript: string): number[] {
+  if (!transcript) return []
+  const clean = transcript.toLowerCase().replace(/।/g, ' ').replace(/[.,?!\-\\()]/g, ' ')
+  const tokens = clean.split(/\s+/).filter(t => t.length > 0)
+  const results: number[] = []
+
+  let i = 0
+  while (i < tokens.length) {
+    if (parseHindiOrNumericValue(tokens[i]) !== null) {
+      const seq: string[] = []
+      while (i < tokens.length && parseHindiOrNumericValue(tokens[i]) !== null) {
+        seq.push(tokens[i])
+        i++
+      }
+      const val = parseCompoundNumberSequence(seq)
+      if (val !== null && val >= 10) {
+        results.push(val)
+      }
+    } else {
+      i++
+    }
+  }
+
+  return results
+}
+
 const MIN_PLAUSIBLE_SALE_VALUE = 5.0
 
 /**
@@ -188,28 +217,13 @@ export function implausibilityReason(unit: string, qty: number, total: number, r
 
   // Numeric consistency guard: check if any compound number >= 10 in transcript was silently dropped
   if (rawTranscript) {
-    const clean = rawTranscript.toLowerCase().replace(/।/g, ' ').replace(/[.,?!\-\\()]/g, ' ')
-    const tokens = clean.split(/\s+/).filter(t => t.length > 0)
-
-    let i = 0
-    while (i < tokens.length) {
-      if (parseHindiOrNumericValue(tokens[i]) !== null) {
-        const seq: string[] = []
-        while (i < tokens.length && parseHindiOrNumericValue(tokens[i]) !== null) {
-          seq.push(tokens[i])
-          i++
-        }
-        const val = parseCompoundNumberSequence(seq)
-        if (val !== null && val >= 10) {
-          const matchesQty = Math.abs(qty - val) < 0.01
-          const matchesPrice = Math.abs(priceAtSale - val) < 0.01
-          const matchesTotal = Math.abs(total - val) < 0.01
-          if (!matchesQty && !matchesPrice && !matchesTotal) {
-            return `spoken compound number ${val} in '${rawTranscript}' was not reflected in qty (${qty}), price (${priceAtSale}), or total (${total})`
-          }
-        }
-      } else {
-        i++
+    const spokenNumbers = extractSpokenNumbers(rawTranscript)
+    for (const val of spokenNumbers) {
+      const matchesQty = Math.abs(qty - val) < 0.01
+      const matchesPrice = Math.abs(priceAtSale - val) < 0.01
+      const matchesTotal = Math.abs(total - val) < 0.01
+      if (!matchesQty && !matchesPrice && !matchesTotal) {
+        return `spoken compound number ${val} in '${rawTranscript}' was not reflected in qty (${qty}), price (${priceAtSale}), or total (${total})`
       }
     }
   }

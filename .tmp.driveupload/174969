@@ -1,0 +1,19 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.voicetoinvoice.app-mergeDebugResources-44:/values-v30/values-v30.xml",
+            "map": [
+                {
+                    "source": "C:\\Users\\harsh\\.gradle\\caches\\9.1.0\\transforms\\ae52003235b52fb26acb7e84a7f428b7\\workspace\\transformed\\material3-release\\res\\values-v30\\values-v30.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "55",
+                        "endColumns": "72",
+                        "endOffsets": "123"
+                    }
+                }
+            ]
+        }
+    ]
+}

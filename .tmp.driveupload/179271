@@ -1,0 +1,168 @@
+package com.voicetoinvoice.app.data.local.dao;
+
+import android.database.Cursor;
+import android.os.CancellationSignal;
+import androidx.annotation.NonNull;
+import androidx.room.CoroutinesRoom;
+import androidx.room.EntityDeletionOrUpdateAdapter;
+import androidx.room.EntityInsertionAdapter;
+import androidx.room.RoomDatabase;
+import androidx.room.RoomSQLiteQuery;
+import androidx.room.util.CursorUtil;
+import androidx.room.util.DBUtil;
+import androidx.sqlite.db.SupportSQLiteStatement;
+import com.voicetoinvoice.app.data.local.Converters;
+import com.voicetoinvoice.app.data.local.entity.SyncAction;
+import com.voicetoinvoice.app.data.local.entity.SyncQueueItem;
+import java.lang.Class;
+import java.lang.Exception;
+import java.lang.Object;
+import java.lang.Override;
+import java.lang.String;
+import java.lang.SuppressWarnings;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+import javax.annotation.processing.Generated;
+import kotlin.Unit;
+import kotlin.coroutines.Continuation;
+
+@Generated("androidx.room.RoomProcessor")
+@SuppressWarnings({"unchecked", "deprecation"})
+public final class SyncQueueDao_Impl implements SyncQueueDao {
+  private final RoomDatabase __db;
+
+  private final EntityInsertionAdapter<SyncQueueItem> __insertionAdapterOfSyncQueueItem;
+
+  private final Converters __converters = new Converters();
+
+  private final EntityDeletionOrUpdateAdapter<SyncQueueItem> __deletionAdapterOfSyncQueueItem;
+
+  public SyncQueueDao_Impl(@NonNull final RoomDatabase __db) {
+    this.__db = __db;
+    this.__insertionAdapterOfSyncQueueItem = new EntityInsertionAdapter<SyncQueueItem>(__db) {
+      @Override
+      @NonNull
+      protected String createQuery() {
+        return "INSERT OR REPLACE INTO `sync_queue` (`id`,`tableName`,`recordId`,`action`,`payloadJson`,`timestamp`,`retryCount`) VALUES (?,?,?,?,?,?,?)";
+      }
+
+      @Override
+      protected void bind(@NonNull final SupportSQLiteStatement statement,
+          @NonNull final SyncQueueItem entity) {
+        statement.bindString(1, entity.getId());
+        statement.bindString(2, entity.getTableName());
+        statement.bindString(3, entity.getRecordId());
+        final String _tmp = __converters.fromSyncAction(entity.getAction());
+        statement.bindString(4, _tmp);
+        statement.bindString(5, entity.getPayloadJson());
+        statement.bindLong(6, entity.getTimestamp());
+        statement.bindLong(7, entity.getRetryCount());
+      }
+    };
+    this.__deletionAdapterOfSyncQueueItem = new EntityDeletionOrUpdateAdapter<SyncQueueItem>(__db) {
+      @Override
+      @NonNull
+      protected String createQuery() {
+        return "DELETE FROM `sync_queue` WHERE `id` = ?";
+      }
+
+      @Override
+      protected void bind(@NonNull final SupportSQLiteStatement statement,
+          @NonNull final SyncQueueItem entity) {
+        statement.bindString(1, entity.getId());
+      }
+    };
+  }
+
+  @Override
+  public Object enqueue(final SyncQueueItem item, final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        __db.beginTransaction();
+        try {
+          __insertionAdapterOfSyncQueueItem.insert(item);
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object dequeue(final SyncQueueItem item, final Continuation<? super Unit> $completion) {
+    return CoroutinesRoom.execute(__db, true, new Callable<Unit>() {
+      @Override
+      @NonNull
+      public Unit call() throws Exception {
+        __db.beginTransaction();
+        try {
+          __deletionAdapterOfSyncQueueItem.handle(item);
+          __db.setTransactionSuccessful();
+          return Unit.INSTANCE;
+        } finally {
+          __db.endTransaction();
+        }
+      }
+    }, $completion);
+  }
+
+  @Override
+  public Object getPendingQueue(final Continuation<? super List<SyncQueueItem>> $completion) {
+    final String _sql = "SELECT * FROM sync_queue ORDER BY timestamp ASC";
+    final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);
+    final CancellationSignal _cancellationSignal = DBUtil.createCancellationSignal();
+    return CoroutinesRoom.execute(__db, false, _cancellationSignal, new Callable<List<SyncQueueItem>>() {
+      @Override
+      @NonNull
+      public List<SyncQueueItem> call() throws Exception {
+        final Cursor _cursor = DBUtil.query(__db, _statement, false, null);
+        try {
+          final int _cursorIndexOfId = CursorUtil.getColumnIndexOrThrow(_cursor, "id");
+          final int _cursorIndexOfTableName = CursorUtil.getColumnIndexOrThrow(_cursor, "tableName");
+          final int _cursorIndexOfRecordId = CursorUtil.getColumnIndexOrThrow(_cursor, "recordId");
+          final int _cursorIndexOfAction = CursorUtil.getColumnIndexOrThrow(_cursor, "action");
+          final int _cursorIndexOfPayloadJson = CursorUtil.getColumnIndexOrThrow(_cursor, "payloadJson");
+          final int _cursorIndexOfTimestamp = CursorUtil.getColumnIndexOrThrow(_cursor, "timestamp");
+          final int _cursorIndexOfRetryCount = CursorUtil.getColumnIndexOrThrow(_cursor, "retryCount");
+          final List<SyncQueueItem> _result = new ArrayList<SyncQueueItem>(_cursor.getCount());
+          while (_cursor.moveToNext()) {
+            final SyncQueueItem _item;
+            final String _tmpId;
+            _tmpId = _cursor.getString(_cursorIndexOfId);
+            final String _tmpTableName;
+            _tmpTableName = _cursor.getString(_cursorIndexOfTableName);
+            final String _tmpRecordId;
+            _tmpRecordId = _cursor.getString(_cursorIndexOfRecordId);
+            final SyncAction _tmpAction;
+            final String _tmp;
+            _tmp = _cursor.getString(_cursorIndexOfAction);
+            _tmpAction = __converters.toSyncAction(_tmp);
+            final String _tmpPayloadJson;
+            _tmpPayloadJson = _cursor.getString(_cursorIndexOfPayloadJson);
+            final long _tmpTimestamp;
+            _tmpTimestamp = _cursor.getLong(_cursorIndexOfTimestamp);
+            final int _tmpRetryCount;
+            _tmpRetryCount = _cursor.getInt(_cursorIndexOfRetryCount);
+            _item = new SyncQueueItem(_tmpId,_tmpTableName,_tmpRecordId,_tmpAction,_tmpPayloadJson,_tmpTimestamp,_tmpRetryCount);
+            _result.add(_item);
+          }
+          return _result;
+        } finally {
+          _cursor.close();
+          _statement.release();
+        }
+      }
+    }, $completion);
+  }
+
+  @NonNull
+  public static List<Class<?>> getRequiredConverters() {
+    return Collections.emptyList();
+  }
+}

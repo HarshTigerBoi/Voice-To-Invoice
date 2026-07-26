@@ -79,6 +79,17 @@ class SttWorker(
         try {
             db.sttJobDao().updateJob(jobRecord.copy(status = SttJobStatus.TRANSCRIBING))
 
+            // Re-read job record with bounded timeout to allow onDeviceTranscript backfill if pending
+            val updatedJob = kotlinx.coroutines.withTimeoutOrNull(1000L) {
+                var current = db.sttJobDao().getJobById(jobId)
+                val start = System.currentTimeMillis()
+                while (current != null && current.onDeviceTranscript.isBlank() && System.currentTimeMillis() - start < 1000L) {
+                    kotlinx.coroutines.delay(100L)
+                    current = db.sttJobDao().getJobById(jobId)
+                }
+                current
+            } ?: jobRecord
+
             val endpointUrl = "${SupabaseConfig.SUPABASE_URL}/functions/v1/process-voice-job"
             val boundary = "Boundary-${System.currentTimeMillis()}"
             val lineEnd = "\r\n"
@@ -124,6 +135,27 @@ class SttWorker(
                 writeString("$twoHyphens$boundary$lineEnd")
                 writeString("Content-Disposition: form-data; name=\"shopId\"$lineEnd$lineEnd")
                 writeString("11111111-1111-1111-1111-111111111111$lineEnd")
+
+                // Field 3.6: onDeviceTranscript
+                if (updatedJob.onDeviceTranscript.isNotBlank()) {
+                    writeString("$twoHyphens$boundary$lineEnd")
+                    writeString("Content-Disposition: form-data; name=\"onDeviceTranscript\"$lineEnd$lineEnd")
+                    writeString("${updatedJob.onDeviceTranscript}$lineEnd")
+                }
+
+                // Field 3.7: previousJobId
+                if (updatedJob.previousJobId != null) {
+                    writeString("$twoHyphens$boundary$lineEnd")
+                    writeString("Content-Disposition: form-data; name=\"previousJobId\"$lineEnd$lineEnd")
+                    writeString("${updatedJob.previousJobId}$lineEnd")
+                }
+
+                // Field 3.8: precedingGapMs
+                if (updatedJob.precedingGapMs >= 0L) {
+                    writeString("$twoHyphens$boundary$lineEnd")
+                    writeString("Content-Disposition: form-data; name=\"precedingGapMs\"$lineEnd$lineEnd")
+                    writeString("${updatedJob.precedingGapMs}$lineEnd")
+                }
 
                 // Field 4: file
                 writeString("$twoHyphens$boundary$lineEnd")

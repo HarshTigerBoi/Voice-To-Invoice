@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.voicetoinvoice.app.OrderingSegmenterTest" tests="8" skipped="0" failures="0" errors="0" timestamp="2026-07-26T15:33:34.716Z" hostname="HARSH" time="0.082">
+  <properties/>
+  <testcase name="testClipEndsOnQuantitySetsCarryover" classname="com.voicetoinvoice.app.OrderingSegmenterTest" time="0.025"/>
+  <testcase name="testElidedUnitMidUtteranceBeforeSecondItem" classname="com.voicetoinvoice.app.OrderingSegmenterTest" time="0.017"/>
+  <testcase name="testQuantityPrecedesItem" classname="com.voicetoinvoice.app.OrderingSegmenterTest" time="0.004"/>
+  <testcase name="testIndicFractionQuantity" classname="com.voicetoinvoice.app.OrderingSegmenterTest" time="0.01"/>
+  <testcase name="testDoubleQuantityNoItemFlagsSanity" classname="com.voicetoinvoice.app.OrderingSegmenterTest" time="0.004"/>
+  <testcase name="testQuantityAfterItemBelongsToNextItem" classname="com.voicetoinvoice.app.OrderingSegmenterTest" time="0.005"/>
+  <testcase name="testElidedKiloUnitRecoversQuantityAndUnit" classname="com.voicetoinvoice.app.OrderingSegmenterTest" time="0.006"/>
+  <testcase name="testMultiItemSequence" classname="com.voicetoinvoice.app.OrderingSegmenterTest" time="0.007"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

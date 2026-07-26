@@ -30,5 +30,8 @@ data class SttJobRecord(
     val audioStartMs: Long = 0L,
     val audioEndMs: Long = 0L,
     val diagnosticTraceJson: String = "",
+    val onDeviceTranscript: String = "",
+    val previousJobId: String? = null,
+    val precedingGapMs: Long = -1L,
     val synced: Boolean = false
 )

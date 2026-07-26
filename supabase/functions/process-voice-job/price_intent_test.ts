@@ -1,6 +1,6 @@
 import assert from 'node:assert'
 import { test } from 'node:test'
-import { detectPriceIntent, parseCompoundNumberSequence, implausibilityReason } from './price_intent.ts'
+import { detectPriceIntent, parseCompoundNumberSequence, implausibilityReason, extractSpokenNumbers } from './price_intent.ts'
 
 test('parseCompoundNumberSequence resolves compound Hindi/Hinglish numbers correctly', () => {
   assert.strictEqual(parseCompoundNumberSequence(['पचास']), 50)
@@ -56,8 +56,14 @@ test('implausibilityReason does NOT falsely flag valid compound bulk sales', () 
 })
 
 test('implausibilityReason FLAGS unrepresented spoken numbers >= 10', () => {
-  // Spoke "पचास रुपये" (50) but parsed total is 10 and priceAtSale is 10 -> MUST FLAG!
+  // "पाँच किलो आलू पचास रुपये" (50) but parsed total is 10 and priceAtSale is 10 -> MUST FLAG!
   const reason = implausibilityReason('KG', 5, 10, 'पाँच किलो आलू पचास रुपये', 10)
   assert.notStrictEqual(reason, null)
   assert.ok(reason?.includes('50'))
+})
+
+test('extractSpokenNumbers extracts compound numbers >= 10 from transcript', () => {
+  assert.deepStrictEqual(extractSpokenNumbers('पाँच किलो आलू दो सौ पचास रुपये'), [250])
+  assert.deepStrictEqual(extractSpokenNumbers('गोल्ड पचास रुपये'), [50])
+  assert.deepStrictEqual(extractSpokenNumbers('एक हजार दो सौ रुपये'), [1200])
 })

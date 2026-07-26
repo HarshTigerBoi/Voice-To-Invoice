@@ -50,7 +50,10 @@ class SttProxyClient(
         audioFile: File,
         catalogContext: List<String> = emptyList(),
         jobId: String = UUID.randomUUID().toString(),
-        shopId: String? = null
+        shopId: String? = null,
+        onDeviceTranscript: String = "",
+        previousJobId: String? = null,
+        precedingGapMs: Long = -1L
     ): SttResult = withContext(Dispatchers.IO) {
         if (!audioFile.exists()) {
             return@withContext SttResult.Error(null, "Audio file does not exist")
@@ -96,6 +99,15 @@ class SttProxyClient(
                 writeField("jobId", jobId)
 
                 SupabaseConfig.getNullSafeShopId(shopId)?.let { writeField("shopId", it) }
+
+                if (onDeviceTranscript.isNotBlank()) {
+                    writeField("onDeviceTranscript", onDeviceTranscript)
+                }
+
+                previousJobId?.let { writeField("previousJobId", it) }
+                if (precedingGapMs >= 0L) {
+                    writeField("precedingGapMs", precedingGapMs.toString())
+                }
 
                 if (catalogContext.isNotEmpty()) {
                     writeField("catalogNames", JSONArray(catalogContext).toString())
