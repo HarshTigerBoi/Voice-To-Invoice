@@ -2,26 +2,22 @@ package com.voicetoinvoice.app.domain.parser
 
 import kotlin.math.min
 
+data class CandidateRank(
+    val itemName: String,
+    val distance: Double,
+    val score: Double,
+    val margin: Double? = null
+)
+
 data class RawItemSegment(
     val quantity: Double,
     val unit: String?,
     val itemTokens: List<String>,
     val rawSegmentText: String,
     val isSanityFlagged: Boolean = false,
-    /**
-     * Normalized phonetic distance of the item match that produced this segment:
-     * `0.0` = the transcript token *is* the vocabulary word, `WHOLE_TOKEN_MAX_NORM`
-     * (0.25) = the loosest match the decoder is willing to accept at all, `null` = the
-     * token matched nothing and was kept verbatim as a new item name.
-     *
-     * This exists because confidence used to be computed as `isCatalogMatched ? 0.95
-     * : 0.60`, throwing away the distance the matcher had just calculated. In trace
-     * `e0b68f80-6876-42e2-b556-2adf73ce463f` the token "चोर" matched catalog item
-     * "Jeera" at normalized 0.250 — the single worst match the thresholds permit — and
-     * was booked to the ledger at 0.95 confidence. A number this close to the reject
-     * line must not survive the auto-confirm gate. See ISSUE-022.
-     */
-    val itemMatchNorm: Double? = null
+    val itemMatchNorm: Double? = null,
+    val itemMargin: Double? = null,
+    val top3Candidates: List<CandidateRank> = emptyList()
 )
 
 data class SegmentResult(
@@ -36,13 +32,10 @@ private data class DecodedToken(
     val rawToken: String,
     val numericValue: Double? = null,
     val canonicalUnit: String? = null,
-    /** This reading rests on a token STT is known to have mangled (see
-     *  [OrderingSegmenter.DISTANCE_UNIT_TOKENS]). The quantity/unit are trustworthy;
-     *  the item name is a guess and must never auto-confirm. */
     val suspect: Boolean = false,
-    /** For ITEM readings: how close the phonetic match actually was. See
-     *  [RawItemSegment.itemMatchNorm]. Null for an unmatched, literal item name. */
-    val matchNorm: Double? = null
+    val matchNorm: Double? = null,
+    val matchMargin: Double? = null,
+    val top3Candidates: List<CandidateRank> = emptyList()
 )
 
 /** One typed piece a source token can decode to. A source token yields several of these
@@ -54,9 +47,9 @@ private data class Emission(
     val numericValue: Double? = null,
     val canonicalUnit: String? = null,
     val suspect: Boolean = false,
-    /** Normalized phonetic distance for an ITEM emission that resolved to a known word;
-     *  null when the token matched nothing and survives as a literal new item name. */
-    val matchNorm: Double? = null
+    val matchNorm: Double? = null,
+    val matchMargin: Double? = null,
+    val top3Candidates: List<CandidateRank> = emptyList()
 )
 
 /** One complete reading of a single source token: either a whole-token reading
@@ -70,7 +63,12 @@ internal data class VocabEntry(
     val canonicalUnit: String? = null
 )
 
-private data class VocabHit(val entry: VocabEntry, val normalized: Double)
+private data class VocabHit(
+    val entry: VocabEntry,
+    val normalized: Double,
+    val margin: Double? = null,
+    val top3: List<CandidateRank> = emptyList()
+)
 
 /**
  * Grammar-aware lattice decoder for shopkeeper voice orders.
@@ -188,8 +186,8 @@ private object GrammarLatticeDecoder {
         allowElision: Boolean = false,
         allowEcho: Boolean = false
     ): VocabHit? {
-        if (fragment.isEmpty()) return null
-        var best: VocabHit? = null
+        if (fragment.isEmpty() || vocab.isEmpty()) return null
+        val candidateMap = mutableMapOf<String, VocabHit>()
         for (entry in vocab) {
             if (entry.key.isEmpty()) continue
             var cost = PhoneticKey.distance(fragment, entry.key)
@@ -200,20 +198,32 @@ private object GrammarLatticeDecoder {
                 cost = min(cost, (fragment.length - entry.key.length) * 0.5)
             }
             val norm = cost / maxOf(fragment.length, entry.key.length).toDouble()
-            if (best == null || norm < best.normalized) best = VocabHit(entry, norm)
+            val existing = candidateMap[entry.key]
+            if (existing == null || norm < existing.normalized) {
+                candidateMap[entry.key] = VocabHit(entry, norm)
+            }
         }
-        return if (best != null && best.normalized <= maxNorm) best else null
+        if (candidateMap.isEmpty()) return null
+        val candidates = candidateMap.values.sortedBy { it.normalized }
+        val best = candidates[0]
+        if (best.normalized > maxNorm) return null
+        val second = if (candidates.size > 1) candidates[1] else null
+        val margin = second?.let { it.normalized - best.normalized }
+        val top3 = candidates.take(3).map { c ->
+            CandidateRank(
+                itemName = c.entry.surface,
+                distance = c.normalized,
+                score = c.normalized,
+                margin = margin
+            )
+        }
+        return VocabHit(best.entry, best.normalized, margin, top3)
     }
 
     private fun wholeTokenExpansions(raw: String, vocab: SegmenterVocabulary): List<Expansion> {
         val lower = raw.lowercase()
         val out = mutableListOf<Expansion>()
 
-        // A distance word is never a real reading of shop speech. Offer only a suspect
-        // ITEM fallback so the token can't be consumed as a unit and can't win on cost;
-        // the split expansions added by the caller are what should actually carry it
-        // (किलोमीटर -> किलो + मीटर). Returning a non-exact expansion here is deliberate:
-        // it keeps `exactOnly` false in decode(), which is what re-enables splitting.
         if (OrderingSegmenter.DISTANCE_UNIT_TOKENS.contains(lower)) {
             return listOf(
                 Expansion(
@@ -223,7 +233,6 @@ private object GrammarLatticeDecoder {
             )
         }
 
-        // Exact literal lookups stay exact — never route a known word through phonetics.
         OrderingSegmenter.HINDI_NUMBER_MAP[lower]?.let {
             out.add(Expansion(listOf(Emission(TokenType.NUM, EXACT_COST, raw, numericValue = it)), EXACT_COST))
         }
@@ -234,10 +243,6 @@ private object GrammarLatticeDecoder {
             out.add(Expansion(listOf(Emission(TokenType.UNIT, EXACT_COST, raw, canonicalUnit = lower)), EXACT_COST))
         }
         if (out.isNotEmpty()) {
-            // An exact vocabulary match is unambiguous by definition — don't offer an ITEM
-            // escape hatch that would let the decoder buy a cheaper global path by
-            // relabelling a literal number/unit as a fake item name just to dodge a
-            // transition penalty (e.g. avoiding UNIT->NUM by pretending "किलो" is the item).
             return out
         }
 
@@ -249,15 +254,20 @@ private object GrammarLatticeDecoder {
             matchVocab(key, vocab.units, WHOLE_TOKEN_MAX_NORM, allowElision = true)?.let {
                 out.add(Expansion(listOf(Emission(TokenType.UNIT, it.normalized, raw, canonicalUnit = it.entry.canonicalUnit)), it.normalized))
             }
-            // A token that phonetically resolves to a known item is much stronger
-            // evidence than an unrecognized word, so it emits below ITEM_BASELINE_COST
-            // and carries the canonical surface forward. `allowEcho` absorbs the
-            // trailing syllable STT tacks on at utterance end ("sebab" -> "सेब").
             matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, allowEcho = true)?.let {
                 val cost = ITEM_MATCHED_BASE_COST + it.normalized
                 out.add(
                     Expansion(
-                        listOf(Emission(TokenType.ITEM, cost, it.entry.surface, matchNorm = it.normalized)),
+                        listOf(
+                            Emission(
+                                type = TokenType.ITEM,
+                                cost = cost,
+                                surface = it.entry.surface,
+                                matchNorm = it.normalized,
+                                matchMargin = it.margin,
+                                top3Candidates = it.top3
+                            )
+                        ),
                         cost
                     )
                 )
@@ -283,7 +293,9 @@ private object GrammarLatticeDecoder {
             surface = hit.entry.surface,
             numericValue = hit.entry.numericValue,
             canonicalUnit = hit.entry.canonicalUnit,
-            matchNorm = if (type == TokenType.ITEM) hit.normalized else null
+            matchNorm = if (type == TokenType.ITEM) hit.normalized else null,
+            matchMargin = if (type == TokenType.ITEM) hit.margin else null,
+            top3Candidates = if (type == TokenType.ITEM) hit.top3 else emptyList()
         )
 
         // 2-way: [NUM][UNIT] ("चरगलो"), [UNIT][ITEM] ("ग्लोसोना"), [NUM][ITEM] ("एकलो").
@@ -426,7 +438,9 @@ private object GrammarLatticeDecoder {
                         numericValue = em.numericValue,
                         canonicalUnit = em.canonicalUnit,
                         suspect = em.suspect,
-                        matchNorm = em.matchNorm
+                        matchNorm = em.matchNorm,
+                        matchMargin = em.matchMargin,
+                        top3Candidates = em.top3Candidates
                     )
                 )
             }
@@ -629,6 +643,8 @@ class OrderingSegmenter {
         // Worst (largest) match distance among this segment's item tokens — the weakest
         // link is what the confidence downstream must be built on, not the best one.
         var worstItemNorm: Double? = null
+        var bestItemMargin: Double? = null
+        var segmentTop3 = mutableListOf<CandidateRank>()
         val segments = mutableListOf<RawItemSegment>()
 
         fun closeSegment() {
@@ -641,7 +657,9 @@ class OrderingSegmenter {
                         itemTokens = currentItemTokens.toList(),
                         rawSegmentText = if (rawText.isNotBlank()) rawText else currentItemTokens.joinToString(" "),
                         isSanityFlagged = ambiguousDoubleQty || suspectReading,
-                        itemMatchNorm = worstItemNorm
+                        itemMatchNorm = worstItemNorm,
+                        itemMargin = bestItemMargin,
+                        top3Candidates = segmentTop3.toList()
                     )
                 )
             }
@@ -652,6 +670,8 @@ class OrderingSegmenter {
             ambiguousDoubleQty = false
             suspectReading = false
             worstItemNorm = null
+            bestItemMargin = null
+            segmentTop3 = mutableListOf()
         }
 
         for (dt in decoded) {
@@ -673,6 +693,12 @@ class OrderingSegmenter {
                 TokenType.ITEM -> {
                     dt.matchNorm?.let { n ->
                         worstItemNorm = worstItemNorm?.let { maxOf(it, n) } ?: n
+                    }
+                    dt.matchMargin?.let { m ->
+                        bestItemMargin = m
+                    }
+                    if (dt.top3Candidates.isNotEmpty()) {
+                        segmentTop3 = dt.top3Candidates.toMutableList()
                     }
                     currentItemTokens.add(dt.rawToken)
                     currentSegmentTokens.add(dt.rawToken)

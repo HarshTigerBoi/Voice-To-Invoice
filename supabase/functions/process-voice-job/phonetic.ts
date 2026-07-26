@@ -309,7 +309,17 @@ type TokenType = 'NUM' | 'UNIT' | 'ITEM'
 
 interface VocabEntry { key: string; surface: string; numericValue?: number; canonicalUnit?: string }
 interface VocabHit { entry: VocabEntry; normalized: number }
-interface Emission { type: TokenType; cost: number; surface: string; numericValue?: number; canonicalUnit?: string; suspect?: boolean; matchNorm?: number }
+interface Emission {
+  type: TokenType
+  cost: number
+  surface: string
+  numericValue?: number
+  canonicalUnit?: string
+  suspect?: boolean
+  matchNorm?: number
+  matchMargin?: number | null
+  top3Candidates?: CandidateRank[]
+}
 interface Expansion { emissions: Emission[]; emissionCost: number }
 
 export interface SegmenterVocabulary {
@@ -363,14 +373,28 @@ function endCost(last: TokenType): number {
   return last === 'ITEM' ? 0.0 : 0.6
 }
 
+export interface CandidateRank {
+  itemName: string
+  distance: number
+  score: number
+  margin?: number | null
+}
+
+export interface VocabHit {
+  entry: VocabEntry
+  normalized: number
+  margin?: number | null
+  top3?: CandidateRank[]
+}
+
 function matchVocab(
   fragment: string,
   vocab: VocabEntry[],
   maxNorm: number,
   opts: { allowElision?: boolean; allowEcho?: boolean } = {}
 ): VocabHit | null {
-  if (!fragment) return null
-  let best: VocabHit | null = null
+  if (!fragment || !vocab.length) return null
+  const candidateMap = new Map<string, VocabHit>()
   for (const entry of vocab) {
     if (!entry.key) continue
     let cost = phoneticDistance(fragment, entry.key)
@@ -384,9 +408,28 @@ function matchVocab(
       cost = Math.min(cost, (fragment.length - entry.key.length) * 0.5)
     }
     const norm = cost / Math.max(fragment.length, entry.key.length)
-    if (!best || norm < best.normalized) best = { entry, normalized: norm }
+    const existing = candidateMap.get(entry.key)
+    if (!existing || norm < existing.normalized) {
+      candidateMap.set(entry.key, { entry, normalized: norm })
+    }
   }
-  return best && best.normalized <= maxNorm ? best : null
+  if (!candidateMap.size) return null
+  const candidates = Array.from(candidateMap.values()).sort((a, b) => a.normalized - b.normalized)
+  const best = candidates[0]
+  if (best.normalized > maxNorm) return null
+  const second = candidates.length > 1 ? candidates[1] : null
+  const margin = second ? (second.normalized - best.normalized) : null
+  const top3: CandidateRank[] = candidates.slice(0, 3).map(c => ({
+    itemName: c.entry.surface,
+    distance: c.normalized,
+    score: c.normalized,
+    margin,
+  }))
+  return {
+    ...best,
+    margin,
+    top3,
+  }
 }
 
 function wholeTokenExpansions(raw: string, vocab: SegmenterVocabulary): Expansion[] {
@@ -428,7 +471,17 @@ function wholeTokenExpansions(raw: string, vocab: SegmenterVocabulary): Expansio
     const it = matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, { allowEcho: true })
     if (it) {
       const cost = ITEM_MATCHED_BASE_COST + it.normalized
-      out.push({ emissions: [{ type: 'ITEM', cost, surface: it.entry.surface, matchNorm: it.normalized }], emissionCost: cost })
+      out.push({
+        emissions: [{
+          type: 'ITEM',
+          cost,
+          surface: it.entry.surface,
+          matchNorm: it.normalized,
+          matchMargin: it.margin,
+          top3Candidates: it.top3,
+        }],
+        emissionCost: cost,
+      })
     }
   }
 
@@ -448,6 +501,8 @@ function splitExpansions(raw: string, vocab: SegmenterVocabulary): Expansion[] {
     type, cost: hit.normalized, surface: hit.entry.surface,
     numericValue: hit.entry.numericValue, canonicalUnit: hit.entry.canonicalUnit,
     matchNorm: type === 'ITEM' ? hit.normalized : undefined,
+    matchMargin: type === 'ITEM' ? hit.margin : undefined,
+    top3Candidates: type === 'ITEM' ? hit.top3 : undefined,
   })
 
   for (let i = MIN_SPLIT_PHONES; i <= key.length - MIN_SPLIT_PHONES; i++) {
@@ -488,7 +543,16 @@ function splitExpansions(raw: string, vocab: SegmenterVocabulary): Expansion[] {
 /** `suspect`: this reading rests on a token STT is known to have mangled (a distance
  *  word). Quantity and unit are trustworthy; the item name is a guess that must reach
  *  the review queue instead of auto-confirming. */
-interface DecodedToken { type: TokenType; rawToken: string; numericValue?: number; canonicalUnit?: string; suspect?: boolean; matchNorm?: number }
+interface DecodedToken {
+  type: TokenType
+  rawToken: string
+  numericValue?: number
+  canonicalUnit?: string
+  suspect?: boolean
+  matchNorm?: number
+  matchMargin?: number | null
+  top3Candidates?: CandidateRank[]
+}
 
 /**
  * Viterbi over a token-expansion lattice. State is (source token index, type of the
@@ -575,7 +639,16 @@ function decode(tokens: string[], vocab: SegmenterVocabulary): { decoded: Decode
   const decoded: DecodedToken[] = []
   for (const exp of chosen) {
     for (const e of exp.emissions) {
-      decoded.push({ type: e.type, rawToken: e.surface, numericValue: e.numericValue, canonicalUnit: e.canonicalUnit, suspect: e.suspect, matchNorm: e.matchNorm })
+      decoded.push({
+        type: e.type,
+        rawToken: e.surface,
+        numericValue: e.numericValue,
+        canonicalUnit: e.canonicalUnit,
+        suspect: e.suspect,
+        matchNorm: e.matchNorm,
+        matchMargin: e.matchMargin,
+        top3Candidates: e.top3Candidates,
+      })
     }
   }
   return { decoded, minGap }
@@ -587,17 +660,9 @@ export interface RawItemSegment {
   unit: string
   itemTokens: string[]
   isSanityFlagged: boolean
-  /**
-   * Normalized phonetic distance of the item match behind this segment: 0.0 = the
-   * transcript token IS the vocabulary word, 0.25 (WHOLE_TOKEN_MAX_NORM) = the loosest
-   * match accepted at all, null = matched nothing and kept verbatim as a new name.
-   *
-   * Confidence used to be `isCatalogMatched ? 0.95 : 0.60`, discarding the distance the
-   * matcher had just computed. Trace e0b68f80-6876-42e2-b556-2adf73ce463f matched "चोर"
-   * to catalog item "Jeera" at exactly 0.250 — the worst match the thresholds allow —
-   * and auto-confirmed it to the ledger at 0.95. See ISSUE-022.
-   */
   itemMatchNorm: number | null
+  itemMargin?: number | null
+  top3Candidates?: CandidateRank[]
 }
 
 const LOW_CONFIDENCE_GAP_THRESHOLD = 0.15
@@ -625,13 +690,10 @@ export function segmentTranscript(
   let currentItemTokens: string[] = []
   let currentSegmentTokens: string[] = []
   let ambiguousDoubleQty = minGap < LOW_CONFIDENCE_GAP_THRESHOLD
-  // Set when a token in the current segment came from a reading the decoder itself
-  // distrusts (a distance word STT invented). Quantity and unit stay good; the item
-  // name is a guess, so the segment must reach review instead of auto-confirming.
   let suspectReading = false
-  // Worst (largest) match distance among this segment's item tokens — confidence must
-  // be built on the weakest link, not the best one.
   let worstItemNorm: number | null = null
+  let bestItemMargin: number | null = null
+  let segmentTop3: CandidateRank[] = []
   const segments: RawItemSegment[] = []
 
   const closeSegment = () => {
@@ -645,6 +707,8 @@ export function segmentTranscript(
         itemTokens: [name],
         isSanityFlagged: ambiguousDoubleQty || suspectReading,
         itemMatchNorm: worstItemNorm,
+        itemMargin: bestItemMargin,
+        top3Candidates: segmentTop3.length > 0 ? segmentTop3 : undefined,
       })
     }
     currentQty = null
@@ -654,6 +718,8 @@ export function segmentTranscript(
     ambiguousDoubleQty = false
     suspectReading = false
     worstItemNorm = null
+    bestItemMargin = null
+    segmentTop3 = []
   }
 
   for (const dt of decoded) {
@@ -669,6 +735,12 @@ export function segmentTranscript(
     } else {
       if (dt.matchNorm !== undefined && dt.matchNorm !== null) {
         worstItemNorm = worstItemNorm === null ? dt.matchNorm : Math.max(worstItemNorm, dt.matchNorm)
+      }
+      if (dt.matchMargin !== undefined && dt.matchMargin !== null) {
+        bestItemMargin = dt.matchMargin
+      }
+      if (dt.top3Candidates && dt.top3Candidates.length > 0) {
+        segmentTop3 = dt.top3Candidates
       }
       currentItemTokens.push(dt.rawToken)
       currentSegmentTokens.push(dt.rawToken)

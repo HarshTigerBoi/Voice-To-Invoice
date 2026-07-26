@@ -866,6 +866,8 @@ Parse this order.`
           // tell an exact hit apart from a barely-legal one. Without this the two are
           // indistinguishable downstream — the ISSUE-022 failure.
           item_match_norm: seg.itemMatchNorm,
+          item_margin: seg.itemMargin ?? null,
+          top3_candidates: seg.top3Candidates ?? [],
           // Provenance: this item came from the rule-based segmenter, NOT from the AI.
           source: 'segmenter' as const,
         }
@@ -897,16 +899,8 @@ Parse this order.`
       const isCatalogMatched = matched !== undefined
       const unit = rawItem.unit || (matched ? matched.unit_id : "PACKET")
 
-      // Confidence is derived from HOW WELL the item matched, not merely from WHETHER
-      // it matched. The old rule was `isCatalogMatched ? 0.95 : 0.60`, which threw away
-      // the normalized phonetic distance the matcher had just computed — so a token
-      // sitting exactly on the reject line scored identically to an exact hit. That is
-      // how trace e0b68f80 booked "चोर" as catalog item "Jeera" (distance 0.250, the
-      // worst the thresholds allow) to the ledger at 0.95 confidence. See ISSUE-022.
       let confidence: number
       if (typeof rawItem.confidence === 'number') {
-        // An explicit number (AI-reported, or the segmenter's ambiguity cap) still
-        // obeys the documented ceiling for catalog-unmatched items.
         confidence = isCatalogMatched ? rawItem.confidence : Math.min(rawItem.confidence, 0.60)
       } else if (isCatalogMatched) {
         confidence = confidenceFromMatchNorm(rawItem.item_match_norm)
@@ -914,10 +908,6 @@ Parse this order.`
         confidence = 0.60
       }
 
-      // Plausibility is independent of phonetics: even a perfectly-matched item can be
-      // an obvious mis-parse in context. "7 GRAM Jeera" for ₹2.80 is not a sale any
-      // kirana shop has ever made, and no amount of transcript confidence should let it
-      // reach the ledger unreviewed.
       const implausibility = implausibilityReason(unit, qty, total)
       if (implausibility) confidence = Math.min(confidence, IMPLAUSIBLE_CONFIDENCE_CAP)
 
@@ -930,8 +920,10 @@ Parse this order.`
         total: total,
         confidence: confidence,
         is_matched_to_catalog: isCatalogMatched,
-        // Surfaced in the trace so a review-queue entry explains itself.
+        // Surfaced in the trace so a review-queue entry explains itself (Phase 0a logging).
         item_match_norm: rawItem.item_match_norm ?? null,
+        item_margin: rawItem.item_margin ?? null,
+        top3_candidates: rawItem.top3_candidates ?? [],
         implausibility_reason: implausibility,
         parse_source: rawItem.source ?? 'ai',
       }

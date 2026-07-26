@@ -371,4 +371,19 @@ class PhoneticSegmentationTest {
             result.segments[0].itemTokens.any { PhoneticKey.of(it) == PhoneticKey.of("अमचूर") }
         )
     }
+
+    // ---------- Phase 0a: Candidate distance ranking and margin instrumentation ----------
+
+    @Test
+    fun candidateRankAndMarginArePopulatedOnItemMatch() {
+        val result = segmenter.segmentTranscript("पांच कुल संधन")
+        assertEquals(1, result.segments.size)
+        val seg = result.segments[0]
+        assertNotNull("itemMatchNorm must be populated for matched items", seg.itemMatchNorm)
+        assertNotNull("itemMargin must be populated for matched items", seg.itemMargin)
+        assertTrue("top3Candidates must not be empty", seg.top3Candidates.isNotEmpty())
+        assertTrue("top3Candidates must contain at least 1 candidate", seg.top3Candidates.size >= 1)
+        val topCandidate = seg.top3Candidates[0]
+        assertEquals(PhoneticKey.of("चंदन"), PhoneticKey.of(topCandidate.itemName))
+    }
 }
