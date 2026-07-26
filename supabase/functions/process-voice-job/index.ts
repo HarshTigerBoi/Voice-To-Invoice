@@ -9,6 +9,12 @@ import {
   UNIT_SET,
   type RawItemSegment,
 } from './phonetic.ts'
+import {
+  detectPriceIntent,
+  parseCompoundNumberSequence,
+  implausibilityReason,
+  type PriceIntent,
+} from './price_intent.ts'
 
 // Deno Deploy / Supabase Edge Runtime global declaration
 declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void }
@@ -129,144 +135,7 @@ const MIN_PLAUSIBLE_SALE_VALUE = 5.0
  *  often the pipeline loses its only arbitration stage. */
 const AI_CHAT_TIMEOUT_MS = Number(Deno.env.get('AI_CHAT_TIMEOUT_MS') || '45000')
 
-const RUPEE_WORDS = new Set([
-  'rs', 'rs.', '₹',
-  'rupay', 'rupaye', 'rupaya', 'rupaiya', 'rupaiye',
-  'rupee', 'rupees',
-  'रुपये', 'रुपया', 'रुपए', 'रु', 'रूपये', 'रूपए'
-])
 
-export type PriceIntent = 'NONE' | 'RATE_UPDATE' | 'BULK_SALE_TOTAL' | 'AMBIGUOUS_UNTRUSTED'
-
-interface DeterministicPriceDetection {
-  priceIntent: PriceIntent
-  spokenPrice: number | null
-  hasLeadingQty: boolean
-  hasAmbiguousPriceNumber: boolean
-}
-
-/**
- * Server-side mirror of VoiceParser.kt's deterministic price intent classifier.
- * Analyzes the raw transcript for Rupee words ("रुपये", "रुपए", "rs") and price numbers.
- */
-function detectPriceIntent(transcript: string): DeterministicPriceDetection {
-  if (!transcript || !transcript.trim()) {
-    return { priceIntent: 'NONE', spokenPrice: null, hasLeadingQty: false, hasAmbiguousPriceNumber: false }
-  }
-
-  const clean = transcript
-    .replace(/।/g, ' ')
-    .replace(/[.,?!\-\\()]/g, ' ')
-    .toLowerCase()
-    .trim()
-
-  const tokens = clean.split(/\s+/).filter(t => t.length > 0)
-  if (!tokens.length) {
-    return { priceIntent: 'NONE', spokenPrice: null, hasLeadingQty: false, hasAmbiguousPriceNumber: false }
-  }
-
-  let rupeeWordIdx = -1
-  for (let i = 0; i < tokens.length; i++) {
-    if (RUPEE_WORDS.has(tokens[i])) {
-      rupeeWordIdx = i
-      break
-    }
-  }
-
-  // Extract trailing number before or after Rupee word
-  let spokenPrice: number | null = null
-  if (rupeeWordIdx !== -1) {
-    if (rupeeWordIdx > 0) {
-      const prevVal = parseHindiOrNumericValue(tokens[rupeeWordIdx - 1])
-      if (prevVal !== null && prevVal > 0) spokenPrice = prevVal
-    }
-    if (spokenPrice === null && rupeeWordIdx < tokens.length - 1) {
-      const nextVal = parseHindiOrNumericValue(tokens[rupeeWordIdx + 1])
-      if (nextVal !== null && nextVal > 0) spokenPrice = nextVal
-    }
-  }
-
-  // Check if there is a leading quantity before the item name (token 0 is a number/unit)
-  const firstTokenVal = parseHindiOrNumericValue(tokens[0])
-  const firstTokenIsUnit = UNIT_SET.includes(tokens[0])
-  const hasLeadingQty = (firstTokenVal !== null && firstTokenVal > 0) || firstTokenIsUnit
-
-  // Check for ambiguous price number (a number >= 10 at the end without a Rupee word)
-  let hasAmbiguousPriceNumber = false
-  if (rupeeWordIdx === -1 && tokens.length >= 2) {
-    const lastTokenVal = parseHindiOrNumericValue(tokens[tokens.length - 1])
-    if (lastTokenVal !== null && lastTokenVal >= 10) {
-      hasAmbiguousPriceNumber = true
-    }
-  }
-
-  let priceIntent: PriceIntent = 'NONE'
-  if (hasAmbiguousPriceNumber) {
-    priceIntent = 'AMBIGUOUS_UNTRUSTED'
-  } else if (spokenPrice !== null && spokenPrice > 0 && !hasLeadingQty) {
-    priceIntent = 'RATE_UPDATE'
-  } else if (spokenPrice !== null && spokenPrice > 0 && hasLeadingQty) {
-    priceIntent = 'BULK_SALE_TOTAL'
-  }
-
-  return { priceIntent, spokenPrice, hasLeadingQty, hasAmbiguousPriceNumber }
-}
-
-function parseHindiOrNumericValue(token: string): number | null {
-  if (!token) return null
-  const num = parseFloat(token)
-  if (!isNaN(num)) return num
-  const norm = token.toLowerCase()
-  if (HINDI_NUMBER_MAP[norm] !== undefined) return HINDI_NUMBER_MAP[norm]
-  return null
-}
-
-/**
- * Domain sanity, independent of transcript confidence. A shopkeeper does not sell
- * 7 grams of anything — weight-in-grams is sold in 50/100/250/500 steps, and a
- * quantity of 7 there is a mis-heard unit (almost always KG heard as GRAM).
- *
- * Also checks numeric consistency: if a number >= 10 appears in the transcript but
- * is neither reflected in quantity, price_at_sale, nor total, the transcript's numbers
- * were silently dropped during parsing.
- *
- * Returns a human-readable reason, or null when the combination is plausible.
- */
-function implausibilityReason(unit: string, qty: number, total: number, rawTranscript: string = '', priceAtSale: number = 0): string | null {
-  const u = (unit || '').toUpperCase()
-  if (!(qty > 0)) return `quantity ${qty} is not positive`
-
-  if (u === 'GRAM' || u === 'ML') {
-    if (qty < 10) return `${qty} ${u} is below any real retail quantity (likely a mis-heard KG/LITRE)`
-    if (qty > 5000) return `${qty} ${u} exceeds a plausible single sale`
-  } else if (u === 'KG' || u === 'LITRE') {
-    if (qty > 200) return `${qty} ${u} exceeds a plausible single sale`
-  } else if (u === 'PIECE' || u === 'PACKET' || u === 'DOZEN') {
-    if (qty > 500) return `${qty} ${u} exceeds a plausible single sale`
-  }
-
-  if (total > 0 && total < MIN_PLAUSIBLE_SALE_VALUE) {
-    return `sale value ₹${total.toFixed(2)} is below the ₹${MIN_PLAUSIBLE_SALE_VALUE} auto-confirm floor`
-  }
-
-  // Numeric consistency guard: check if any number >= 10 in transcript was silently dropped
-  if (rawTranscript) {
-    const tokens = rawTranscript.toLowerCase().replace(/।/g, ' ').replace(/[.,?!\-\\()]/g, ' ').split(/\s+/)
-    for (const t of tokens) {
-      const val = parseHindiOrNumericValue(t)
-      if (val !== null && val >= 10) {
-        const matchesQty = Math.abs(qty - val) < 0.01
-        const matchesPrice = Math.abs(priceAtSale - val) < 0.01
-        const matchesTotal = Math.abs(total - val) < 0.01
-        if (!matchesQty && !matchesPrice && !matchesTotal) {
-          return `spoken number ${val} in '${rawTranscript}' was not reflected in qty (${qty}), price (${priceAtSale}), or total (${total})`
-        }
-      }
-    }
-  }
-
-  return null
-}
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
