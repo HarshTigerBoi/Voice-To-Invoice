@@ -31,9 +31,9 @@ const CORS_HEADERS = {
 // var (if set) is always tried first.
 const XAI_CHAT_MODELS: string[] = [
   Deno.env.get('XAI_CHAT_MODEL') || '',
-  'grok-2-latest',
-  'grok-2-1212',
-  'grok-beta',
+  'grok-4.5',   // current flagship as of 2026-07
+  'grok-4.3',   // what the retired grok-4/grok-3 families now redirect to
+  'grok-4',
 ].filter(Boolean)
 
 const SARVAM_STT_MODELS: string[] = [
@@ -127,7 +127,7 @@ const MIN_PLAUSIBLE_SALE_VALUE = 5.0
 
 /** Budget for the step-4 chat call. Env-tunable because it trades latency against how
  *  often the pipeline loses its only arbitration stage. */
-const AI_CHAT_TIMEOUT_MS = Number(Deno.env.get('AI_CHAT_TIMEOUT_MS') || '20000')
+const AI_CHAT_TIMEOUT_MS = Number(Deno.env.get('AI_CHAT_TIMEOUT_MS') || '45000')
 
 /**
  * Domain sanity, independent of transcript confidence. A shopkeeper does not sell
