@@ -200,18 +200,19 @@
   4. Updated `process-voice-job/index.ts` trace logging: `rawTranscript` now records `chosenRaw` (untouched STT), and `normalizedTranscript` records the cleaned hint string.
   5. Updated `BackgroundSttProcessor.kt` trace logging to include `heardSegmentText`.
   6. Added regression test `heardTextSurvivesEvenWhenItemIsMisresolved` to `PhoneticSegmentationTest.kt`.
-#### [ISSUE-025] [2026-07-26] Server-Side Price Intent Schema Alignment & Deterministic Pre-Check Integration
-- **Symptom**: Trace `1ec60144` ("गोल्ड पचास रुपए") auto-confirmed a fake ₹34 sale for 1 piece of Amul Gold Milk at confidence 0.9. Grok AI's contractually enforced JSON output schema lacked `price_at_sale`, `total`, and `price_intent` fields. When given prompt rules for rate updates, Grok AI had nowhere to output price decisions, causing inconsistent behavior (e.g. dropping "50" entirely or stuffing 50 into quantity).
+#### [ISSUE-025] [2026-07-26] Server-Side Price Intent Schema Alignment, Deterministic Compound Number Engine & Deno Test Suite
+- **Symptom**: Trace `1ec60144` ("गोल्ड पचास रुपए") auto-confirmed a fake ₹34 sale for 1 piece of Amul Gold Milk at confidence 0.9. Grok AI's contractually enforced JSON output schema lacked `price_at_sale`, `total`, and `price_intent` fields. Furthermore, initial single-token price pre-check truncated multi-word Hindi numbers (e.g. "गोल्ड दो सौ पचास रुपये" extracted 50 instead of 250), and the numeric consistency guard falsely flagged hundreds-words ("सौ") inside valid compound totals ("पाँच किलो आलू दो सौ रुपये").
 - **Root Cause**:
   1. Server-side Edge Function `process-voice-job/index.ts` relied entirely on LLM prompt prose for price intent determination without supporting schema fields in `response_format: json_object`.
-  2. While the Android client had a deterministic `PriceIntent` classifier (`VoiceParser.kt`, see ISSUE-012), the cloud Edge Function lacked an equivalent pre-checker and relied on prompt text alone (commits `c8c9480`, `8ea2c9e`, `7afc782`).
-  3. `implausibilityReason()` lacked a numeric consistency check to detect when a spoken number $\ge 10$ in the raw transcript was dropped from `quantity`, `price_at_sale`, and `total`.
+  2. Single-token adjacency check (`tokens[rupeeWordIdx - 1]`) in initial pre-check dropped multiplier tokens ("सौ", "हजार") in compound Hindi numbers.
+  3. `implausibilityReason()` checked individual tokens against totals, causing false positive flags on valid compound numbers.
 - **Resolution**:
   1. Updated Grok AI system prompt and JSON output schema in `process-voice-job/index.ts` to include `price_at_sale`, `total`, and `price_intent` (`NONE`, `RATE_UPDATE`, `BULK_SALE_TOTAL`, `AMBIGUOUS_UNTRUSTED`).
-  2. Implemented server-side deterministic `detectPriceIntent(transcript)` helper mirroring `VoiceParser.kt`'s `RUPEE_WORDS` set (including `रुपए`, `रुपये`, `rs`, `₹`, etc.) and `hasLeadingQty` logic, taking precedence over LLM guesses.
-  3. Added numeric-consistency safety net in `implausibilityReason()`: if any spoken number $\ge 10$ is present in raw transcript but unrepresented in `quantity`, `price_at_sale`, or `total`, it marks the item implausible, caps confidence at `0.40`, and blocks auto-confirmation.
-  4. Added `testPriceIntent_RateUpdate_RupayeSpellingVariant` in `VoiceParserTest.kt`.
-- **Verification Date**: 2026-07-26 (All 63 Kotlin unit tests PASSED, Edge Function deployed live to Supabase `lyowklxsbfznnqridtgr`).
+  2. Created modular `price_intent.ts` containing server-side `detectPriceIntent(transcript)` pre-check mirroring `VoiceParser.kt`'s `RUPEE_WORDS` set (including `रुपए`, `रुपये`, `rs`, `₹`, etc.) and `hasLeadingQty` logic.
+  3. Implemented `parseCompoundNumberSequence()` in `price_intent.ts` to correctly resolve multi-word Hindi numbers ("दो सौ पचास" $\rightarrow$ 250, "डेढ़ सौ" $\rightarrow$ 150, "ढाई सौ" $\rightarrow$ 250, "एक हजार दो सौ" $\rightarrow$ 1200). Added `hazaar` / `हजार` to `HINDI_NUMBER_MAP` in `phonetic.ts`.
+  4. Updated `implausibilityReason()` to extract compound numbers $\ge 10$ from raw transcripts before checking against `qty`/`priceAtSale`/`total`, preventing false flags on compound bulk sales.
+  5. Built dedicated TypeScript/Node test suite `price_intent_test.ts` (6/6 tests PASSED in 163ms) and added `testPriceIntent_RateUpdate_RupayeSpellingVariant` in `VoiceParserTest.kt` (63/63 Kotlin unit tests PASSED).
+- **Verification Date**: 2026-07-26 (Node TS tests PASSED 6/6, Kotlin tests PASSED 63/63, Edge Function deployed live to Supabase `lyowklxsbfznnqridtgr`, commits `70c24db` & `5a79fe8` pushed to `master`).
 
 #### [ISSUE-011] [2026-07-25] Segmenter Corrupted "बिंडी" (Bhindi) → "घी" (Ghee) Due to Missing Devanagari Vocab Entry, Auto-Confirmed Wrong Item to Ledger
 - **Symptom**: Trace `6690cc7b-89cf-41f0-a4fc-04d5ae766fec` — shopkeeper said "दो किलो भिंडी" (2kg Bhindi/okra), Grok STT correctly heard it as `"दो किलोबिंडी"` (fused, unaspirated `ब` for `भ` — a common STT confusion), but `combinatorialFuzzySegmenter` rewrote it to `"दो किलो घी"` (Ghee) and auto-confirmed **Desi Ghee × 2KG = ₹1300** to the ledger instead of Bhindi. This is a real wrong-item, wrong-price transaction silently booked to the confirmed ledger.
