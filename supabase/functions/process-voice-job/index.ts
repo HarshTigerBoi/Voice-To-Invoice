@@ -31,9 +31,9 @@ const CORS_HEADERS = {
 // var (if set) is always tried first.
 const XAI_CHAT_MODELS: string[] = [
   Deno.env.get('XAI_CHAT_MODEL') || '',
-  'grok-4.5',   // current flagship as of 2026-07
-  'grok-4.3',   // what the retired grok-4/grok-3 families now redirect to
-  'grok-4',
+  'grok-2-latest',
+  'grok-2-1212',
+  'grok-beta',
 ].filter(Boolean)
 
 const SARVAM_STT_MODELS: string[] = [

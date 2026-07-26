@@ -4,7 +4,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 // Was hardcoded to `grok-2-latest` in three places, which xAI has since retired — every
 // call here returned "Model not found" until ISSUE-021. Keep it env-configurable and in
 // one place so the next deprecation is a secret change, not a code change.
-const XAI_CHAT_MODEL = Deno.env.get('XAI_CHAT_MODEL') || 'grok-4.5'
+const XAI_CHAT_MODEL = Deno.env.get('XAI_CHAT_MODEL') || 'grok-2-latest'
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
