@@ -287,6 +287,7 @@ export const DEFAULT_ITEM_VOCAB: string[] = [
   'चंदन', 'Chandan', 'कुमकुम', 'Kumkum', 'रोली', 'Roli', 'मौली', 'Mouli',
   'अक्षत', 'Akshat', 'कपूर', 'Kapoor', 'धूप', 'Dhoop', 'दीया', 'Diya',
   'रुई', 'Rooi', 'हवन सामग्री', 'Havan Samagri', 'गंगाजल', 'Gangajal',
+  'करोंजा', 'Karonja', 'करौंदा', 'Karonda', 'सोयाबीन', 'Soyabean',
 ]
 
 export function normalizeUnit(unitStr: string): string {

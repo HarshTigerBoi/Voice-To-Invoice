@@ -313,9 +313,18 @@ function scoreTranscript(transcript: string, catalogNames: string[]): { score: n
   const { segments } = segmentTranscript(transcript, catalogNames)
   if (!segments.length) return { score: 0, segments: [] }
 
+  // Heavily penalize English/Latin hallucinations ("Charles Xavier", "tinggal sebab")
+  // when Hindi speech recognition was requested. Pure Devanagari STT output should win.
+  const hasLatinScript = /[a-zA-Z]/.test(transcript)
+  const hasDevanagari = /[\u0900-\u097F]/.test(transcript)
+
   const itemKeys = new Set([...DEFAULT_ITEM_VOCAB, ...catalogNames].map(n => phoneticKey(n)).filter(Boolean))
 
   let score = 0
+  if (hasLatinScript && !hasDevanagari) {
+    score -= 5
+  }
+
   for (const seg of segments) {
     // A recognized item is the strongest signal that the audio was understood.
     const name = seg.itemTokens.join(' ')
@@ -604,13 +613,21 @@ async function processVoiceJob(args: {
     const grokScored = scoreTranscript(rawGrokTranscript, fullCatalogList)
     const sarvamScored = scoreTranscript(rawSarvamTranscript, fullCatalogList)
 
-    // Pick whichever STT stream actually parses as a shopkeeper order, rather than
-    // always preferring Grok. Previously Grok won unconditionally, so a confident
-    // Grok mis-decode buried a correct Sarvam transcript.
-    let chosenRaw = grokScored.score >= sarvamScored.score ? rawGrokTranscript : rawSarvamTranscript
-    let step3Segments: RawItemSegment[] = grokScored.score >= sarvamScored.score ? grokScored.segments : sarvamScored.segments
+    // Pick whichever STT stream actually parses as a shopkeeper order. Sarvam (saaras:v3)
+    // is explicitly tuned for Indic verbatim speech. When Sarvam parses a valid order
+    // structure (or ties with Grok), Sarvam wins. Grok frequently introduces spurious spaces
+    // ("दो किलो करों जा") which trick segmenters into scoring unlisted words as multi-tokens.
+    let chosenRaw = (sarvamScored.score >= grokScored.score && rawSarvamTranscript)
+      ? rawSarvamTranscript
+      : (grokScored.score > sarvamScored.score && rawGrokTranscript)
+        ? rawGrokTranscript
+        : (rawSarvamTranscript || rawGrokTranscript)
+
+    let step3Segments: RawItemSegment[] = chosenRaw === rawSarvamTranscript ? sarvamScored.segments : grokScored.segments
     let bestScore = Math.max(grokScored.score, sarvamScored.score)
-    let transcript = chosenRaw ? normalizeTranscript(chosenRaw, fullCatalogList) : ''
+    // IMPORTANT: transcript MUST remain the pure, untouched verbatim text from STT (chosenRaw).
+    // It must NEVER be mutated or dictionary-replaced by normalizeTranscript!
+    let transcript = chosenRaw || ''
 
     // Step 5 (runs before AI interpretation so the AI sees the best available audio
     // reading): ADAPTIVE RE-DECODE.

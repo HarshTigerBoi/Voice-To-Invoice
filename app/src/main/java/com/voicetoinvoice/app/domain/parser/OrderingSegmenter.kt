@@ -601,7 +601,8 @@ class OrderingSegmenter {
             // normalized distance to the wrong word beat having no right word at all.
             "चंदन", "Chandan", "कुमकुम", "Kumkum", "रोली", "Roli", "मौली", "Mouli",
             "अक्षत", "Akshat", "कपूर", "Kapoor", "धूप", "Dhoop", "दीया", "Diya",
-            "रुई", "Rooi", "हवन सामग्री", "Havan Samagri", "गंगाजल", "Gangajal"
+            "रुई", "Rooi", "हवन सामग्री", "Havan Samagri", "गंगाजल", "Gangajal",
+            "करोंजा", "Karonja", "करौंदा", "Karonda", "सोयाबीन", "Soyabean"
         )
 
         // Ambiguity gap below this threshold means the lattice decoder had a genuinely
