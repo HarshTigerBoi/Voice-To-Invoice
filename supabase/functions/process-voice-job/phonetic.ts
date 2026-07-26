@@ -302,18 +302,30 @@ export function normalizeUnit(unitStr: string): string {
   return (unitStr || '').toUpperCase()
 }
 
-// ---------------------------------------------------------------------------
-// Grammar-aware token-expansion lattice
-// ---------------------------------------------------------------------------
+export interface RawItemSegment {
+  rawSegmentText: string
+  heardSegmentText?: string
+  quantity: number
+  unit: string
+  itemTokens: string[]
+  isSanityFlagged?: boolean
+  itemMatchNorm?: number | null
+  itemMargin?: number | null
+  top3Candidates?: CandidateRank[]
+}
+
+export interface SegmentResult {
+  segments: RawItemSegment[]
+  carryoverQty?: number | null
+}
 
 type TokenType = 'NUM' | 'UNIT' | 'ITEM'
 
-interface VocabEntry { key: string; surface: string; numericValue?: number; canonicalUnit?: string }
-interface VocabHit { entry: VocabEntry; normalized: number }
 interface Emission {
   type: TokenType
   cost: number
   surface: string
+  heardText: string
   numericValue?: number
   canonicalUnit?: string
   suspect?: boolean
@@ -321,7 +333,18 @@ interface Emission {
   matchMargin?: number | null
   top3Candidates?: CandidateRank[]
 }
-interface Expansion { emissions: Emission[]; emissionCost: number }
+
+interface Expansion {
+  emissions: Emission[]
+  emissionCost: number
+}
+
+interface VocabEntry {
+  key: string
+  surface: string
+  numericValue?: number
+  canonicalUnit?: string
+}
 
 export interface SegmenterVocabulary {
   numbers: VocabEntry[]
@@ -344,16 +367,10 @@ const EXACT_COST = 0.0
 const ELISION_COST = 0.5
 const ITEM_BASELINE_COST = 1.2
 const ITEM_MATCHED_BASE_COST = 0.2
-// See OrderingSegmenter.kt for the tuning history behind these three: 0.34/0.35 let
-// "एकलो" match ग्यारह(11) and "ग्लोसोना" match लहसुन whole, swallowing fused tokens
-// as the wrong word instead of splitting them.
 const WHOLE_TOKEN_MAX_NORM = 0.25
 const SPLIT_PART_MAX_NORM = 0.30
 const MIN_SPLIT_PHONES = 2
 const SPLIT_PENALTY = 0.10
-// A distance word read whole, as an item name — priced above any plausible split of the
-// same token, so it only wins when nothing else matches at all and the token would
-// otherwise vanish.
 const DISTANCE_TOKEN_ITEM_COST = 2.5
 
 function transitionCost(prev: TokenType | null, curr: TokenType): number {
@@ -363,13 +380,6 @@ function transitionCost(prev: TokenType | null, curr: TokenType): number {
   return curr === 'NUM' ? 0.0 : curr === 'UNIT' ? 1.5 : 0.2
 }
 
-/**
- * Cost of finishing the utterance on `last`. A shopkeeper does not say "five kilos" and
- * stop, so a decode ending on a bare quantity/unit is structurally incomplete and should
- * lose to any reading that yields an item. Small on purpose: an exact UNIT_SET match
- * costs 0.0 and returns before any ITEM alternative is offered, so a genuine trailing
- * "चार किलो" (carryover to the next recording) has no competing path this can flip.
- */
 function endCost(last: TokenType): number {
   return last === 'ITEM' ? 0.0 : 0.6
 }
@@ -402,9 +412,6 @@ function matchVocab(
     if (opts.allowElision && entry.key.length > fragment.length && entry.key.endsWith(fragment)) {
       cost = Math.min(cost, ELISION_COST)
     }
-    // Trailing-echo bonus: whole-token catalog reads only ("sebab" -> "seb"). Never
-    // inside a split, where every phone must be paid for by some part or a fragment
-    // steals phones from its neighbour and the split silently misaligns.
     if (opts.allowEcho && fragment.length > entry.key.length && fragment.startsWith(entry.key)) {
       cost = Math.min(cost, (fragment.length - entry.key.length) * 0.5)
     }
@@ -437,37 +444,30 @@ function wholeTokenExpansions(raw: string, vocab: SegmenterVocabulary): Expansio
   const lower = raw.toLowerCase()
   const out: Expansion[] = []
 
-  // Distance word: never a real reading of shop speech. Offer only a suspect ITEM
-  // fallback so it can't be consumed as a unit, and so `exactOnly` stays false in
-  // decode() — which is what re-enables the split expansions that should actually
-  // carry this token (किलोमीटर -> किलो + मीटर).
   if (DISTANCE_UNIT_TOKENS.includes(lower)) {
     return [{
-      emissions: [{ type: 'ITEM', cost: DISTANCE_TOKEN_ITEM_COST, surface: raw, suspect: true }],
+      emissions: [{ type: 'ITEM', cost: DISTANCE_TOKEN_ITEM_COST, surface: raw, heardText: raw, suspect: true }],
       emissionCost: DISTANCE_TOKEN_ITEM_COST,
     }]
   }
 
   if (HINDI_NUMBER_MAP[lower] !== undefined) {
-    out.push({ emissions: [{ type: 'NUM', cost: EXACT_COST, surface: raw, numericValue: HINDI_NUMBER_MAP[lower] }], emissionCost: EXACT_COST })
+    out.push({ emissions: [{ type: 'NUM', cost: EXACT_COST, surface: raw, heardText: raw, numericValue: HINDI_NUMBER_MAP[lower] }], emissionCost: EXACT_COST })
   } else if (/^\d+(\.\d+)?$/.test(lower)) {
-    out.push({ emissions: [{ type: 'NUM', cost: EXACT_COST, surface: raw, numericValue: parseFloat(lower) }], emissionCost: EXACT_COST })
+    out.push({ emissions: [{ type: 'NUM', cost: EXACT_COST, surface: raw, heardText: raw, numericValue: parseFloat(lower) }], emissionCost: EXACT_COST })
   }
   if (UNIT_SET.includes(lower)) {
-    out.push({ emissions: [{ type: 'UNIT', cost: EXACT_COST, surface: raw, canonicalUnit: lower }], emissionCost: EXACT_COST })
+    out.push({ emissions: [{ type: 'UNIT', cost: EXACT_COST, surface: raw, heardText: raw, canonicalUnit: lower }], emissionCost: EXACT_COST })
   }
-  // An exact vocabulary match is unambiguous — don't offer an ITEM escape hatch that
-  // would let the decoder buy a cheaper global path by relabelling a literal
-  // number/unit as a fake item name just to dodge a transition penalty.
   if (out.length > 0) return out
 
   const key = phoneticKey(lower)
   if (key) {
     const n = matchVocab(key, vocab.numbers, WHOLE_TOKEN_MAX_NORM)
-    if (n) out.push({ emissions: [{ type: 'NUM', cost: n.normalized, surface: raw, numericValue: n.entry.numericValue }], emissionCost: n.normalized })
+    if (n) out.push({ emissions: [{ type: 'NUM', cost: n.normalized, surface: raw, heardText: raw, numericValue: n.entry.numericValue }], emissionCost: n.normalized })
 
     const u = matchVocab(key, vocab.units, WHOLE_TOKEN_MAX_NORM, { allowElision: true })
-    if (u) out.push({ emissions: [{ type: 'UNIT', cost: u.normalized, surface: raw, canonicalUnit: u.entry.canonicalUnit }], emissionCost: u.normalized })
+    if (u) out.push({ emissions: [{ type: 'UNIT', cost: u.normalized, surface: raw, heardText: raw, canonicalUnit: u.entry.canonicalUnit }], emissionCost: u.normalized })
 
     const it = matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, { allowEcho: true })
     if (it) {
@@ -477,6 +477,7 @@ function wholeTokenExpansions(raw: string, vocab: SegmenterVocabulary): Expansio
           type: 'ITEM',
           cost,
           surface: it.entry.surface,
+          heardText: raw,
           matchNorm: it.normalized,
           matchMargin: it.margin,
           top3Candidates: it.top3,
@@ -486,10 +487,7 @@ function wholeTokenExpansions(raw: string, vocab: SegmenterVocabulary): Expansio
     }
   }
 
-  // Always available: an unrecognized word is far more likely to be an item the
-  // catalog hasn't seen than a mangled number. This is what keeps a genuinely new
-  // item name intact rather than rewriting it to the nearest catalog entry.
-  out.push({ emissions: [{ type: 'ITEM', cost: ITEM_BASELINE_COST, surface: raw }], emissionCost: ITEM_BASELINE_COST })
+  out.push({ emissions: [{ type: 'ITEM', cost: ITEM_BASELINE_COST, surface: raw, heardText: raw }], emissionCost: ITEM_BASELINE_COST })
   return out
 }
 
@@ -498,8 +496,8 @@ function splitExpansions(raw: string, vocab: SegmenterVocabulary): Expansion[] {
   if (key.length < MIN_SPLIT_PHONES * 2) return []
   const out: Expansion[] = []
 
-  const em = (type: TokenType, hit: VocabHit): Emission => ({
-    type, cost: hit.normalized, surface: hit.entry.surface,
+  const em = (type: TokenType, hit: VocabHit, heardText: string = raw): Emission => ({
+    type, cost: hit.normalized, surface: hit.entry.surface, heardText,
     numericValue: hit.entry.numericValue, canonicalUnit: hit.entry.canonicalUnit,
     matchNorm: type === 'ITEM' ? hit.normalized : undefined,
     matchMargin: type === 'ITEM' ? hit.margin : undefined,
@@ -541,9 +539,6 @@ function splitExpansions(raw: string, vocab: SegmenterVocabulary): Expansion[] {
   return out
 }
 
-/** `suspect`: this reading rests on a token STT is known to have mangled (a distance
- *  word). Quantity and unit are trustworthy; the item name is a guess that must reach
- *  the review queue instead of auto-confirming. */
 interface DecodedToken {
   type: TokenType
   rawToken: string
@@ -629,7 +624,7 @@ function decode(tokens: string[], vocab: SegmenterVocabulary): { decoded: Decode
   for (let i = tokens.length - 1; i >= 0; i--) {
     const entry = back[i][currentType]
     if (!entry) {
-      chosen[i] = { emissions: [{ type: 'ITEM', cost: ITEM_BASELINE_COST, surface: tokens[i] }], emissionCost: ITEM_BASELINE_COST }
+      chosen[i] = { emissions: [{ type: 'ITEM', cost: ITEM_BASELINE_COST, surface: tokens[i], heardText: tokens[i] }], emissionCost: ITEM_BASELINE_COST }
       currentType = 'ITEM'
       continue
     }
@@ -643,6 +638,7 @@ function decode(tokens: string[], vocab: SegmenterVocabulary): { decoded: Decode
       decoded.push({
         type: e.type,
         rawToken: e.surface,
+        heardText: e.heardText,
         numericValue: e.numericValue,
         canonicalUnit: e.canonicalUnit,
         suspect: e.suspect,
@@ -657,6 +653,7 @@ function decode(tokens: string[], vocab: SegmenterVocabulary): { decoded: Decode
 
 export interface RawItemSegment {
   rawSegmentText: string
+  heardSegmentText?: string
   quantity: number
   unit: string
   itemTokens: string[]
@@ -690,6 +687,7 @@ export function segmentTranscript(
   let currentUnit: string | null = null
   let currentItemTokens: string[] = []
   let currentSegmentTokens: string[] = []
+  let currentHeardTokens: string[] = []
   let ambiguousDoubleQty = minGap < LOW_CONFIDENCE_GAP_THRESHOLD
   let suspectReading = false
   let worstItemNorm: number | null = null
@@ -701,8 +699,10 @@ export function segmentTranscript(
     if (currentItemTokens.length > 0) {
       const name = currentItemTokens.join(' ').trim()
       const rawText = currentSegmentTokens.join(' ').trim()
+      const heardText = currentHeardTokens.join(' ').trim()
       segments.push({
         rawSegmentText: rawText || name,
+        heardSegmentText: heardText || name,
         quantity: currentQty ?? 1.0,
         unit: currentUnit ?? 'PACKET',
         itemTokens: [name],
@@ -716,6 +716,7 @@ export function segmentTranscript(
     currentUnit = null
     currentItemTokens = []
     currentSegmentTokens = []
+    currentHeardTokens = []
     ambiguousDoubleQty = false
     suspectReading = false
     worstItemNorm = null
@@ -730,9 +731,11 @@ export function segmentTranscript(
       else if (currentQty !== null) ambiguousDoubleQty = true
       currentQty = dt.numericValue ?? 1.0
       currentSegmentTokens.push(dt.rawToken)
+      currentHeardTokens.push(dt.heardText)
     } else if (dt.type === 'UNIT') {
       currentUnit = normalizeUnit(dt.canonicalUnit ?? dt.rawToken)
       currentSegmentTokens.push(dt.rawToken)
+      currentHeardTokens.push(dt.heardText)
     } else {
       if (dt.matchNorm !== undefined && dt.matchNorm !== null) {
         worstItemNorm = worstItemNorm === null ? dt.matchNorm : Math.max(worstItemNorm, dt.matchNorm)
@@ -745,6 +748,7 @@ export function segmentTranscript(
       }
       currentItemTokens.push(dt.rawToken)
       currentSegmentTokens.push(dt.rawToken)
+      currentHeardTokens.push(dt.heardText)
     }
   }
 
@@ -759,5 +763,5 @@ export function segmentTranscript(
 export function normalizeTranscript(transcript: string, catalogNames: string[] = []): string {
   const { segments } = segmentTranscript(transcript, catalogNames)
   if (!segments.length) return transcript
-  return segments.map(s => s.rawSegmentText).join(' ')
+  return segments.map(s => s.heardSegmentText || s.rawSegmentText).join(' ')
 }

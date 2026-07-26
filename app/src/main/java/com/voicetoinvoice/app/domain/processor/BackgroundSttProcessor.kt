@@ -137,7 +137,8 @@ class BackgroundSttProcessor(
                         for (seg in deterministicSegments) {
                             segArr.put(JSONObject().apply {
                                 put("rawSegmentText", seg.rawSegmentText)
-                                put("quantity", seg.quantity ?: JSONObject.NULL)
+                                put("heardSegmentText", seg.heardSegmentText)
+                                put("quantity", seg.quantity)
                                 put("unit", seg.unit ?: JSONObject.NULL)
                                 put("itemTokens", JSONArray(seg.itemTokens))
                                 put("isSanityFlagged", seg.isSanityFlagged)

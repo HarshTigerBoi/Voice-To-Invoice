@@ -974,7 +974,8 @@ Parse this order.`
         audioEndMs: metadata.audioEndMs || 0,
       },
       step_2_stt_proxy_response: {
-        rawTranscript: transcript,
+        rawTranscript: chosenRaw,
+        normalizedTranscript: normalizeTranscript(chosenRaw, fullCatalogList),
         grokTranscript: rawGrokTranscript,
         sarvamTranscript: rawSarvamTranscript,
         provider: sttProvider,

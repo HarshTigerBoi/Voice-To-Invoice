@@ -188,6 +188,20 @@
   7. Added 8 new unit tests in `VoiceParserTest.kt` verifying all `PriceIntent` branches and sanity checks.
 - **Verification Date**: 2026-07-25 (All 27 `VoiceParserTest` unit tests PASSED, APK `VoiceToInvoice_v58.apk` built and verified).
 
+#### [ISSUE-024] [2026-07-26] Open-Vocab Phase 0-pre: Verbatim STT Preservation & heardText Trace Isolation
+- **Symptom**: Trace `26ee5b12` showed Sarvam STT hearing `"चार किलो सोयाबीन"`, but `rawTranscript` in DB trace read `"चार किलो साबुन"` (soap). `normalizeTranscript()` had re-tokenized the winning transcript and fuzzy-matched `"सोयाबीन"` to `"साबुन"` at 0.214 distance, mutating the raw trace log and handing the step-4 AI model a mis-resolved transcript hint.
+- **Root Cause**:
+  1. `Emissions` and `DecodedTokens` only carried resolved vocabulary surfaces (`surface`), causing `normalizeTranscript()` to join resolved Surfaces instead of literal heard tokens.
+  2. `rawTranscript` in `process-voice-job/index.ts` recorded `transcript` (the output of `normalizeTranscript`) instead of `chosenRaw` (the untouched STT output).
+- **Resolution**:
+  1. Added `heardText: String` to `Emission` and `DecodedToken` across Kotlin and TypeScript segmenter engines, carrying literal heard substrings from transcript construction sites.
+  2. Added `heardSegmentText: String` to `RawItemSegment` in both Kotlin and TypeScript engines (leaving `rawSegmentText` untouched to preserve `MultiSaleDetector.kt` behavior).
+  3. Updated `normalizeTranscript()` in `phonetic.ts` to join `heardSegmentText` instead of `rawSegmentText`.
+  4. Updated `process-voice-job/index.ts` trace logging: `rawTranscript` now records `chosenRaw` (untouched STT), and `normalizedTranscript` records the cleaned hint string.
+  5. Updated `BackgroundSttProcessor.kt` trace logging to include `heardSegmentText`.
+  6. Added regression test `heardTextSurvivesEvenWhenItemIsMisresolved` to `PhoneticSegmentationTest.kt`.
+- **Verification Date**: 2026-07-26 (All 62 unit tests PASSED, edge function deployed to Supabase `lyowklxsbfznnqridtgr`, `VoiceToInvoice_v71.apk` built and deployed).
+
 #### [ISSUE-011] [2026-07-25] Segmenter Corrupted "बिंडी" (Bhindi) → "घी" (Ghee) Due to Missing Devanagari Vocab Entry, Auto-Confirmed Wrong Item to Ledger
 - **Symptom**: Trace `6690cc7b-89cf-41f0-a4fc-04d5ae766fec` — shopkeeper said "दो किलो भिंडी" (2kg Bhindi/okra), Grok STT correctly heard it as `"दो किलोबिंडी"` (fused, unaspirated `ब` for `भ` — a common STT confusion), but `combinatorialFuzzySegmenter` rewrote it to `"दो किलो घी"` (Ghee) and auto-confirmed **Desi Ghee × 2KG = ₹1300** to the ledger instead of Bhindi. This is a real wrong-item, wrong-price transaction silently booked to the confirmed ledger.
 - **Root Cause**:

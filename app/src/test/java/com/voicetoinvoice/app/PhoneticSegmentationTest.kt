@@ -386,4 +386,24 @@ class PhoneticSegmentationTest {
         val topCandidate = seg.top3Candidates[0]
         assertEquals(PhoneticKey.of("चंदन"), PhoneticKey.of(topCandidate.itemName))
     }
+
+    @Test
+    fun heardTextSurvivesEvenWhenItemIsMisresolved() {
+        // Production trace 26ee5b12: Sarvam correctly heard "सोयाबीन" (soyabean); the
+        // segmenter's own vocabulary fuzzy-matched it to "साबुन" (soap) at norm 0.214.
+        // The RESOLVED item name is allowed to be wrong here (that's what margin-gating
+        // in Phase 0b is for) — what must NEVER happen is losing the fact that "सोयाबीन"
+        // is what was actually said.
+        val result = segmenter.segmentTranscript("चार किलो सोयाबीन")
+        assertEquals(1, result.segments.size)
+        val seg = result.segments[0]
+        assertTrue(
+            "resolved item may legitimately be wrong pending Phase 0b, got ${seg.itemTokens}",
+            seg.itemTokens.isNotEmpty()
+        )
+        assertTrue(
+            "heardSegmentText must preserve सोयाबीन verbatim regardless of what it resolved to, got '${seg.heardSegmentText}'",
+            seg.heardSegmentText.contains("सोयाबीन")
+        )
+    }
 }
