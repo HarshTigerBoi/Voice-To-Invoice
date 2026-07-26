@@ -240,16 +240,47 @@ export const DISTANCE_UNIT_TOKENS: string[] = [
 
 /** Item words usable as the ITEM half of a fused token, in BOTH scripts. Kept in sync
  *  with OrderingSegmenter.DEFAULT_ITEM_VOCAB and FuzzyCatalogMatcher.indicAliasMap. */
+/**
+ * A word absent from this vocabulary cannot be recognized — only mapped onto the
+ * nearest word that IS present. In ISSUE-022 the shopkeeper said "अमचूर", which
+ * appeared nowhere in the codebase, so the matcher resolved it to "Jeera" and booked
+ * it. Breadth here is a correctness requirement, not a nice-to-have.
+ *
+ * Mirrors OrderingSegmenter.DEFAULT_ITEM_VOCAB — keep the two identical.
+ */
 export const DEFAULT_ITEM_VOCAB: string[] = [
-  'सेब', 'Seb', 'आलू', 'Aaloo', 'प्याज', 'Pyaz', 'टमाटर', 'Tamatar',
-  'भिंडी', 'Bhindi', 'धनिया', 'Dhaniya', 'मिर्च', 'Mirch', 'गोभी', 'Gobhi',
-  'बैंगन', 'Baingan', 'गाजर', 'Gajar', 'मटर', 'Matar', 'खीरा', 'Kheera',
-  'पालक', 'Palak', 'लहसुन', 'Lahsun', 'अदरक', 'Adrak', 'केला', 'Kela',
-  'दूध', 'Doodh', 'दही', 'Dahi', 'पनीर', 'Paneer', 'घी', 'Ghee',
-  'मक्खन', 'Butter', 'अंडे', 'Anda', 'चीनी', 'Chini', 'आटा', 'Atta',
-  'चावल', 'Chawal', 'नमक', 'Namak', 'तेल', 'Tel', 'मैगी', 'Maggi',
-  'सोना', 'Sona', 'चांदी', 'Chaandi', 'काजू', 'Kaju', 'बादाम', 'Badam',
-  'मूंगफली', 'Moongphali',
+  'सेब', 'Seb', 'आलू', 'Aaloo', 'प्याज', 'Pyaz',
+  'टमाटर', 'Tamatar', 'भिंडी', 'Bhindi', 'धनिया', 'Dhaniya',
+  'मिर्च', 'Mirch', 'गोभी', 'Gobhi', 'बैंगन', 'Baingan',
+  'गाजर', 'Gajar', 'मटर', 'Matar', 'खीरा', 'Kheera',
+  'पालक', 'Palak', 'लहसुन', 'Lahsun', 'अदरक', 'Adrak',
+  'केला', 'Kela', 'नींबू', 'Nimbu', 'शिमला मिर्च', 'Shimla Mirch',
+  'लौकी', 'Lauki', 'तोरई', 'Torai', 'करेला', 'Karela',
+  'कद्दू', 'Kaddu', 'मूली', 'Mooli', 'चुकंदर', 'Chukandar',
+  'अंगूर', 'Angoor', 'आम', 'Aam', 'संतरा', 'Santra',
+  'पपीता', 'Papita', 'अनार', 'Anar', 'तरबूज', 'Tarbooj',
+  'अमरूद', 'Amrood', 'दूध', 'Doodh', 'दही', 'Dahi',
+  'पनीर', 'Paneer', 'घी', 'Ghee', 'मक्खन', 'Butter',
+  'अंडे', 'Anda', 'मलाई', 'Malai', 'छाछ', 'Chaach',
+  'चीनी', 'Chini', 'आटा', 'Atta', 'चावल', 'Chawal',
+  'नमक', 'Namak', 'तेल', 'Tel', 'मैदा', 'Maida',
+  'सूजी', 'Sooji', 'बेसन', 'Besan', 'पोहा', 'Poha',
+  'सेवई', 'Sewai', 'साबूदाना', 'Sabudana', 'गुड़', 'Gud',
+  'चना', 'Chana', 'राजमा', 'Rajma', 'मूंग', 'Moong',
+  'मसूर', 'Masoor', 'अरहर', 'Arhar', 'तूर', 'Toor',
+  'उड़द', 'Urad', 'छोले', 'Chole', 'अमचूर', 'Amchoor',
+  'हल्दी', 'Haldi', 'जीरा', 'Jeera', 'राई', 'Rai',
+  'मेथी', 'Methi', 'सौंफ', 'Saunf', 'इलायची', 'Elaichi',
+  'दालचीनी', 'Dalchini', 'लौंग', 'Laung', 'काली मिर्च', 'Kali Mirch',
+  'तेजपत्ता', 'Tejpatta', 'हींग', 'Hing', 'अजवाइन', 'Ajwain',
+  'गरम मसाला', 'Garam Masala', 'कसूरी मेथी', 'Kasuri Methi', 'इमली', 'Imli',
+  'खटाई', 'Khatai', 'काजू', 'Kaju', 'बादाम', 'Badam',
+  'मूंगफली', 'Moongphali', 'किशमिश', 'Kishmish', 'अखरोट', 'Akhrot',
+  'पिस्ता', 'Pista', 'खजूर', 'Khajoor', 'नारियल', 'Nariyal',
+  'मैगी', 'Maggi', 'चायपत्ती', 'Chaipatti', 'कॉफी', 'Coffee',
+  'साबुन', 'Sabun', 'शैम्पू', 'Shampoo', 'अगरबत्ती', 'Agarbatti',
+  'माचिस', 'Machis', 'बिस्कुट', 'Biscuit', 'ब्रेड', 'Bread',
+  'नमकीन', 'Namkeen', 'सोना', 'Sona', 'चांदी', 'Chaandi',
 ]
 
 export function normalizeUnit(unitStr: string): string {
@@ -272,7 +303,7 @@ type TokenType = 'NUM' | 'UNIT' | 'ITEM'
 
 interface VocabEntry { key: string; surface: string; numericValue?: number; canonicalUnit?: string }
 interface VocabHit { entry: VocabEntry; normalized: number }
-interface Emission { type: TokenType; cost: number; surface: string; numericValue?: number; canonicalUnit?: string; suspect?: boolean }
+interface Emission { type: TokenType; cost: number; surface: string; numericValue?: number; canonicalUnit?: string; suspect?: boolean; matchNorm?: number }
 interface Expansion { emissions: Emission[]; emissionCost: number }
 
 export interface SegmenterVocabulary {
@@ -391,7 +422,7 @@ function wholeTokenExpansions(raw: string, vocab: SegmenterVocabulary): Expansio
     const it = matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, { allowEcho: true })
     if (it) {
       const cost = ITEM_MATCHED_BASE_COST + it.normalized
-      out.push({ emissions: [{ type: 'ITEM', cost, surface: it.entry.surface }], emissionCost: cost })
+      out.push({ emissions: [{ type: 'ITEM', cost, surface: it.entry.surface, matchNorm: it.normalized }], emissionCost: cost })
     }
   }
 
@@ -410,6 +441,7 @@ function splitExpansions(raw: string, vocab: SegmenterVocabulary): Expansion[] {
   const em = (type: TokenType, hit: VocabHit): Emission => ({
     type, cost: hit.normalized, surface: hit.entry.surface,
     numericValue: hit.entry.numericValue, canonicalUnit: hit.entry.canonicalUnit,
+    matchNorm: type === 'ITEM' ? hit.normalized : undefined,
   })
 
   for (let i = MIN_SPLIT_PHONES; i <= key.length - MIN_SPLIT_PHONES; i++) {
@@ -450,7 +482,7 @@ function splitExpansions(raw: string, vocab: SegmenterVocabulary): Expansion[] {
 /** `suspect`: this reading rests on a token STT is known to have mangled (a distance
  *  word). Quantity and unit are trustworthy; the item name is a guess that must reach
  *  the review queue instead of auto-confirming. */
-interface DecodedToken { type: TokenType; rawToken: string; numericValue?: number; canonicalUnit?: string; suspect?: boolean }
+interface DecodedToken { type: TokenType; rawToken: string; numericValue?: number; canonicalUnit?: string; suspect?: boolean; matchNorm?: number }
 
 /**
  * Viterbi over a token-expansion lattice. State is (source token index, type of the
@@ -537,7 +569,7 @@ function decode(tokens: string[], vocab: SegmenterVocabulary): { decoded: Decode
   const decoded: DecodedToken[] = []
   for (const exp of chosen) {
     for (const e of exp.emissions) {
-      decoded.push({ type: e.type, rawToken: e.surface, numericValue: e.numericValue, canonicalUnit: e.canonicalUnit, suspect: e.suspect })
+      decoded.push({ type: e.type, rawToken: e.surface, numericValue: e.numericValue, canonicalUnit: e.canonicalUnit, suspect: e.suspect, matchNorm: e.matchNorm })
     }
   }
   return { decoded, minGap }
@@ -549,6 +581,17 @@ export interface RawItemSegment {
   unit: string
   itemTokens: string[]
   isSanityFlagged: boolean
+  /**
+   * Normalized phonetic distance of the item match behind this segment: 0.0 = the
+   * transcript token IS the vocabulary word, 0.25 (WHOLE_TOKEN_MAX_NORM) = the loosest
+   * match accepted at all, null = matched nothing and kept verbatim as a new name.
+   *
+   * Confidence used to be `isCatalogMatched ? 0.95 : 0.60`, discarding the distance the
+   * matcher had just computed. Trace e0b68f80-6876-42e2-b556-2adf73ce463f matched "चोर"
+   * to catalog item "Jeera" at exactly 0.250 — the worst match the thresholds allow —
+   * and auto-confirmed it to the ledger at 0.95. See ISSUE-022.
+   */
+  itemMatchNorm: number | null
 }
 
 const LOW_CONFIDENCE_GAP_THRESHOLD = 0.15
@@ -580,6 +623,9 @@ export function segmentTranscript(
   // distrusts (a distance word STT invented). Quantity and unit stay good; the item
   // name is a guess, so the segment must reach review instead of auto-confirming.
   let suspectReading = false
+  // Worst (largest) match distance among this segment's item tokens — confidence must
+  // be built on the weakest link, not the best one.
+  let worstItemNorm: number | null = null
   const segments: RawItemSegment[] = []
 
   const closeSegment = () => {
@@ -592,6 +638,7 @@ export function segmentTranscript(
         unit: currentUnit ?? 'PACKET',
         itemTokens: [name],
         isSanityFlagged: ambiguousDoubleQty || suspectReading,
+        itemMatchNorm: worstItemNorm,
       })
     }
     currentQty = null
@@ -600,6 +647,7 @@ export function segmentTranscript(
     currentSegmentTokens = []
     ambiguousDoubleQty = false
     suspectReading = false
+    worstItemNorm = null
   }
 
   for (const dt of decoded) {
@@ -613,6 +661,9 @@ export function segmentTranscript(
       currentUnit = normalizeUnit(dt.canonicalUnit ?? dt.rawToken)
       currentSegmentTokens.push(dt.rawToken)
     } else {
+      if (dt.matchNorm !== undefined && dt.matchNorm !== null) {
+        worstItemNorm = worstItemNorm === null ? dt.matchNorm : Math.max(worstItemNorm, dt.matchNorm)
+      }
       currentItemTokens.push(dt.rawToken)
       currentSegmentTokens.push(dt.rawToken)
     }

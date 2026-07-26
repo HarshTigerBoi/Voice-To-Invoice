@@ -7,7 +7,21 @@ data class RawItemSegment(
     val unit: String?,
     val itemTokens: List<String>,
     val rawSegmentText: String,
-    val isSanityFlagged: Boolean = false
+    val isSanityFlagged: Boolean = false,
+    /**
+     * Normalized phonetic distance of the item match that produced this segment:
+     * `0.0` = the transcript token *is* the vocabulary word, `WHOLE_TOKEN_MAX_NORM`
+     * (0.25) = the loosest match the decoder is willing to accept at all, `null` = the
+     * token matched nothing and was kept verbatim as a new item name.
+     *
+     * This exists because confidence used to be computed as `isCatalogMatched ? 0.95
+     * : 0.60`, throwing away the distance the matcher had just calculated. In trace
+     * `e0b68f80-6876-42e2-b556-2adf73ce463f` the token "चोर" matched catalog item
+     * "Jeera" at normalized 0.250 — the single worst match the thresholds permit — and
+     * was booked to the ledger at 0.95 confidence. A number this close to the reject
+     * line must not survive the auto-confirm gate. See ISSUE-022.
+     */
+    val itemMatchNorm: Double? = null
 )
 
 data class SegmentResult(
@@ -25,7 +39,10 @@ private data class DecodedToken(
     /** This reading rests on a token STT is known to have mangled (see
      *  [OrderingSegmenter.DISTANCE_UNIT_TOKENS]). The quantity/unit are trustworthy;
      *  the item name is a guess and must never auto-confirm. */
-    val suspect: Boolean = false
+    val suspect: Boolean = false,
+    /** For ITEM readings: how close the phonetic match actually was. See
+     *  [RawItemSegment.itemMatchNorm]. Null for an unmatched, literal item name. */
+    val matchNorm: Double? = null
 )
 
 /** One typed piece a source token can decode to. A source token yields several of these
@@ -36,7 +53,10 @@ private data class Emission(
     val surface: String,
     val numericValue: Double? = null,
     val canonicalUnit: String? = null,
-    val suspect: Boolean = false
+    val suspect: Boolean = false,
+    /** Normalized phonetic distance for an ITEM emission that resolved to a known word;
+     *  null when the token matched nothing and survives as a literal new item name. */
+    val matchNorm: Double? = null
 )
 
 /** One complete reading of a single source token: either a whole-token reading
@@ -235,7 +255,12 @@ private object GrammarLatticeDecoder {
             // trailing syllable STT tacks on at utterance end ("sebab" -> "सेब").
             matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, allowEcho = true)?.let {
                 val cost = ITEM_MATCHED_BASE_COST + it.normalized
-                out.add(Expansion(listOf(Emission(TokenType.ITEM, cost, it.entry.surface)), cost))
+                out.add(
+                    Expansion(
+                        listOf(Emission(TokenType.ITEM, cost, it.entry.surface, matchNorm = it.normalized)),
+                        cost
+                    )
+                )
             }
         }
 
@@ -257,7 +282,8 @@ private object GrammarLatticeDecoder {
             cost = cost,
             surface = hit.entry.surface,
             numericValue = hit.entry.numericValue,
-            canonicalUnit = hit.entry.canonicalUnit
+            canonicalUnit = hit.entry.canonicalUnit,
+            matchNorm = if (type == TokenType.ITEM) hit.normalized else null
         )
 
         // 2-way: [NUM][UNIT] ("चरगलो"), [UNIT][ITEM] ("ग्लोसोना"), [NUM][ITEM] ("एकलो").
@@ -399,7 +425,8 @@ private object GrammarLatticeDecoder {
                         rawToken = em.surface,
                         numericValue = em.numericValue,
                         canonicalUnit = em.canonicalUnit,
-                        suspect = em.suspect
+                        suspect = em.suspect,
+                        matchNorm = em.matchNorm
                     )
                 )
             }
@@ -506,16 +533,53 @@ class OrderingSegmenter {
          * `DEFAULT_ITEM_VOCAB` in supabase/functions/process-voice-job/phonetic.ts.
          * A shop's live catalog is unioned onto this at construction time.
          */
+        /**
+         * A word that is not in this vocabulary cannot be recognized — it can only be
+         * mapped onto the nearest word that *is*. That is not a tuning problem, it is
+         * the defining failure mode: in ISSUE-022 the shopkeeper said "अमचूर", which
+         * appeared nowhere in the codebase, so the matcher did the only thing available
+         * and resolved it to "Jeera". Breadth here is a correctness requirement, not a
+         * nice-to-have — every missing staple is a guaranteed future mis-booking.
+         *
+         * A shop's live catalog is unioned onto this at construction time; this list is
+         * the floor for shops whose catalog is still sparse.
+         */
         val DEFAULT_ITEM_VOCAB: List<String> = listOf(
+            // Vegetables & fruit
             "सेब", "Seb", "आलू", "Aaloo", "प्याज", "Pyaz", "टमाटर", "Tamatar",
             "भिंडी", "Bhindi", "धनिया", "Dhaniya", "मिर्च", "Mirch", "गोभी", "Gobhi",
             "बैंगन", "Baingan", "गाजर", "Gajar", "मटर", "Matar", "खीरा", "Kheera",
             "पालक", "Palak", "लहसुन", "Lahsun", "अदरक", "Adrak", "केला", "Kela",
+            "नींबू", "Nimbu", "शिमला मिर्च", "Shimla Mirch", "लौकी", "Lauki",
+            "तोरई", "Torai", "करेला", "Karela", "कद्दू", "Kaddu", "मूली", "Mooli",
+            "चुकंदर", "Chukandar", "अंगूर", "Angoor", "आम", "Aam", "संतरा", "Santra",
+            "पपीता", "Papita", "अनार", "Anar", "तरबूज", "Tarbooj", "अमरूद", "Amrood",
+            // Dairy & eggs
             "दूध", "Doodh", "दही", "Dahi", "पनीर", "Paneer", "घी", "Ghee",
-            "मक्खन", "Butter", "अंडे", "Anda", "चीनी", "Chini", "आटा", "Atta",
-            "चावल", "Chawal", "नमक", "Namak", "तेल", "Tel", "मैगी", "Maggi",
-            "सोना", "Sona", "चांदी", "Chaandi", "काजू", "Kaju", "बादाम", "Badam",
-            "मूंगफली", "Moongphali"
+            "मक्खन", "Butter", "अंडे", "Anda", "मलाई", "Malai", "छाछ", "Chaach",
+            // Staples & grains
+            "चीनी", "Chini", "आटा", "Atta", "चावल", "Chawal", "नमक", "Namak",
+            "तेल", "Tel", "मैदा", "Maida", "सूजी", "Sooji", "बेसन", "Besan",
+            "पोहा", "Poha", "सेवई", "Sewai", "साबूदाना", "Sabudana", "गुड़", "Gud",
+            // Dals & pulses
+            "चना", "Chana", "राजमा", "Rajma", "मूंग", "Moong", "मसूर", "Masoor",
+            "अरहर", "Arhar", "तूर", "Toor", "उड़द", "Urad", "छोले", "Chole",
+            // Spices — the gap that caused ISSUE-022
+            "अमचूर", "Amchoor", "हल्दी", "Haldi", "जीरा", "Jeera", "राई", "Rai",
+            "मेथी", "Methi", "सौंफ", "Saunf", "इलायची", "Elaichi", "दालचीनी", "Dalchini",
+            "लौंग", "Laung", "काली मिर्च", "Kali Mirch", "तेजपत्ता", "Tejpatta",
+            "हींग", "Hing", "अजवाइन", "Ajwain", "गरम मसाला", "Garam Masala",
+            "कसूरी मेथी", "Kasuri Methi", "इमली", "Imli", "खटाई", "Khatai",
+            // Dry fruit
+            "काजू", "Kaju", "बादाम", "Badam", "मूंगफली", "Moongphali",
+            "किशमिश", "Kishmish", "अखरोट", "Akhrot", "पिस्ता", "Pista", "खजूर", "Khajoor",
+            "नारियल", "Nariyal",
+            // Packaged & misc
+            "मैगी", "Maggi", "चायपत्ती", "Chaipatti", "कॉफी", "Coffee",
+            "साबुन", "Sabun", "शैम्पू", "Shampoo", "अगरबत्ती", "Agarbatti",
+            "माचिस", "Machis", "बिस्कुट", "Biscuit", "ब्रेड", "Bread", "नमकीन", "Namkeen",
+            // Precious metals (this shop books these too)
+            "सोना", "Sona", "चांदी", "Chaandi"
         )
 
         // Ambiguity gap below this threshold means the lattice decoder had a genuinely
@@ -554,6 +618,9 @@ class OrderingSegmenter {
         // still good; only the item name is a guess, so the segment must reach the
         // review queue rather than auto-confirm.
         var suspectReading = false
+        // Worst (largest) match distance among this segment's item tokens — the weakest
+        // link is what the confidence downstream must be built on, not the best one.
+        var worstItemNorm: Double? = null
         val segments = mutableListOf<RawItemSegment>()
 
         fun closeSegment() {
@@ -565,7 +632,8 @@ class OrderingSegmenter {
                         unit = currentUnit,
                         itemTokens = currentItemTokens.toList(),
                         rawSegmentText = if (rawText.isNotBlank()) rawText else currentItemTokens.joinToString(" "),
-                        isSanityFlagged = ambiguousDoubleQty || suspectReading
+                        isSanityFlagged = ambiguousDoubleQty || suspectReading,
+                        itemMatchNorm = worstItemNorm
                     )
                 )
             }
@@ -575,6 +643,7 @@ class OrderingSegmenter {
             currentSegmentTokens = mutableListOf()
             ambiguousDoubleQty = false
             suspectReading = false
+            worstItemNorm = null
         }
 
         for (dt in decoded) {
@@ -594,6 +663,9 @@ class OrderingSegmenter {
                     currentSegmentTokens.add(dt.rawToken)
                 }
                 TokenType.ITEM -> {
+                    dt.matchNorm?.let { n ->
+                        worstItemNorm = worstItemNorm?.let { maxOf(it, n) } ?: n
+                    }
                     currentItemTokens.add(dt.rawToken)
                     currentSegmentTokens.add(dt.rawToken)
                 }

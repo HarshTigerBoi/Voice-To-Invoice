@@ -73,6 +73,80 @@ function modelChain(all: string[], knownGood: string | null): string[] {
   return [knownGood, ...all.filter(m => m !== knownGood)]
 }
 
+// -----------------------------------------------------------------------------
+// CONFIDENCE & PLAUSIBILITY
+//
+// The root cause of ISSUE-022: confidence was `isCatalogMatched ? 0.95 : 0.60`, a
+// yes/no derived from *whether* an item matched while discarding *how well* it
+// matched. The phonetic matcher computes a normalized distance for every hit and then
+// threw it away, so a token sitting exactly on the reject line (0.250, the loosest
+// match `WHOLE_TOKEN_MAX_NORM` permits) was indistinguishable from an exact hit and
+// sailed through the 0.80 auto-confirm gate straight into the ledger.
+//
+// Every previous fix in this pipeline improved RECALL — finding a match at all. None
+// measured PRECISION. That is why each improvement made the system more confidently
+// wrong rather than more correct.
+// -----------------------------------------------------------------------------
+
+/** Must equal `WHOLE_TOKEN_MAX_NORM` in phonetic.ts / OrderingSegmenter.kt. */
+const MATCH_NORM_REJECT = 0.25
+const CONFIDENCE_AT_EXACT_MATCH = 0.95
+const CONFIDENCE_AT_WORST_MATCH = 0.50
+/** Anything the plausibility rules reject is held below the auto-confirm gate. */
+const IMPLAUSIBLE_CONFIDENCE_CAP = 0.55
+
+/**
+ * Maps normalized phonetic distance onto confidence, linearly.
+ *
+ * `null` (the token matched nothing and survives as a literal new item name) returns
+ * the documented 0.60 unmatched floor. With the constants above, only matches inside
+ * ~0.075 normalized distance clear the 0.80 gate — i.e. essentially exact ones. That
+ * is deliberate for a financial ledger: a mis-parse routed to review costs one tap, a
+ * mis-parse booked silently corrupts the shopkeeper's books and their trust.
+ */
+function confidenceFromMatchNorm(norm: number | null | undefined): number {
+  if (norm === null || norm === undefined) return 0.60
+  const clamped = Math.max(0, Math.min(norm, MATCH_NORM_REJECT))
+  const quality = 1 - clamped / MATCH_NORM_REJECT // 1.0 = exact, 0.0 = on the reject line
+  return CONFIDENCE_AT_WORST_MATCH +
+    (CONFIDENCE_AT_EXACT_MATCH - CONFIDENCE_AT_WORST_MATCH) * quality
+}
+
+/** Smallest sale value we will auto-confirm without a human glance. */
+const MIN_PLAUSIBLE_SALE_VALUE = 5.0
+
+/** Budget for the step-4 chat call. Env-tunable because it trades latency against how
+ *  often the pipeline loses its only arbitration stage. */
+const AI_CHAT_TIMEOUT_MS = Number(Deno.env.get('AI_CHAT_TIMEOUT_MS') || '20000')
+
+/**
+ * Domain sanity, independent of transcript confidence. A shopkeeper does not sell
+ * 7 grams of anything — weight-in-grams is sold in 50/100/250/500 steps, and a
+ * quantity of 7 there is a mis-heard unit (almost always KG heard as GRAM, exactly as
+ * in trace e0b68f80 where "गिलम" matched `gram` at 0.100 and beat `kilo` at 0.300).
+ *
+ * Returns a human-readable reason, or null when the combination is plausible. This
+ * never blocks a sale — it only withholds AUTO-CONFIRM and routes to review.
+ */
+function implausibilityReason(unit: string, qty: number, total: number): string | null {
+  const u = (unit || '').toUpperCase()
+  if (!(qty > 0)) return `quantity ${qty} is not positive`
+
+  if (u === 'GRAM' || u === 'ML') {
+    if (qty < 10) return `${qty} ${u} is below any real retail quantity (likely a mis-heard KG/LITRE)`
+    if (qty > 5000) return `${qty} ${u} exceeds a plausible single sale`
+  } else if (u === 'KG' || u === 'LITRE') {
+    if (qty > 200) return `${qty} ${u} exceeds a plausible single sale`
+  } else if (u === 'PIECE' || u === 'PACKET' || u === 'DOZEN') {
+    if (qty > 500) return `${qty} ${u} exceeds a plausible single sale`
+  }
+
+  if (total > 0 && total < MIN_PLAUSIBLE_SALE_VALUE) {
+    return `sale value ₹${total.toFixed(2)} is below the ₹${MIN_PLAUSIBLE_SALE_VALUE} auto-confirm floor`
+  }
+  return null
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
@@ -697,7 +771,10 @@ Parse this order.`
       // the whole time and every sale was riding on the rule-based segmenter alone.
       for (const model of modelChain(XAI_CHAT_MODELS, knownGoodChatModel)) {
         const chatController = new AbortController()
-        const chatTimeoutId = setTimeout(() => chatController.abort(), 8000)
+        // 8s was too tight — trace e0b68f80 timed out here, which silently removed the
+        // only stage capable of arbitrating between the two disagreeing transcripts and
+        // left the rule-based segmenter's guess to be booked unchallenged.
+        const chatTimeoutId = setTimeout(() => chatController.abort(), AI_CHAT_TIMEOUT_MS)
         try {
           const grokResp = await fetch('https://api.x.ai/v1/chat/completions', {
             method: 'POST',
@@ -747,7 +824,7 @@ Parse this order.`
           console.warn(`Grok chat model "${model}" unavailable, trying next: ${aiError}`)
         } catch (aiErr: any) {
           clearTimeout(chatTimeoutId)
-          aiError = aiErr?.name === 'AbortError' ? 'AI Timeout (8s limit)' : (aiErr?.message || String(aiErr))
+          aiError = aiErr?.name === 'AbortError' ? `AI Timeout (${AI_CHAT_TIMEOUT_MS}ms limit)` : (aiErr?.message || String(aiErr))
           console.error('Grok AI multi-item interpretation error:', aiError)
           break
         }
@@ -773,7 +850,13 @@ Parse this order.`
           unit: seg.unit,
           price: 0.0,
           confidence: seg.isSanityFlagged ? 0.3 : undefined,
-          matched_catalog: false
+          matched_catalog: false,
+          // Carry the phonetic match distance forward so the confidence step below can
+          // tell an exact hit apart from a barely-legal one. Without this the two are
+          // indistinguishable downstream — the ISSUE-022 failure.
+          item_match_norm: seg.itemMatchNorm,
+          // Provenance: this item came from the rule-based segmenter, NOT from the AI.
+          source: 'segmenter' as const,
         }
       })
     }
@@ -801,38 +884,61 @@ Parse this order.`
       const priceAtSale = matched ? matched.price : (rawItem.price || 0.0)
       const total = qty * priceAtSale
       const isCatalogMatched = matched !== undefined
-      // Never let a self-reported confidence exceed the documented floor for
-      // unmatched items (see Docs/audit.md §1) — otherwise the LLM reporting
-      // high confidence for an item it just told us isn't in the catalog
-      // (a real observed case: "Chaandi" at 0.85 with matched_catalog:false)
-      // silently defeats the review-queue safety net.
-      const confidence = isCatalogMatched
-        ? (rawItem.confidence || 0.95)
-        : Math.min(rawItem.confidence || 0.60, 0.60)
+      const unit = rawItem.unit || (matched ? matched.unit_id : "PACKET")
+
+      // Confidence is derived from HOW WELL the item matched, not merely from WHETHER
+      // it matched. The old rule was `isCatalogMatched ? 0.95 : 0.60`, which threw away
+      // the normalized phonetic distance the matcher had just computed — so a token
+      // sitting exactly on the reject line scored identically to an exact hit. That is
+      // how trace e0b68f80 booked "चोर" as catalog item "Jeera" (distance 0.250, the
+      // worst the thresholds allow) to the ledger at 0.95 confidence. See ISSUE-022.
+      let confidence: number
+      if (typeof rawItem.confidence === 'number') {
+        // An explicit number (AI-reported, or the segmenter's ambiguity cap) still
+        // obeys the documented ceiling for catalog-unmatched items.
+        confidence = isCatalogMatched ? rawItem.confidence : Math.min(rawItem.confidence, 0.60)
+      } else if (isCatalogMatched) {
+        confidence = confidenceFromMatchNorm(rawItem.item_match_norm)
+      } else {
+        confidence = 0.60
+      }
+
+      // Plausibility is independent of phonetics: even a perfectly-matched item can be
+      // an obvious mis-parse in context. "7 GRAM Jeera" for ₹2.80 is not a sale any
+      // kirana shop has ever made, and no amount of transcript confidence should let it
+      // reach the ledger unreviewed.
+      const implausibility = implausibilityReason(unit, qty, total)
+      if (implausibility) confidence = Math.min(confidence, IMPLAUSIBLE_CONFIDENCE_CAP)
 
       return {
         item_name: matched ? matched.name : rawName,
         item_id: matched ? matched.id : null,
         quantity: qty,
-        unit: rawItem.unit || (matched ? matched.unit_id : "PACKET"),
+        unit,
         price_at_sale: priceAtSale,
         total: total,
         confidence: confidence,
-        is_matched_to_catalog: isCatalogMatched
+        is_matched_to_catalog: isCatalogMatched,
+        // Surfaced in the trace so a review-queue entry explains itself.
+        item_match_norm: rawItem.item_match_norm ?? null,
+        implausibility_reason: implausibility,
+        parse_source: rawItem.source ?? 'ai',
       }
     })
 
     // Smart Auto-Confirm Gate: Item is auto-confirmed ONLY IF:
-    // 1. confidence >= 0.80
+    // 1. confidence >= 0.80 (which now encodes match quality, not just match existence)
     // 2. price_at_sale > 0.0 and total > 0.0 (No ₹0 sales in confirmed ledger!)
     // 3. valid, non-empty item name
+    // 4. quantity/unit/value are plausible for a kirana shop
     const isAutoConfirmed = finalParsedItems.length > 0 && finalParsedItems.every(item =>
       item.confidence >= 0.80 &&
       item.price_at_sale > 0.0 &&
       item.total > 0.0 &&
       item.item_name &&
       item.item_name.trim().length > 0 &&
-      item.item_name !== "Unrecognized Item"
+      item.item_name !== "Unrecognized Item" &&
+      item.implausibility_reason === null
     )
     const finalStatus = isAutoConfirmed ? "AUTO_CONFIRMED" : "PARSED"
 
@@ -876,10 +982,17 @@ Parse this order.`
           quantity: item.quantity,
           unit: item.unit,
           itemTokens: [item.item_name],
-          isSanityFlagged: false
+          isSanityFlagged: item.implausibility_reason !== null,
+          itemMatchNorm: item.item_match_norm
         }))
       },
+      // Named for the step it belongs to, but it is NOT necessarily AI output: when the
+      // chat call fails or times out, `finalParsedItems` is the rule-based segmenter's
+      // reading. Trace e0b68f80 showed this field populated alongside
+      // `step_4_ai_error: "AI Timeout"`, which read as though the AI had agreed with a
+      // parse it never saw. `parse_source` on each item now says which stage produced it.
       step_4_grok_ai_interpretation: finalParsedItems,
+      step_4_interpretation_source: aiError ? 'segmenter_fallback' : 'grok_ai',
       step_5_adaptive_audio_expansion_engine: {
         // Honest reporting: this records what was actually re-run. When no re-decode
         // was needed the pass list is empty rather than claiming a fabricated pass.

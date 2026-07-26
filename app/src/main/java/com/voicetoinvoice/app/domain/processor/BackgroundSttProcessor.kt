@@ -13,6 +13,7 @@ import com.voicetoinvoice.app.data.local.entity.TransactionSource
 import com.voicetoinvoice.app.domain.parser.MultiSaleDetector
 import com.voicetoinvoice.app.domain.parser.OrderingSegmenter
 import com.voicetoinvoice.app.domain.parser.ParsedVoiceSale
+import com.voicetoinvoice.app.domain.parser.SalePlausibility
 import com.voicetoinvoice.app.domain.parser.VoiceParser
 import com.voicetoinvoice.app.network.CloudSyncManager
 import com.voicetoinvoice.app.network.SttProxyClient
@@ -352,11 +353,20 @@ class BackgroundSttProcessor(
                                 db.catalogDao().insertOrUpdate(item.copy(price = saleResult.updatedUnitPrice, synced = false))
                             }
                         } else {
+                            // Domain sanity, checked independently of transcript
+                            // confidence: a perfectly-matched item can still be an
+                            // obvious mis-parse in context. "7 GRAM Jeera for ₹2.80"
+                            // (ISSUE-022) was booked at 0.95 confidence because nothing
+                            // ever asked whether the sale made sense.
+                            val implausibility = SalePlausibility.reason(
+                                saleResult.unit, saleResult.quantity, saleResult.estimatedTotal
+                            )
                             val isAutoConfirmable = item != null &&
                                     saleResult.confidence >= 0.80f &&
                                     !saleResult.isPendingPrice &&
                                     saleResult.estimatedTotal > 0.0 &&
-                                    !saleResult.isSanityFlagged
+                                    !saleResult.isSanityFlagged &&
+                                    implausibility == null
 
                             val itemOutcomeJson = JSONObject().apply {
                                 put("itemName", item?.name ?: "Unrecognized Item")
@@ -366,6 +376,7 @@ class BackgroundSttProcessor(
                                 put("estimatedTotal", saleResult.estimatedTotal)
                                 put("confidence", saleResult.confidence)
                                 put("isSanityFlagged", saleResult.isSanityFlagged)
+                                put("implausibilityReason", implausibility ?: JSONObject.NULL)
                                 put("autoConfirmedToLedger", isAutoConfirmable)
                             }
                             outcomeArray.put(itemOutcomeJson)

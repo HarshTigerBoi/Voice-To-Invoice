@@ -2,6 +2,7 @@ package com.voicetoinvoice.app
 
 import com.voicetoinvoice.app.domain.parser.OrderingSegmenter
 import com.voicetoinvoice.app.domain.parser.PhoneticKey
+import com.voicetoinvoice.app.domain.parser.SalePlausibility
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
@@ -232,5 +233,112 @@ class PhoneticSegmentationTest {
         val result = segmenter.segmentTranscript("आलू", pendingCarryoverQty = 4.0)
         assertEquals(1, result.segments.size)
         assertEquals(4.0, result.segments[0].quantity, 0.01)
+    }
+
+    // ---------- ISSUE-022: match QUALITY must be measurable ----------
+    //
+    // Production trace e0b68f80-6876-42e2-b556-2adf73ce463f: shopkeeper said
+    // "पांच किलो अमचूर". Grok returned "साथ गिलम चोर", Sarvam "सात गुलामचूर". The token
+    // "चोर" matched catalog item "Jeera" at normalized distance 0.250 — exactly the
+    // loosest match the thresholds permit — and was auto-confirmed to the ledger at
+    // 0.95 confidence, because confidence was `isCatalogMatched ? 0.95 : 0.60` and
+    // discarded the distance entirely.
+
+    @Test
+    fun exactMatchReportsZeroDistance() {
+        val result = segmenter.segmentTranscript("पांच किलो आलू")
+        assertEquals(0.0, result.segments[0].itemMatchNorm ?: -1.0, 0.001)
+    }
+
+    @Test
+    fun borderlineMatchReportsItsDistanceInsteadOfHidingIt() {
+        // "चोर" (thief) against "Jeera" (cumin) — a match only because it squeaks under
+        // the 0.25 ceiling. The segmenter must report that, so confidence downstream can
+        // be built on match QUALITY rather than on match EXISTENCE.
+        val result = segmenter.segmentTranscript("साथ गिलम चोर", catalogNames = listOf("Jeera"))
+        assertEquals(1, result.segments.size)
+        val norm = result.segments[0].itemMatchNorm
+        assertNotNull("a fuzzy item match must report its distance", norm)
+        // The specific catalog word this lands on is not the point and will shift as the
+        // vocabulary grows (with the expanded lexicon "चोर" now reaches छोले/Chole at
+        // 0.125 rather than Jeera at 0.250). What must hold is that the distance is
+        // reported and is clearly non-exact, so the server's confidence mapping keeps it
+        // under the 0.80 auto-confirm gate instead of treating it as a certainty.
+        assertTrue(
+            "a fuzzy match must be distinguishable from an exact one, got $norm",
+            norm!! > 0.05
+        )
+    }
+
+    @Test
+    fun unmatchedItemReportsNullDistanceRatherThanAFakeScore() {
+        val result = segmenter.segmentTranscript("दो किलो zxqwvr")
+        assertNull(
+            "an unrecognized word kept verbatim has no match distance to report",
+            result.segments[0].itemMatchNorm
+        )
+    }
+
+    @Test
+    fun amchoorIsInTheDefaultVocabulary() {
+        // The deepest cause of ISSUE-022: अमचूर existed in NO vocabulary anywhere, so
+        // the matcher could not recognize it — only map it onto the nearest word it did
+        // know. A missing staple is a guaranteed future mis-booking.
+        val keys = OrderingSegmenter.DEFAULT_ITEM_VOCAB.map { PhoneticKey.of(it) }
+        assertTrue("अमचूर must be in the default item vocabulary", keys.contains(PhoneticKey.of("अमचूर")))
+        assertTrue("हल्दी must be in the default item vocabulary", keys.contains(PhoneticKey.of("हल्दी")))
+        assertTrue("हींग must be in the default item vocabulary", keys.contains(PhoneticKey.of("हींग")))
+    }
+
+    @Test
+    fun amchoorNowResolvesToItselfRatherThanTheNearestKnownSpice() {
+        val result = segmenter.segmentTranscript("पांच किलो अमचूर")
+        assertEquals(1, result.segments.size)
+        assertEquals(5.0, result.segments[0].quantity, 0.01)
+        assertEquals("KG", result.segments[0].unit)
+        assertTrue(
+            "expected अमचूर, got ${result.segments[0].itemTokens}",
+            result.segments[0].itemTokens.any { PhoneticKey.of(it) == PhoneticKey.of("अमचूर") }
+        )
+        assertEquals(0.0, result.segments[0].itemMatchNorm ?: -1.0, 0.001)
+    }
+
+    // ---------- Domain plausibility ----------
+
+    @Test
+    fun sevenGramsIsNotARealSale() {
+        // The exact combination the ISSUE-022 trace auto-confirmed: 7 GRAM Jeera, ₹2.80.
+        assertNotNull(
+            "7 GRAM must be rejected as a plausible retail quantity",
+            SalePlausibility.reason("GRAM", 7.0, 2.80)
+        )
+    }
+
+    @Test
+    fun ordinaryKiranaSalesStayPlausible() {
+        assertNull(SalePlausibility.reason("KG", 5.0, 250.0))
+        assertNull(SalePlausibility.reason("GRAM", 500.0, 120.0))
+        assertNull(SalePlausibility.reason("PACKET", 2.0, 40.0))
+        assertNull(SalePlausibility.reason("LITRE", 1.0, 60.0))
+    }
+
+    @Test
+    fun absurdQuantitiesAndTinyValuesAreRejected() {
+        assertNotNull(SalePlausibility.reason("KG", 5000.0, 100000.0))
+        assertNotNull(SalePlausibility.reason("ML", 3.0, 50.0))
+        assertNotNull("a sub-₹5 sale must not auto-confirm", SalePlausibility.reason("KG", 1.0, 2.0))
+        assertNotNull(SalePlausibility.reason("KG", 0.0, 0.0))
+    }
+
+    @Test
+    fun fusedKiloAmchoorIsRecoveredFromTheSarvamReading() {
+        // Sarvam heard "सात गुलामचूर" — "kilo am-choor" fused into one token. With अमचूर
+        // in the vocabulary the split किलो + अमचूर is now available to the lattice.
+        val result = segmenter.segmentTranscript("सात गुलामचूर")
+        assertEquals(1, result.segments.size)
+        assertTrue(
+            "expected अमचूर to be recovered from the fused token, got ${result.segments[0].itemTokens}",
+            result.segments[0].itemTokens.any { PhoneticKey.of(it) == PhoneticKey.of("अमचूर") }
+        )
     }
 }
