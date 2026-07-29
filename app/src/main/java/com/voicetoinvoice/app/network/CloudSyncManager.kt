@@ -82,6 +82,20 @@ class CloudSyncManager(
                 put("source", transaction.source.name)
                 put("device_id", transaction.deviceId)
                 put("raw_transcript", transaction.rawTranscript)
+                // Without line_no the column defaults to 0 server-side, which collides
+                // with the unique (job_id, line_no) index whenever this transaction is
+                // NOT the job's first line (e.g. the shopkeeper manually confirms line 2
+                // of a 3-item recording) -- the sync would be silently rejected. See ISSUE-029.
+                put("line_no", transaction.lineNo)
+                // Correction signal for the server-side Learned Parse Memory (ISSUE-031) --
+                // a trigger on Supabase's transactions table demotes any memoized parse
+                // this job_id contributed to the moment voided flips to true.
+                put("voided", transaction.voided)
+                if (transaction.voidedAtMs != null) {
+                    put("voided_at", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
+                        it.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                    }.format(java.util.Date(transaction.voidedAtMs)))
+                }
                 if (!transaction.jobId.isNull_or_empty()) put("job_id", transaction.jobId)
                 if (!transaction.audioCloudUrl.isNull_or_empty()) {
                     put("audio_cloud_url", transaction.audioCloudUrl)
@@ -355,6 +369,101 @@ class CloudSyncManager(
             os.flush()
         }
         return connection.responseCode
+    }
+
+    /**
+     * Fetches the shop's active catalog FROM Supabase — the only server→client read path in
+     * the app.
+     *
+     * Everything else here is push-only (see `SyncEngine`): the cloud is a mirror, not a
+     * second source of truth. This one exception exists because two server-side code paths
+     * write `catalog_items` directly and the phone had no way to ever learn about them:
+     *
+     *  1. Catalog-Learning-From-History (ISSUE-033) auto-adds a recurring unmatched item at
+     *     price 0, so the item stops being "unknown" — but only server-side. Without this
+     *     pull, the phone kept treating it as unknown forever, which defeats the feature.
+     *  2. A spoken RATE_UPDATE applies `catalog_items.price` server-side (ISSUE-026). The
+     *     phone's local price silently stayed stale — a pre-existing bug this also fixes.
+     *
+     * Returns null on any failure (offline, HTTP error, malformed body) so the caller can
+     * distinguish "fetch failed, change nothing" from "server genuinely has zero items" —
+     * conflating those would let a transient network error look like an empty catalog.
+     */
+    suspend fun fetchCatalogFromCloud(): List<CatalogItem>? = withContext(Dispatchers.IO) {
+        try {
+            val url = URL("$supabaseUrl/rest/v1/catalog_items?active=eq.true&select=id,name,unit_id,price,active,updated_at")
+            val connection = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 15000
+                readTimeout = 15000
+                setRequestProperty("Authorization", "Bearer $anonKey")
+                setRequestProperty("apikey", anonKey)
+                setRequestProperty("Accept", "application/json")
+            }
+
+            val code = connection.responseCode
+            if (code !in 200..299) {
+                Log.w(TAG, "❌ Catalog pull HTTP $code")
+                return@withContext null
+            }
+
+            val body = connection.inputStream.bufferedReader().use { it.readText() }
+            val arr = org.json.JSONArray(body)
+            val out = ArrayList<CatalogItem>(arr.length())
+            for (i in 0 until arr.length()) {
+                val row = arr.optJSONObject(i) ?: continue
+                val id = row.optString("id", "")
+                val name = row.optString("name", "")
+                if (id.isBlank() || name.isBlank()) continue
+                out.add(
+                    CatalogItem(
+                        id = id,
+                        name = name,
+                        unitId = row.optString("unit_id", "KG").ifBlank { "KG" },
+                        price = row.optDouble("price", 0.0),
+                        active = row.optBoolean("active", true),
+                        updatedAt = parseIsoTimestamp(row.optString("updated_at", "")),
+                        // Straight from the server, so by definition already in sync —
+                        // marking it unsynced would bounce it right back on the next push.
+                        synced = true
+                    )
+                )
+            }
+            Log.i(TAG, "⬇️ Pulled ${out.size} catalog item(s) from Supabase")
+            out
+        } catch (e: Exception) {
+            Log.w(TAG, "Catalog pull failed (offline or error): ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Parses PostgREST's `timestamptz` rendering to epoch millis, falling back to 0 rather
+     * than to "now" — a row whose timestamp we cannot read must never win a
+     * last-write-wins comparison against a local edit it might actually be older than.
+     */
+    private fun parseIsoTimestamp(raw: String): Long {
+        if (raw.isBlank()) return 0L
+        // Postgres emits a variable number of fractional-second digits and either a "Z" or
+        // a "+00:00" offset, so try the realistic shapes rather than assuming one.
+        val patterns = listOf(
+            "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+            "yyyy-MM-dd'T'HH:mm:ssXXX",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS",
+            "yyyy-MM-dd'T'HH:mm:ss"
+        )
+        for (p in patterns) {
+            try {
+                val sdf = java.text.SimpleDateFormat(p, java.util.Locale.US).apply {
+                    timeZone = java.util.TimeZone.getTimeZone("UTC")
+                }
+                return sdf.parse(raw)?.time ?: continue
+            } catch (_: Exception) { /* try the next shape */ }
+        }
+        Log.w(TAG, "Unparseable updated_at '$raw' — treating as epoch 0")
+        return 0L
     }
 
     private fun String?.isNull_or_empty(): Boolean = this == null || this.trim().isEmpty()

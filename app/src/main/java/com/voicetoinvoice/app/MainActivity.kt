@@ -23,6 +23,7 @@ import com.voicetoinvoice.app.ui.screens.settings.SettingsScreen
 import com.voicetoinvoice.app.ui.screens.stockin.StockInScreen
 import com.voicetoinvoice.app.ui.screens.summary.DailySummaryScreen
 import com.voicetoinvoice.app.ui.screens.udhaar.UdhaarScreen
+import com.voicetoinvoice.app.ui.theme.VoiceToInvoiceTheme
 import kotlinx.coroutines.launch
 import java.util.Calendar
 
@@ -52,7 +53,7 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            MaterialTheme {
+            VoiceToInvoiceTheme {
                 MainAppScreen(database)
             }
         }
@@ -291,6 +292,14 @@ fun MainAppScreen(database: AppDatabase) {
                                 syncEngine.syncAllUnsynced()
                             }
                         },
+                        onRemoveItem = { item ->
+                            scope.launch {
+                                // Soft delete — `transactions.itemId` still references this
+                                // row, so it is hidden rather than removed.
+                                database.catalogDao().deactivate(item.id)
+                                syncEngine.syncAllUnsynced()
+                            }
+                        },
                         onNavigateBack = { currentScreen = Screen.HOME }
                     )
                 }
@@ -331,6 +340,12 @@ fun MainAppScreen(database: AppDatabase) {
                                 val updatedTx = tx.copy(priceAtSale = newUnitPrice, total = newTotal, synced = false)
                                 database.transactionDao().insert(updatedTx)
                                 database.catalogDao().updatePrice(tx.itemId, newUnitPrice)
+                                syncEngine.syncAllUnsynced()
+                            }
+                        },
+                        onVoidTransaction = { tx ->
+                            scope.launch {
+                                database.transactionDao().voidTransaction(tx.id, System.currentTimeMillis())
                                 syncEngine.syncAllUnsynced()
                             }
                         },

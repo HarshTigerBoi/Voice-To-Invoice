@@ -52,6 +52,7 @@ class SttProxyClient(
         jobId: String = UUID.randomUUID().toString(),
         shopId: String? = null,
         onDeviceTranscript: String = "",
+        onDeviceStatus: String = "",
         previousJobId: String? = null,
         precedingGapMs: Long = -1L
     ): SttResult = withContext(Dispatchers.IO) {
@@ -102,6 +103,10 @@ class SttProxyClient(
 
                 if (onDeviceTranscript.isNotBlank()) {
                     writeField("onDeviceTranscript", onDeviceTranscript)
+                }
+
+                if (onDeviceStatus.isNotBlank()) {
+                    writeField("onDeviceStatus", onDeviceStatus)
                 }
 
                 previousJobId?.let { writeField("previousJobId", it) }

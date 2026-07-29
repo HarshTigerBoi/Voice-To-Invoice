@@ -65,6 +65,15 @@ private const val PRE_ROLL_MS = 300L
 /** Audio captured after release, to recover trailing phonemes. */
 private const val POST_ROLL_MS = 300L
 
+/** Pre-roll budget reserved for the next recording so post-roll never clips quantity words. */
+private const val PREROLL_RESERVE_MS = 200L
+
+/** RollingAudioBuffer holds 30s of PCM; a hold approaching that silently starts losing
+ *  its OWN leading audio (minStartAllowed = totalWritten - bufferCapacity truncates the
+ *  window front with no error). Warn before that happens instead of silently booking a
+ *  wrong/incomplete order for a long multi-item recitation. */
+private const val LONG_HOLD_WARNING_MS = 25000L
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
@@ -96,8 +105,9 @@ fun HomeScreen(
         }
     }
 
-    // BUG-1 Fix: Inject the SAME active RollingAudioBuffer instance into BackgroundSttProcessor
-    val backgroundProcessor = remember { BackgroundSttProcessor(context, scope, rollingAudioBuffer) }
+    // Enqueues QUEUED jobs onto WorkManager/SttWorker -- the actual parse pipeline is
+    // server-side (process-voice-job), so this no longer needs the RollingAudioBuffer.
+    val backgroundProcessor = remember { BackgroundSttProcessor(context, scope) }
 
     // Auto-cleanup any jobs that got stuck in processing from a previous interrupted session
     LaunchedEffect(Unit) {
@@ -107,6 +117,13 @@ fun HomeScreen(
 
     // Collect pending parsed jobs asynchronously
     val pendingJobs by db.sttJobDao().getParsedJobsFlow().collectAsState(initial = emptyList())
+    // Count PENDING LINES, not jobs -- a single multi-item recording can have 3 lines
+    // where 2 already booked and 1 needs review; the pill should say "1", not "1 job".
+    val pendingLineCount = remember(pendingJobs) {
+        pendingJobs.sumOf { job ->
+            com.voicetoinvoice.app.ui.components.parsePendingLines(job).count { !it.committed && !it.resolved }
+        }
+    }
 
     var isRecording by remember { mutableStateOf(false) }
     var activeParsedSale by remember { mutableStateOf<ParsedVoiceSale?>(null) }
@@ -258,6 +275,14 @@ fun HomeScreen(
                                         val releaseTimestamp = System.currentTimeMillis()
                                         val holdDurationMs = Math.max(releaseTimestamp - pressTimestamp, 100L)
 
+                                        if (holdDurationMs >= LONG_HOLD_WARNING_MS) {
+                                            Toast.makeText(
+                                                context,
+                                                "बहुत लंबी रिकॉर्डिंग — कृपया थोड़े आइटम एक बार में बोलें",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+
                                         try {
                                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                         } catch (e: Exception) {
@@ -277,7 +302,9 @@ fun HomeScreen(
                                             val nextPress = pttWindowLedger.nextPressAfter(releaseTs)
                                             val clampedStartMs = Math.max(pressTs - PRE_ROLL_MS, lastEnd)
                                             val rawEndMs = releaseTs + POST_ROLL_MS
-                                            val clampedEndMs = if (nextPress != null) Math.min(rawEndMs, nextPress) else rawEndMs
+                                            val clampedEndMs = if (nextPress != null) {
+                                                Math.max(releaseTs, Math.min(rawEndMs, nextPress - PREROLL_RESERVE_MS))
+                                            } else rawEndMs
 
                                             val lastJob = db.sttJobDao().getLatestJob()
                                             val prevId = lastJob?.id
@@ -309,11 +336,14 @@ fun HomeScreen(
 
                                                 // Backfill on-device speech transcript asynchronously
                                                 scope.launch(Dispatchers.IO) {
-                                                    val text = onDeviceRecognizer.awaitTranscript(4000L)
-                                                    if (text.isNotBlank()) {
-                                                        db.sttJobDao().getJobById(job.id)?.let { currentJob ->
-                                                            db.sttJobDao().updateJob(currentJob.copy(onDeviceTranscript = text))
-                                                        }
+                                                    val res = onDeviceRecognizer.awaitResult(4000L)
+                                                    db.sttJobDao().getJobById(job.id)?.let { currentJob ->
+                                                        db.sttJobDao().updateJob(
+                                                            currentJob.copy(
+                                                                onDeviceTranscript = res.transcript,
+                                                                onDeviceStatus = res.status
+                                                            )
+                                                        )
                                                     }
                                                 }
 
@@ -385,7 +415,7 @@ fun HomeScreen(
 
             // Floating Pending Sales Pill Badge
             PendingConfirmationsBar(
-                pendingCount = pendingJobs.size,
+                pendingCount = pendingLineCount,
                 onClick = { showPendingSheet = true },
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -398,72 +428,104 @@ fun HomeScreen(
     if (showPendingSheet) {
         PendingConfirmationsSheet(
             pendingJobs = pendingJobs,
-            onConfirmJob = { job ->
-                val matched = catalog.find { it.id == job.parsedItemId || it.name.equals(job.parsedItemName, ignoreCase = true) }
-                val item = matched ?: CatalogItem(name = job.parsedItemName, unitId = job.parsedUnit, price = if (job.parsedQty > 0) job.parsedTotal / job.parsedQty else 0.0)
+            catalog = catalog,
+            onConfirmLine = { job, line, isLastPendingLine, resolvedItemId, rate ->
+                // Resolution order (ISSUE-030): trust an explicit catalog pick first: fall
+                // back to a case-insensitive name lookup before ever creating a new row --
+                // blind-inserting on every confirm is how the catalog accumulated
+                // duplicate rows (e.g. Aaloo x3 at two different prices) in the first
+                // place. Only create when genuinely nothing matches.
+                val byId = resolvedItemId?.let { id -> catalog.find { it.id == id } }
+                val byName = byId ?: catalog.find { it.name.equals(line.itemName, ignoreCase = true) }
+                val isNewItem = byName == null
+                val item = byName ?: CatalogItem(name = line.itemName, unitId = line.unit, price = rate)
+                val total = line.quantity * rate
 
                 scope.launch(Dispatchers.IO) {
-                    if (matched == null) {
-                        // Persist newly-recognized items so future sales of this item match
-                        // automatically instead of landing back in Pending Confirmations at ₹0 every time.
+                    if (isNewItem) {
                         db.catalogDao().insertOrUpdate(item)
+                    } else if (rate > 0.0 && rate != item.price) {
+                        // The shopkeeper corrected the rate while confirming -- teach the
+                        // catalog so this item doesn't need a rate every time.
+                        db.catalogDao().updatePrice(item.id, rate)
                     }
-
-                    // Rebuild step_6_final_outcome so the synced diagnostic trace reflects the
-                    // confirmed item/price instead of staying stuck at the original PARSED values.
-                    val traceObj = try { JSONObject(job.diagnosticTraceJson) } catch (_: Exception) { JSONObject() }
-                    traceObj.put("step_6_final_outcome", JSONArray().put(JSONObject().apply {
-                        put("itemName", item.name)
-                        put("matchedCatalogId", item.id)
-                        put("quantity", job.parsedQty)
-                        put("unit", job.parsedUnit)
-                        put("priceAtSale", if (job.parsedQty > 0) job.parsedTotal / job.parsedQty else item.price)
-                        put("estimatedTotal", job.parsedTotal)
-                        put("confidence", 1.0)
-                        put("isSanityFlagged", false)
-                        put("autoConfirmedToLedger", true)
-                        put("userResolved", true)
-                    }))
-
-                    val updatedJob = job.copy(
-                        status = com.voicetoinvoice.app.data.local.entity.SttJobStatus.CONFIRMED,
-                        parsedItemName = item.name,
-                        parsedQty = job.parsedQty,
-                        parsedUnit = job.parsedUnit,
-                        parsedTotal = job.parsedTotal,
-                        isSanityFlagged = false,
-                        diagnosticTraceJson = traceObj.toString(),
-                        synced = false
-                    )
-                    db.sttJobDao().updateJob(updatedJob)
 
                     val txRecord = com.voicetoinvoice.app.data.local.entity.TransactionRecord(
                         itemId = item.id,
                         itemName = item.name,
-                        quantity = job.parsedQty,
-                        priceAtSale = if (job.parsedQty > 0) job.parsedTotal / job.parsedQty else item.price,
-                        total = job.parsedTotal,
+                        quantity = line.quantity,
+                        priceAtSale = rate,
+                        total = total,
                         source = com.voicetoinvoice.app.data.local.entity.TransactionSource.VOICE,
                         rawTranscript = job.rawTranscript,
                         audioFilePath = job.audioFilePath,
                         jobId = job.id,
+                        lineNo = line.lineNo,
                         audioCloudUrl = "${com.voicetoinvoice.app.network.SupabaseConfig.SUPABASE_URL}/storage/v1/object/public/voice-recordings/${job.id}.wav",
                         synced = false
                     )
                     db.transactionDao().insert(txRecord)
 
+                    // Merge this line's outcome into the trace instead of overwriting the
+                    // whole array -- a multi-item job's other lines' outcomes must survive.
+                    val traceObj = try { JSONObject(job.diagnosticTraceJson) } catch (_: Exception) { JSONObject() }
+                    val outcomeArr = traceObj.optJSONArray("step_6_final_outcome") ?: JSONArray()
+                    val lineOutcome = JSONObject().apply {
+                        put("lineNo", line.lineNo)
+                        put("itemName", item.name)
+                        put("matchedCatalogId", item.id)
+                        put("quantity", line.quantity)
+                        put("unit", line.unit)
+                        put("priceAtSale", rate)
+                        put("estimatedTotal", total)
+                        put("confidence", 1.0)
+                        put("isSanityFlagged", false)
+                        put("autoConfirmedToLedger", true)
+                        put("userResolved", true)
+                    }
+                    if (line.lineNo < outcomeArr.length()) outcomeArr.put(line.lineNo, lineOutcome) else outcomeArr.put(lineOutcome)
+                    traceObj.put("step_6_final_outcome", outcomeArr)
+
+                    val updatedItemsJson = com.voicetoinvoice.app.ui.components.markLineResolved(job, line.lineNo)
+                    val updatedJob = if (isLastPendingLine) {
+                        job.copy(
+                            status = com.voicetoinvoice.app.data.local.entity.SttJobStatus.CONFIRMED,
+                            parsedItemName = if (line.lineNo == 0) item.name else job.parsedItemName,
+                            parsedQty = if (line.lineNo == 0) line.quantity else job.parsedQty,
+                            parsedUnit = if (line.lineNo == 0) line.unit else job.parsedUnit,
+                            parsedTotal = if (line.lineNo == 0) total else job.parsedTotal,
+                            isSanityFlagged = false,
+                            diagnosticTraceJson = traceObj.toString(),
+                            parsedItemsJson = updatedItemsJson,
+                            synced = false
+                        )
+                    } else {
+                        job.copy(
+                            diagnosticTraceJson = traceObj.toString(),
+                            parsedItemsJson = updatedItemsJson,
+                            synced = false
+                        )
+                    }
+                    db.sttJobDao().updateJob(updatedJob)
+
                     val syncEngine = com.voicetoinvoice.app.data.sync.SyncEngine(db.transactionDao(), db.stockInDao(), db.catalogDao(), db.creditDao(), db.sttJobDao(), db.supplierDao())
                     syncEngine.syncAllUnsynced()
                 }
             },
-            onDiscardJob = { job ->
+            onDiscardLine = { job, line, isLastPendingLine ->
                 scope.launch(Dispatchers.IO) {
-                    val discardedJob = job.copy(
-                        status = com.voicetoinvoice.app.data.local.entity.SttJobStatus.FAILED,
-                        errorMessage = "Discarded by User",
-                        synced = false
-                    )
-                    db.sttJobDao().updateJob(discardedJob)
+                    val updatedItemsJson = com.voicetoinvoice.app.ui.components.markLineResolved(job, line.lineNo)
+                    val updatedJob = if (isLastPendingLine) {
+                        job.copy(
+                            status = com.voicetoinvoice.app.data.local.entity.SttJobStatus.FAILED,
+                            errorMessage = "Discarded by User",
+                            parsedItemsJson = updatedItemsJson,
+                            synced = false
+                        )
+                    } else {
+                        job.copy(parsedItemsJson = updatedItemsJson, synced = false)
+                    }
+                    db.sttJobDao().updateJob(updatedJob)
 
                     val syncEngine = com.voicetoinvoice.app.data.sync.SyncEngine(db.transactionDao(), db.stockInDao(), db.catalogDao(), db.creditDao(), db.sttJobDao(), db.supplierDao())
                     syncEngine.syncAllUnsynced()

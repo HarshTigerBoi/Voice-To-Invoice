@@ -25,7 +25,7 @@ import kotlinx.coroutines.launch
         SttJobRecord::class,
         SupplierRecord::class
     ],
-    version = 11, // Bumped: Added onDeviceTranscript, previousJobId, precedingGapMs to stt_jobs in v11
+    version = 14, // Bumped: Added voided/voidedAtMs to transactions (correction signal for Learned Parse Memory, ISSUE-031)
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -202,6 +202,45 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        // V12: Added onDeviceStatus column to stt_jobs table
+        private val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("ALTER TABLE stt_jobs ADD COLUMN onDeviceStatus TEXT NOT NULL DEFAULT ''")
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+
+        // V13: Multi-item voice capture -- parsedItemsJson/lineCount on stt_jobs carry the
+        // full per-line breakdown of a recording, lineNo on transactions lets one job/
+        // recording produce more than one transaction row. See ISSUE-029.
+        private val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("ALTER TABLE stt_jobs ADD COLUMN parsedItemsJson TEXT NOT NULL DEFAULT ''")
+                    db.execSQL("ALTER TABLE stt_jobs ADD COLUMN lineCount INTEGER NOT NULL DEFAULT 0")
+                    db.execSQL("ALTER TABLE transactions ADD COLUMN lineNo INTEGER NOT NULL DEFAULT 0")
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+
+        // V14: Added voided/voidedAtMs to transactions -- the correction signal for the
+        // server-side Learned Parse Memory (ISSUE-031). Soft delete only.
+        private val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("ALTER TABLE transactions ADD COLUMN voided INTEGER NOT NULL DEFAULT 0")
+                    db.execSQL("ALTER TABLE transactions ADD COLUMN voidedAtMs INTEGER")
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildDatabase(context).also { INSTANCE = it }
@@ -214,7 +253,7 @@ abstract class AppDatabase : RoomDatabase() {
                 AppDatabase::class.java,
                 "voice_to_invoice_db"
             )
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14)
             .fallbackToDestructiveMigration()
             .addCallback(object : Callback() {
                 override fun onCreate(db: SupportSQLiteDatabase) {

@@ -80,10 +80,10 @@ class SttWorker(
             db.sttJobDao().updateJob(jobRecord.copy(status = SttJobStatus.TRANSCRIBING))
 
             // Re-read job record with bounded timeout to allow onDeviceTranscript backfill if pending
-            val updatedJob = kotlinx.coroutines.withTimeoutOrNull(1000L) {
+            val updatedJob = kotlinx.coroutines.withTimeoutOrNull(1800L) {
                 var current = db.sttJobDao().getJobById(jobId)
                 val start = System.currentTimeMillis()
-                while (current != null && current.onDeviceTranscript.isBlank() && System.currentTimeMillis() - start < 1000L) {
+                while (current != null && current.onDeviceStatus.isBlank() && System.currentTimeMillis() - start < 1800L) {
                     kotlinx.coroutines.delay(100L)
                     current = db.sttJobDao().getJobById(jobId)
                 }
@@ -141,6 +141,13 @@ class SttWorker(
                     writeString("$twoHyphens$boundary$lineEnd")
                     writeString("Content-Disposition: form-data; name=\"onDeviceTranscript\"$lineEnd$lineEnd")
                     writeString("${updatedJob.onDeviceTranscript}$lineEnd")
+                }
+
+                // Field 3.65: onDeviceStatus
+                if (updatedJob.onDeviceStatus.isNotBlank()) {
+                    writeString("$twoHyphens$boundary$lineEnd")
+                    writeString("Content-Disposition: form-data; name=\"onDeviceStatus\"$lineEnd$lineEnd")
+                    writeString("${updatedJob.onDeviceStatus}$lineEnd")
                 }
 
                 // Field 3.7: previousJobId
@@ -225,13 +232,22 @@ class SttWorker(
                                             } catch (_: Exception) {}
                                         }
 
-                                        // Fallback if step_4_grok_ai_interpretation was empty but row has parsed columns
+                                        // Fallback if step_4_grok_ai_interpretation was empty but row has parsed columns.
+                                        // This only carries the line-0 summary columns, not per-item
+                                        // confidence/price_intent, so confidence/price_at_sale are
+                                        // synthesized to make the per-line commit gate below agree with
+                                        // the server's own already-resolved `statusStr` for this one line.
                                         if (parsedItems.length() == 0 && row.has("parsed_item_name")) {
+                                            val fallbackQty = row.optDouble("parsed_qty", 1.0)
+                                            val fallbackTotal = row.optDouble("parsed_total", 0.0)
                                             val singleItem = JSONObject().apply {
                                                 put("item_name", row.optString("parsed_item_name", "Unrecognized Item"))
-                                                put("quantity", row.optDouble("parsed_qty", 1.0))
+                                                put("quantity", fallbackQty)
                                                 put("unit", row.optString("parsed_unit", "PACKET"))
-                                                put("price", row.optDouble("parsed_total", 0.0))
+                                                put("price_at_sale", if (fallbackQty > 0) fallbackTotal / fallbackQty else fallbackTotal)
+                                                put("total", fallbackTotal)
+                                                put("price_intent", "NONE")
+                                                put("confidence", if (statusStr == "AUTO_CONFIRMED") 1.0 else 0.0)
                                             }
                                             parsedItems = JSONArray().put(singleItem)
                                         }
@@ -263,52 +279,105 @@ class SttWorker(
                     } catch (_: Exception) {}
                 }
 
-                val isAutoConfirmed = statusStr == "AUTO_CONFIRMED"
+                val audioCloudUrl = "${SupabaseConfig.SUPABASE_URL}/storage/v1/object/public/voice-recordings/$jobId.wav"
+                val lineCount = parsedItems.length()
 
-                // Save transactions locally to Room DB ONLY if auto-confirmed (confidence >= 0.80)
-                if (isAutoConfirmed) {
-                    for (i in 0 until parsedItems.length()) {
-                        val itemObj = parsedItems.getJSONObject(i)
-                        val itemName = itemObj.optString("item_name", "Unrecognized Item")
-                        val qty = itemObj.optDouble("quantity", 1.0)
-                        val unit = itemObj.optString("unit", "PACKET")
-                        val price = itemObj.optDouble("price_at_sale", itemObj.optDouble("price", 0.0))
+                // Per-line commit (ISSUE-029): mirror the server's isCommittable /
+                // isValidRateUpdate predicates exactly (process-voice-job/index.ts) so a
+                // job the server marked PARTIALLY_CONFIRMED books its confident lines
+                // and routes only the weak ones to review, instead of the old
+                // all-or-nothing `isAutoConfirmed` switch that either wrote every line
+                // (overriding sale prices with the catalog's standing price -- destroying
+                // every BULK_SALE_TOTAL) or dropped every line into one generic review row.
+                for (i in 0 until lineCount) {
+                    val itemObj = parsedItems.getJSONObject(i)
+                    val itemName = itemObj.optString("item_name", "Unrecognized Item")
+                    val qty = itemObj.optDouble("quantity", 1.0)
+                    val unit = itemObj.optString("unit", "PACKET")
+                    val priceAtSale = itemObj.optDouble("price_at_sale", 0.0)
+                    val total = itemObj.optDouble("total", 0.0)
+                    val priceIntent = itemObj.optString("price_intent", "NONE")
+                    val confidence = itemObj.optDouble("confidence", 0.0)
+                    // org.json quirk: optString() on a JSON `null` value (key present,
+                    // value null -- both item_id and implausibility_reason are frequently
+                    // JSON null) returns the literal string "null", not the fallback --
+                    // isNull() must be checked first or a rate update could be attempted
+                    // against a literal "null" catalog id.
+                    val itemId = if (itemObj.isNull("item_id")) null else itemObj.optString("item_id", "").ifBlank { null }
+                    val implausibilityReason = if (itemObj.isNull("implausibility_reason")) null else itemObj.optString("implausibility_reason", "").ifBlank { null }
 
-                        val matchedCatalog = catalog.find { it.name.equals(itemName, ignoreCase = true) }
+                    val isValidRateUpdate = priceIntent == "RATE_UPDATE" &&
+                        itemId != null && confidence >= 0.80 && priceAtSale > 0.0 && implausibilityReason == null
+                    val isCommittableSale = priceIntent != "RATE_UPDATE" &&
+                        confidence >= 0.80 && priceAtSale > 0.0 && total > 0.0 &&
+                        itemName.isNotBlank() && itemName != "Unrecognized Item" && implausibilityReason == null
 
-                        val txRecord = TransactionRecord(
-                            itemId = matchedCatalog?.id ?: "unlisted-$jobId",
-                            itemName = matchedCatalog?.name ?: itemName,
-                            quantity = qty,
-                            priceAtSale = matchedCatalog?.price ?: price,
-                            total = qty * (matchedCatalog?.price ?: price),
-                            paymentMode = PaymentMode.CASH,
-                            source = TransactionSource.VOICE,
-                            rawTranscript = rawTranscript,
-                            audioFilePath = audioPath,
-                            jobId = jobId,
-                            audioCloudUrl = "${SupabaseConfig.SUPABASE_URL}/storage/v1/object/public/voice-recordings/$jobId.wav"
-                        )
-                        db.transactionDao().insert(txRecord)
-                        cloudSyncManager.syncTransactionToCloud(txRecord)
+                    when {
+                        isValidRateUpdate -> {
+                            db.catalogDao().updatePrice(itemId, priceAtSale)
+                        }
+                        isCommittableSale -> {
+                            val matchedCatalog = catalog.find { it.id == itemId } ?: catalog.find { it.name.equals(itemName, ignoreCase = true) }
+                            // Trust the server's own price/total verbatim -- it already
+                            // resolved RATE_UPDATE/BULK_SALE_TOTAL math per line. Overriding
+                            // with the catalog's standing price here (the old behavior)
+                            // silently destroyed every bulk-total sale.
+                            val txRecord = TransactionRecord(
+                                itemId = matchedCatalog?.id ?: itemId ?: "unlisted-$jobId",
+                                itemName = matchedCatalog?.name ?: itemName,
+                                quantity = qty,
+                                priceAtSale = priceAtSale,
+                                total = total,
+                                paymentMode = PaymentMode.CASH,
+                                source = TransactionSource.VOICE,
+                                rawTranscript = rawTranscript,
+                                audioFilePath = audioPath,
+                                jobId = jobId,
+                                lineNo = i,
+                                audioCloudUrl = audioCloudUrl
+                            )
+                            db.transactionDao().insert(txRecord)
+                            cloudSyncManager.syncTransactionToCloud(txRecord)
+                        }
+                        else -> {
+                            val unmatchedItem = com.voicetoinvoice.app.data.local.entity.UnmatchedQueueItem(
+                                id = "$jobId#$i",
+                                shopId = SupabaseConfig.getNullSafeShopId(null),
+                                audioRef = audioCloudUrl,
+                                rawTranscript = rawTranscript,
+                                status = com.voicetoinvoice.app.data.local.entity.UnmatchedStatus.PENDING,
+                                timestamp = System.currentTimeMillis()
+                            )
+                            db.unmatchedQueueDao().insert(unmatchedItem)
+                            cloudSyncManager.syncReviewItemToCloud(unmatchedItem)
+                        }
                     }
-                } else {
-                    // Insert into local Room unmatched_queue table so PARSED items appear in Unmatched Queue UI
+                }
+
+                if (lineCount == 0) {
+                    // Nothing parsed at all -- still keep a review record instead of
+                    // silently losing the recording.
                     val unmatchedItem = com.voicetoinvoice.app.data.local.entity.UnmatchedQueueItem(
-                        id = jobId,
+                        id = "$jobId#0",
                         shopId = SupabaseConfig.getNullSafeShopId(null),
-                        audioRef = "${SupabaseConfig.SUPABASE_URL}/storage/v1/object/public/voice-recordings/$jobId.wav",
+                        audioRef = audioCloudUrl,
                         rawTranscript = rawTranscript,
                         status = com.voicetoinvoice.app.data.local.entity.UnmatchedStatus.PENDING,
                         timestamp = System.currentTimeMillis()
                     )
                     db.unmatchedQueueDao().insert(unmatchedItem)
                     cloudSyncManager.syncReviewItemToCloud(unmatchedItem)
-                    Log.d(TAG, "Inserted pending review item into local unmatched_queue for job $jobId")
                 }
 
-                val firstItem = if (parsedItems.length() > 0) parsedItems.getJSONObject(0) else null
-                val updatedStatus = if (isAutoConfirmed) SttJobStatus.AUTO_CONFIRMED else SttJobStatus.PARSED
+                Log.d(TAG, "Job $jobId processed $lineCount line(s), status=$statusStr")
+
+                val firstItem = if (lineCount > 0) parsedItems.getJSONObject(0) else null
+                val updatedStatus = when (statusStr) {
+                    "AUTO_CONFIRMED" -> SttJobStatus.AUTO_CONFIRMED
+                    "PARTIALLY_CONFIRMED" -> SttJobStatus.PARTIALLY_CONFIRMED
+                    "RATE_UPDATED" -> SttJobStatus.RATE_UPDATED
+                    else -> SttJobStatus.PARSED
+                }
 
                 db.sttJobDao().updateJob(
                     jobRecord.copy(
@@ -317,9 +386,11 @@ class SttWorker(
                         parsedItemName = firstItem?.optString("item_name") ?: "Unrecognized Item",
                         parsedQty = firstItem?.optDouble("quantity") ?: 1.0,
                         parsedUnit = firstItem?.optString("unit") ?: "PACKET",
-                        parsedTotal = firstItem?.optDouble("price_at_sale") ?: firstItem?.optDouble("price") ?: 0.0,
-                        isSanityFlagged = !isAutoConfirmed,
+                        parsedTotal = firstItem?.optDouble("total") ?: 0.0,
+                        isSanityFlagged = updatedStatus != SttJobStatus.AUTO_CONFIRMED && updatedStatus != SttJobStatus.RATE_UPDATED,
                         diagnosticTraceJson = traceJson,
+                        parsedItemsJson = parsedItems.toString(),
+                        lineCount = lineCount,
                         synced = true
                     )
                 )

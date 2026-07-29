@@ -168,6 +168,8 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
         SttJobStatus.AUTO_CONFIRMED -> "AUTO-CONFIRMED" to Color(0xFF2E7D32)
         SttJobStatus.CONFIRMED -> "CONFIRMED" to Color(0xFF2E7D32)
         SttJobStatus.PARSED -> if (log.isSanityFlagged) "REVIEW NEEDED" to Color(0xFFEF6C00) else "PARSED" to Color(0xFF0288D1)
+        SttJobStatus.PARTIALLY_CONFIRMED -> "PARTIALLY CONFIRMED" to Color(0xFFEF6C00)
+        SttJobStatus.RATE_UPDATED -> "RATE UPDATED" to Color(0xFF2E7D32)
         SttJobStatus.FAILED -> "FAILED" to Color(0xFFC62828)
         SttJobStatus.TRANSCRIBING -> "PROCESSING" to Color(0xFF1565C0)
         SttJobStatus.QUEUED -> "QUEUED" to Color(0xFF616161)

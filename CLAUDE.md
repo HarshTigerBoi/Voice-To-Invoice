@@ -44,6 +44,12 @@ Instrumented tests (require a connected device/emulator):
 
 There is no lint/detekt/ktlint config in this repo — just AGP's default `./gradlew lint` if needed.
 
+**After every `assembleDebug` (or any build producing a new debug APK), copy the built APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs`** — this is a standing requirement, not optional. Name it `VoiceToInvoice_v<N>.apk`, incrementing `<N>` from the highest version already in that folder (currently up to `v79` — always `ls` the folder to check rather than trusting this number, it drifts). The built artifact lives at `app/build/outputs/apk/debug/app-debug.apk`; copy (don't move) it, e.g.:
+
+```bash
+cp app/build/outputs/apk/debug/app-debug.apk "C:/Users/harsh/OneDrive/Desktop/VoiceToInvoice_APKs/VoiceToInvoice_v80.apk"
+```
+
 ### Supabase Edge Functions
 
 Functions live in `supabase/functions/*/index.ts` (Deno). Deploy with the Supabase CLI:
@@ -100,6 +106,8 @@ Single-Activity Compose app (`MainActivity.kt`) with a hand-rolled `enum class S
 
 ## Known repo quirks
 
+- **`:app:kspDebugKotlin` intermittently fails** with `java.io.IOException: Could not delete '...\app\build\generated\ksp\debug\java\com'`. The repo lives under a OneDrive-synced `Documents` folder and the sync client (or Defender) holds a transient lock on KSP's output directory. It is not a code error — clear it with `./gradlew --stop`, delete `app/build/generated/ksp`, then rebuild. Expect to hit this every few builds.
+
 - `app/src/androidTest/java/com/example/voicetoinvoice/ui/main/MainScreenTest.kt` is leftover template boilerplate under the stale `com.example.voicetoinvoice` package (the real app package is `com.voicetoinvoice.app`) and references a `MainScreen` composable that doesn't exist in this codebase — it will not compile as part of a real test run.
 - The client's `SttProxyClient` posts to `SupabaseConfig.STT_PROXY_ENDPOINT`, which actually points at the `process-voice-job` function, not the older `stt-proxy` function (which still exists in `supabase/functions/stt-proxy/` but appears superseded — see `implementation_plan.md`).
 
@@ -116,3 +124,9 @@ Whenever you diagnose and fix a real bug (behavior-affecting — not a typo or p
 4. If you change a source-of-truth constant (confidence thresholds, model names, DB schema, line-number references cited elsewhere in the doc), also update the relevant row in "Ground-Truth Source-Code Verified Constants" (§1) so it doesn't silently drift out of date.
 
 Do this before ending the turn, not "later." Also: when the user has approved a commit, reference the issue number in the commit message (e.g. `Fix ISSUE-011: segmenter vocab gap...`) so `git log` independently corroborates the audit log — the log and git history should never diverge.
+
+## Supabase Edge Function deploys — never ask, always deploy
+
+The user has given standing authorization: once a change to any `supabase/functions/*/index.ts` (or its supporting files) is verified — tests pass, the diff has been checked — deploy it immediately with `npx supabase functions deploy <function-name> --project-ref <ref>`. Do not stop to ask "should I deploy this?" or "want me to go ahead?" — just deploy, then report what was deployed and how it was verified.
+
+This authorization covers the deploy action itself, not a license to skip verification first — still confirm tests pass and the source is sane before pushing it live. After deploying, re-fetch the live bundle (`get_edge_function` or equivalent) and grep for a few expected markers to confirm the deploy actually carried the intended changes — this project has a history of placeholder/incomplete deploys silently going live.

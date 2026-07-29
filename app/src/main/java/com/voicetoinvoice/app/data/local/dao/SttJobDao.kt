@@ -26,10 +26,13 @@ interface SttJobDao {
     @Query("UPDATE stt_jobs SET status = 'PARSED', rawTranscript = 'Voice Recording (Server Timeout)', errorMessage = 'Server Timeout', isSanityFlagged = 1 WHERE status IN ('QUEUED', 'TRANSCRIBING') AND recordedAtMs < :thresholdMs")
     suspend fun markStuckJobsAsFailed(thresholdMs: Long)
 
-    @Query("SELECT * FROM stt_jobs WHERE status = 'PARSED' ORDER BY recordedAtMs DESC")
+    // PARTIALLY_CONFIRMED jobs (multi-item capture -- ISSUE-029) still have pending
+    // lines needing review even though some of their lines already booked, so they
+    // belong in the same review queue as PARSED jobs.
+    @Query("SELECT * FROM stt_jobs WHERE status IN ('PARSED', 'PARTIALLY_CONFIRMED') ORDER BY recordedAtMs DESC")
     fun getParsedJobsFlow(): Flow<List<SttJobRecord>>
 
-    @Query("SELECT COUNT(*) FROM stt_jobs WHERE status = 'PARSED'")
+    @Query("SELECT COUNT(*) FROM stt_jobs WHERE status IN ('PARSED', 'PARTIALLY_CONFIRMED')")
     fun getParsedJobsCountFlow(): Flow<Int>
 
     // End-to-End Processing Trace Log Queries
@@ -48,7 +51,7 @@ interface SttJobDao {
     @Query("DELETE FROM stt_jobs")
     suspend fun clearAllJobsLogs()
 
-    @Query("SELECT * FROM stt_jobs WHERE synced = 0 AND status IN ('CONFIRMED', 'AUTO_CONFIRMED', 'PARSED', 'FAILED')")
+    @Query("SELECT * FROM stt_jobs WHERE synced = 0 AND status IN ('CONFIRMED', 'AUTO_CONFIRMED', 'PARSED', 'FAILED', 'PARTIALLY_CONFIRMED', 'RATE_UPDATED')")
     suspend fun getUnsyncedJobs(): List<SttJobRecord>
 
     @Query("UPDATE stt_jobs SET synced = 1 WHERE id IN (:ids)")

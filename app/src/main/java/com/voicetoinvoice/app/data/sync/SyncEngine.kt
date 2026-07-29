@@ -36,10 +36,84 @@ class SyncEngine(
             count += syncUnsyncedCredits()
             count += syncUnsyncedSuppliers()
             count += syncUnsyncedStockIn()
+            // Pull LAST, so local edits have already been pushed and the server copy we
+            // merge against includes them. Pulling first would compare local changes
+            // against a server state that predates them and look like a spurious conflict.
+            count += pullCatalogFromCloud()
         } catch (e: Exception) {
             Log.w(TAG, "Error during full sync sweep: ${e.message}")
         }
         count
+    }
+
+    /**
+     * Merges the server's catalog into the local Room copy — the app's only server→client
+     * read path. See `CloudSyncManager.fetchCatalogFromCloud` for why it exists at all.
+     *
+     * The merge is deliberately conservative, because the local DB is the source of truth
+     * for everything the shopkeeper typed:
+     *
+     *  - A local row with `synced = false` is NEVER overwritten. That row is a pending local
+     *    edit that has not reached the server yet, so the server's copy is by definition
+     *    stale; clobbering it would silently discard a price the shopkeeper just set.
+     *  - Otherwise last-write-wins on `updatedAt`, so a server-side rate update lands but an
+     *    older server row can't resurrect a value the phone already moved past.
+     *  - A server row whose id is unknown locally is INSERTED — this is the case that makes
+     *    ISSUE-033's auto-added items actually reach the phone.
+     *  - A server row is skipped if some other local row already carries the same name. The
+     *    two sides allocate their own UUIDs, so matching on id alone would let the same item
+     *    appear twice in the picker under two different ids.
+     *  - Nothing is ever deleted locally. A row missing from the server is treated as "not
+     *    yet pushed", not as "deleted remotely" — there is no tombstone mechanism that could
+     *    tell those apart, and guessing wrong destroys data.
+     */
+    suspend fun pullCatalogFromCloud(): Int = withContext(Dispatchers.IO) {
+        val remote = cloudSyncManager.fetchCatalogFromCloud() ?: return@withContext 0
+        if (remote.isEmpty()) return@withContext 0
+
+        val local = catalogDao.getAllCatalogList()
+        val localById = local.associateBy { it.id }
+        val localIdsByName = local.groupBy { it.name.trim().lowercase() }
+
+        var applied = 0
+        for (remoteItem in remote) {
+            val existing = localById[remoteItem.id]
+
+            if (existing == null) {
+                // Guard against inserting a duplicate of an item the phone already knows
+                // under a locally-generated id.
+                val nameCollision = localIdsByName[remoteItem.name.trim().lowercase()]
+                if (!nameCollision.isNullOrEmpty()) continue
+
+                catalogDao.insertOrUpdate(remoteItem)
+                applied++
+                Log.i(TAG, "⬇️ Learned new catalog item from cloud: '${remoteItem.name}' (₹${remoteItem.price})")
+                continue
+            }
+
+            if (!existing.synced) continue
+            if (remoteItem.updatedAt <= existing.updatedAt) continue
+            if (remoteItem.price == existing.price &&
+                remoteItem.unitId == existing.unitId &&
+                remoteItem.active == existing.active
+            ) continue
+
+            catalogDao.insertOrUpdate(
+                existing.copy(
+                    name = remoteItem.name,
+                    unitId = remoteItem.unitId,
+                    price = remoteItem.price,
+                    active = remoteItem.active,
+                    updatedAt = remoteItem.updatedAt,
+                    synced = true
+                )
+            )
+            applied++
+            Log.i(TAG, "⬇️ Updated '${existing.name}' from cloud: ₹${existing.price} → ₹${remoteItem.price}")
+        }
+
+        if (applied > 0) Log.i(TAG, "Catalog pull merged $applied change(s) from Supabase")
+        applied
     }
 
     suspend fun syncUnsyncedTransactions(): Int = withContext(Dispatchers.IO) {

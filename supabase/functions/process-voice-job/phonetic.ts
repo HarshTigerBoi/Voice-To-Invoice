@@ -211,6 +211,66 @@ export const HINDI_NUMBER_MAP: Record<string, number> = {
   'ढाई': 2.5, 'dhai': 2.5,
 }
 
+/** Mirrors VoiceParser.kt's RUPEE_WORDS gate. A number is only ever a price when a
+ *  rupee word sits next to it -- everything else (a bare trailing number) stays a
+ *  quantity or falls through as an unattached carryover. Moved here (rather than
+ *  price_intent.ts) so the segmenter's lattice can recognize price runs directly
+ *  during segmentation instead of the whole-utterance post-hoc scan that used to
+ *  apply one price to every item in the utterance -- see ISSUE-029. */
+export const RUPEE_WORDS: Set<string> = new Set([
+  'rs', 'rs.', '₹',
+  'rupay', 'rupaye', 'rupaya', 'rupaiya', 'rupaiye',
+  'rupee', 'rupees',
+  'रुपये', 'रुपया', 'रुपए', 'रु', 'रूपये', 'रूपए',
+])
+
+export function parseHindiOrNumericValue(token: string): number | null {
+  if (!token) return null
+  const num = parseFloat(token)
+  if (!isNaN(num)) return num
+  const norm = token.toLowerCase()
+  if (HINDI_NUMBER_MAP[norm] !== undefined) return HINDI_NUMBER_MAP[norm]
+  return null
+}
+
+/**
+ * Evaluates a sequence of numeric/number-word tokens into a resolved compound number.
+ * Correctly resolves "दो सौ पचास" -> 250, "डेढ़ सौ" -> 150, "तीन सौ" -> 300, "100" -> 100.
+ */
+export function parseCompoundNumberSequence(tokens: string[]): number | null {
+  if (!tokens || tokens.length === 0) return null
+
+  let totalSum = 0
+  let currentGroup = 0
+  let hasValidToken = false
+
+  for (const t of tokens) {
+    const norm = t.toLowerCase()
+    const val = parseHindiOrNumericValue(norm)
+    if (val === null) continue
+
+    hasValidToken = true
+
+    if (norm === 'सौ' || norm === 'sau' || norm === 'hundred' || val === 100) {
+      if (currentGroup === 0) currentGroup = 1
+      totalSum += currentGroup * 100
+      currentGroup = 0
+    } else if (norm === 'हजार' || norm === 'hazaar' || norm === 'thousand' || val === 1000) {
+      if (currentGroup === 0) currentGroup = 1
+      totalSum += currentGroup * 1000
+      currentGroup = 0
+    } else if (val >= 100) {
+      totalSum += currentGroup + val
+      currentGroup = 0
+    } else {
+      currentGroup += val
+    }
+  }
+
+  totalSum += currentGroup
+  return hasValidToken ? totalSum : null
+}
+
 export const UNIT_SET: string[] = [
   'kilo', 'kilos', 'kg', 'kgs', 'किलो', 'किलोग्राम',
   'gram', 'grams', 'gm', 'gms', 'ग्राम', 'g',
@@ -313,6 +373,14 @@ export interface RawItemSegment {
   itemMatchNorm?: number | null
   itemMargin?: number | null
   top3Candidates?: CandidateRank[]
+  /** Price attached to THIS item's segment only (see ISSUE-029) -- null when no rupee
+   *  word/price run was found within the segment's own token span. */
+  spokenPrice?: number | null
+  rupeeWordPresent?: boolean
+  /** Whether a quantity was actually spoken before the item, vs defaulted to 1.0 --
+   *  the RATE_UPDATE / BULK_SALE_TOTAL discriminator needs the real answer, not the
+   *  post-default value. */
+  hasLeadingQty?: boolean
 }
 
 export interface SegmentResult {
@@ -543,6 +611,7 @@ function splitExpansions(raw: string, vocab: SegmenterVocabulary): Expansion[] {
 interface DecodedToken {
   type: TokenType
   rawToken: string
+  heardText: string
   numericValue?: number
   canonicalUnit?: string
   suspect?: boolean
@@ -652,17 +721,9 @@ function decode(tokens: string[], vocab: SegmenterVocabulary): { decoded: Decode
   return { decoded, minGap }
 }
 
-export interface RawItemSegment {
-  rawSegmentText: string
-  heardSegmentText?: string
-  quantity: number
-  unit: string
-  itemTokens: string[]
-  isSanityFlagged: boolean
-  itemMatchNorm: number | null
-  itemMargin?: number | null
-  top3Candidates?: CandidateRank[]
-}
+// (RawItemSegment is declared once, above — a second declaration here used to shadow-merge
+// with it under different optionality modifiers, which TypeScript reports as
+// TS2687/TS2717 on every build.)
 
 const LOW_CONFIDENCE_GAP_THRESHOLD = 0.15
 
@@ -684,6 +745,33 @@ export function segmentTranscript(
   const tokens = cleanText.split(/\s+/).filter(t => t.length > 0)
   const { decoded, minGap } = decode(tokens, vocab)
 
+  // Price-run precompute: a rupee word decodes as a generic ITEM (nothing in the
+  // number/unit/item vocab matches "रुपये"), so without this pass a mid-utterance
+  // price silently became its own bogus item segment -- "आलू 50 रुपये" produced
+  // TWO segments, {Aaloo} and {qty:50, item:"रुपये"} -- instead of one priced item.
+  // For every rupee-word token, walk backward through contiguous NUM tokens (the
+  // compound number run immediately before it, e.g. "दो सौ पचास"); if none, walk
+  // forward. Mirrors detectPriceIntent's backward-then-forward walk, but scoped per
+  // rupee word so a multi-item utterance can carry a different price per item.
+  const priceNumIndices = new Set<number>()
+  const rupeeIndices = new Set<number>()
+  const priceValueAtRupeeIndex = new Map<number, number | null>()
+  for (let i = 0; i < decoded.length; i++) {
+    const dt = decoded[i]
+    if (!RUPEE_WORDS.has((dt.rawToken || '').toLowerCase())) continue
+    rupeeIndices.add(i)
+    const runIdx: number[] = []
+    for (let j = i - 1; j >= 0 && decoded[j].type === 'NUM' && !rupeeIndices.has(j); j--) runIdx.unshift(j)
+    if (runIdx.length === 0) {
+      for (let j = i + 1; j < decoded.length && decoded[j].type === 'NUM'; j++) runIdx.push(j)
+    }
+    for (const j of runIdx) priceNumIndices.add(j)
+    priceValueAtRupeeIndex.set(
+      i,
+      runIdx.length > 0 ? parseCompoundNumberSequence(runIdx.map(j => decoded[j].rawToken)) : null
+    )
+  }
+
   let currentQty: number | null = pendingCarryoverQty
   let currentUnit: string | null = null
   let currentItemTokens: string[] = []
@@ -694,6 +782,9 @@ export function segmentTranscript(
   let worstItemNorm: number | null = null
   let bestItemMargin: number | null = null
   let segmentTop3: CandidateRank[] = []
+  let segmentSpokenPrice: number | null = null
+  let segmentSawRupeeWord = false
+  let sawExplicitQty = pendingCarryoverQty !== null
   const segments: RawItemSegment[] = []
 
   const closeSegment = () => {
@@ -711,6 +802,9 @@ export function segmentTranscript(
         itemMatchNorm: worstItemNorm,
         itemMargin: bestItemMargin,
         top3Candidates: segmentTop3.length > 0 ? segmentTop3 : undefined,
+        spokenPrice: segmentSpokenPrice,
+        rupeeWordPresent: segmentSawRupeeWord,
+        hasLeadingQty: sawExplicitQty,
       })
     }
     currentQty = null
@@ -723,14 +817,37 @@ export function segmentTranscript(
     worstItemNorm = null
     bestItemMargin = null
     segmentTop3 = []
+    segmentSpokenPrice = null
+    segmentSawRupeeWord = false
+    sawExplicitQty = false
   }
 
-  for (const dt of decoded) {
+  for (let idx = 0; idx < decoded.length; idx++) {
+    const dt = decoded[idx]
     if (dt.suspect) suspectReading = true
+
+    // Price-run tokens (a rupee word and any NUM tokens feeding it) attach to
+    // whichever segment is currently open instead of starting/ending a segment --
+    // they carry no item-boundary information of their own.
+    if (rupeeIndices.has(idx)) {
+      segmentSawRupeeWord = true
+      const val = priceValueAtRupeeIndex.get(idx)
+      if (val !== null && val !== undefined) segmentSpokenPrice = val
+      currentSegmentTokens.push(dt.rawToken)
+      currentHeardTokens.push(dt.heardText)
+      continue
+    }
+    if (priceNumIndices.has(idx)) {
+      currentSegmentTokens.push(dt.rawToken)
+      currentHeardTokens.push(dt.heardText)
+      continue
+    }
+
     if (dt.type === 'NUM') {
       if (currentItemTokens.length > 0) closeSegment()
       else if (currentQty !== null) ambiguousDoubleQty = true
       currentQty = dt.numericValue ?? 1.0
+      sawExplicitQty = true
       currentSegmentTokens.push(dt.rawToken)
       currentHeardTokens.push(dt.heardText)
     } else if (dt.type === 'UNIT') {

@@ -26,6 +26,16 @@ interface CatalogDao {
     @Query("UPDATE catalog_items SET price = :newPrice, updatedAt = :timestamp, synced = 0 WHERE id = :id")
     suspend fun updatePrice(id: String, newPrice: Double, timestamp: Long = System.currentTimeMillis())
 
+    /** Every row, active or not — the merge in `SyncEngine.pullCatalogFromCloud` needs to see
+     *  deactivated rows too, or it would re-insert an item the shopkeeper deliberately hid. */
+    @Query("SELECT * FROM catalog_items")
+    suspend fun getAllCatalogList(): List<CatalogItem>
+
+    /** Soft delete. The catalog is referenced by `transactions.itemId`, so rows are hidden,
+     *  never removed — a hard delete would orphan the history that priced those sales. */
+    @Query("UPDATE catalog_items SET active = 0, updatedAt = :timestamp, synced = 0 WHERE id = :id")
+    suspend fun deactivate(id: String, timestamp: Long = System.currentTimeMillis())
+
     @Query("SELECT * FROM catalog_items WHERE synced = 0")
     suspend fun getUnsyncedCatalog(): List<CatalogItem>
 

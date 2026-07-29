@@ -1,11 +1,17 @@
-import { HINDI_NUMBER_MAP, UNIT_SET } from './phonetic.ts'
+import {
+  HINDI_NUMBER_MAP,
+  UNIT_SET,
+  RUPEE_WORDS,
+  parseHindiOrNumericValue,
+  parseCompoundNumberSequence,
+  type RawItemSegment,
+} from './phonetic.ts'
 
-export const RUPEE_WORDS = new Set([
-  'rs', 'rs.', '₹',
-  'rupay', 'rupaye', 'rupaya', 'rupaiya', 'rupaiye',
-  'rupee', 'rupees',
-  'रुपये', 'रुपया', 'रुपए', 'रु', 'रूपये', 'रूपए'
-])
+// RUPEE_WORDS, parseHindiOrNumericValue, and parseCompoundNumberSequence now live in
+// phonetic.ts (the segmenter needs them to recognize price runs during segmentation
+// itself -- see ISSUE-029) and are re-exported here so existing imports elsewhere
+// (index.ts, price_intent_test.ts) keep working unchanged.
+export { RUPEE_WORDS, parseHindiOrNumericValue, parseCompoundNumberSequence }
 
 export type PriceIntent = 'NONE' | 'RATE_UPDATE' | 'BULK_SALE_TOTAL' | 'AMBIGUOUS_UNTRUSTED'
 
@@ -110,51 +116,33 @@ export function detectPriceIntent(transcript: string): DeterministicPriceDetecti
   return { priceIntent, spokenPrice, hasLeadingQty, hasAmbiguousPriceNumber }
 }
 
-/**
- * Evaluates a sequence of numeric/number-word tokens into a resolved compound number.
- * Correctly resolves "दो सौ पचास" -> 250, "डेढ़ सौ" -> 150, "तीन सौ" -> 300, "100" -> 100.
- */
-export function parseCompoundNumberSequence(tokens: string[]): number | null {
-  if (!tokens || tokens.length === 0) return null
-
-  let totalSum = 0
-  let currentGroup = 0
-  let hasValidToken = false
-
-  for (const t of tokens) {
-    const norm = t.toLowerCase()
-    const val = parseHindiOrNumericValue(norm)
-    if (val === null) continue
-
-    hasValidToken = true
-
-    if (norm === 'सौ' || norm === 'sau' || norm === 'hundred' || val === 100) {
-      if (currentGroup === 0) currentGroup = 1
-      totalSum += currentGroup * 100
-      currentGroup = 0
-    } else if (norm === 'हजार' || norm === 'hazaar' || norm === 'thousand' || val === 1000) {
-      if (currentGroup === 0) currentGroup = 1
-      totalSum += currentGroup * 1000
-      currentGroup = 0
-    } else if (val >= 100) {
-      totalSum += currentGroup + val
-      currentGroup = 0
-    } else {
-      currentGroup += val
-    }
-  }
-
-  totalSum += currentGroup
-  return hasValidToken ? totalSum : null
+export interface SegmentPriceClassification {
+  priceIntent: PriceIntent
+  spokenPrice: number | null
 }
 
-export function parseHindiOrNumericValue(token: string): number | null {
-  if (!token) return null
-  const num = parseFloat(token)
-  if (!isNaN(num)) return num
-  const norm = token.toLowerCase()
-  if (HINDI_NUMBER_MAP[norm] !== undefined) return HINDI_NUMBER_MAP[norm]
-  return null
+/**
+ * Per-item price classification, scoped to ONE segment instead of the whole
+ * transcript. The segmenter (phonetic.ts) already attaches spokenPrice/
+ * rupeeWordPresent/hasLeadingQty to each RawItemSegment while it walks the token
+ * lattice, so this is a straight application of the RATE_UPDATE vs BULK_SALE_TOTAL
+ * discriminator to that one item's own signal -- it cannot see, and therefore cannot
+ * apply, another item's price.
+ *
+ * This is what fixes "आलू तीस रुपये किलो, दो किलो प्याज": Aaloo's segment carries
+ * spokenPrice=30, hasLeadingQty=false -> RATE_UPDATE; Pyaz's segment carries no price
+ * at all -> NONE, priced from its own catalog entry. The old detectPriceIntent(chosenRaw)
+ * ran once on the whole string and applied its single answer to every item, silently
+ * turning the Pyaz sale into a second Aaloo rate update. See ISSUE-029.
+ */
+export function classifySegmentPriceIntent(
+  seg: Pick<RawItemSegment, 'spokenPrice' | 'hasLeadingQty'> | null | undefined
+): SegmentPriceClassification {
+  const spokenPrice = seg?.spokenPrice ?? null
+  if (spokenPrice !== null && spokenPrice > 0) {
+    return { priceIntent: seg?.hasLeadingQty ? 'BULK_SALE_TOTAL' : 'RATE_UPDATE', spokenPrice }
+  }
+  return { priceIntent: 'NONE', spokenPrice: null }
 }
 
 /**

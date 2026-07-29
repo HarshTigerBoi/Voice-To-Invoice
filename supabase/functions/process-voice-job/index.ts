@@ -4,6 +4,9 @@ import {
   segmentTranscript,
   normalizeTranscript,
   phoneticKey,
+  normalizedDistance,
+  normalizeUnit,
+  parseHindiOrNumericValue,
   DEFAULT_ITEM_VOCAB,
   HINDI_NUMBER_MAP,
   UNIT_SET,
@@ -11,11 +14,12 @@ import {
 } from './phonetic.ts'
 import {
   detectPriceIntent,
-  parseCompoundNumberSequence,
+  classifySegmentPriceIntent,
   implausibilityReason,
   extractSpokenNumbers,
   type PriceIntent,
 } from './price_intent.ts'
+import { resolveItemName, unpricedLineReason } from './item_resolution.ts'
 
 // Deno Deploy / Supabase Edge Runtime global declaration
 declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void }
@@ -24,6 +28,13 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
+
+// Catalog-Learning-From-History (ISSUE-033): how many distinct recordings the SAME item
+// name (by phonetic key) must recur UNMATCHED before it is auto-added to catalog_items at
+// price 0. Mirrors the learned_parses promotion pattern (ISSUE-031) but for catalog
+// membership rather than parse interpretation — see record_unmatched_item_observation in
+// migration 20260728020000_unmatched_item_catalog_learning.sql.
+const CATALOG_LEARNING_THRESHOLD = 3
 
 // Model ids are env-configurable AND fall back down a chain at runtime.
 //
@@ -153,6 +164,163 @@ function getNullSafeShopId(shopIdRaw: string | null): string | null {
     return null
   }
   return shopIdRaw
+}
+
+// -----------------------------------------------------------------------------
+// LEARNED PARSE MEMORY (ISSUE-031)
+//
+// Memoizes a PROVEN Grok interpretation (item_name/quantity/unit/price_intent ONLY --
+// never price/total/confidence, which are recomputed live from catalog_items on every
+// hit) per shop, keyed on the phonetic signature of the transcript. See
+// supabase/migrations/20260728010000_learned_parses_and_void.sql for the promotion/
+// demotion rules this reads and writes against.
+// -----------------------------------------------------------------------------
+
+/** Cheap, dependency-free string hash -- good enough to detect "the catalog changed",
+ *  not used for anything security-sensitive. */
+function fnv1aHash(str: string): string {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16)
+}
+
+function computeCatalogFingerprint(catalogNames: string[]): string {
+  return fnv1aHash(catalogNames.map(n => n.toLowerCase().trim()).sort().join('|'))
+}
+
+/** Verified against live production data (2026-07-28): public.shops is empty and every
+ *  existing catalog_items/transactions row has shop_id NULL -- this deployment runs
+ *  single-tenant, with shop_id not actually populated end-to-end despite schema.sql
+ *  declaring it NOT NULL. learned_parses.shop_id has a NOT NULL FK to shops, so without
+ *  a sentinel to coalesce onto, the memory feature would never activate for any real
+ *  traffic. See the seed row in migrations/20260728010000_learned_parses_and_void.sql. */
+const DEFAULT_LEARNED_PARSE_SHOP_ID = '00000000-0000-0000-0000-000000000001'
+
+interface MemoItemShape {
+  item_name: string
+  quantity: number
+  unit: string
+  price_intent: string
+}
+
+/** Strips a parsed item down to the pre-catalog-match interpretation this system is
+ *  allowed to cache -- price/total/confidence must always be recomputed fresh. */
+function toMemoShape(items: any[]): MemoItemShape[] {
+  return items.map(it => ({
+    item_name: (it.item_name || '').trim(),
+    quantity: typeof it.quantity === 'number' ? it.quantity : 1.0,
+    unit: it.unit || 'PACKET',
+    price_intent: it.price_intent || 'NONE',
+  }))
+}
+
+/**
+ * The safety belt that makes a shorter (2-observation) promotion warm-up safe: a memo
+ * is only ever trusted when the deterministic phonetic segmenter -- an entirely
+ * independent engine -- resolves to the SAME item identities on THIS recording. A
+ * systematic phonetic misread would have to fool both engines identically to ever pass
+ * this check. Deliberately strict (item counts must match exactly) so the failure mode
+ * of a corroboration miss is just "call Grok anyway", never a wrong silent skip.
+ */
+function itemsCorroboratedBySegmenter(items: { item_name: string }[], segments: RawItemSegment[]): boolean {
+  if (!items || !segments || items.length === 0 || items.length !== segments.length) return false
+  for (let i = 0; i < items.length; i++) {
+    const a = phoneticKey(items[i].item_name || '')
+    const b = phoneticKey(segments[i].itemTokens.join(' '))
+    if (!a || !b) return false
+    if (normalizedDistance(a, b) > 0.30) return false
+  }
+  return true
+}
+
+/** Strict signature comparison used to decide whether a canary Grok call agrees with
+ *  the memo it is verifying -- any difference in item identity, quantity, or unit
+ *  counts as a mismatch (favors demoting a good memo over keeping a bad one). */
+function canonicalSignature(items: MemoItemShape[]): string {
+  return items.map(it => `${phoneticKey(it.item_name)}:${it.quantity}:${it.unit}:${it.price_intent}`).join('|')
+}
+
+function itemsMatchCanonical(freshItems: any[], memoItems: MemoItemShape[]): boolean {
+  if (!freshItems || freshItems.length !== memoItems.length) return false
+  return canonicalSignature(toMemoShape(freshItems)) === canonicalSignature(memoItems)
+}
+
+/** Walks the Grok chat model chain exactly as the inline call used to -- extracted so
+ *  the canary re-verification path (below) can issue the identical call without
+ *  duplicating the request-building/parsing/fallback logic. */
+async function callGrokChatInterpretation(
+  xaiApiKey: string,
+  systemPrompt: string,
+  userPrompt: string,
+  getKnownGood: () => string | null,
+  setKnownGood: (m: string) => void,
+): Promise<{ items: any[]; error: string | null; model: string | null }> {
+  let items: any[] = []
+  let error: string | null = null
+  let model: string | null = null
+
+  for (const m of modelChain(XAI_CHAT_MODELS, getKnownGood())) {
+    const chatController = new AbortController()
+    const chatTimeoutId = setTimeout(() => chatController.abort(), AI_CHAT_TIMEOUT_MS)
+    try {
+      const grokResp = await fetch('https://api.x.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${xaiApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: m,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          response_format: { type: 'json_object' },
+          temperature: 0,
+          // Bounded: this is pure structured extraction over a handful of items, never
+          // a long-form answer, so an unbounded budget only pays for runaway output.
+          max_tokens: 1024,
+          ...(supportsReasoningEffort(m) ? { reasoning_effort: XAI_REASONING_EFFORT } : {}),
+        }),
+        signal: chatController.signal
+      })
+      clearTimeout(chatTimeoutId)
+
+      if (grokResp.ok) {
+        const grokData = await grokResp.json()
+        const content = grokData.choices?.[0]?.message?.content || '{}'
+        const cleanContent = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
+        const match = cleanContent.match(/\{[\s\S]*\}/)
+        if (match) {
+          const parsedJson = JSON.parse(match[0])
+          if (Array.isArray(parsedJson.parsed_items)) {
+            items = parsedJson.parsed_items
+          }
+        }
+        setKnownGood(m)
+        model = m
+        error = null
+        break
+      }
+
+      const body = await grokResp.text().catch(() => '')
+      error = `HTTP ${grokResp.status}: ${body.slice(0, 300)}`
+      if (!isModelUnavailableError(grokResp.status, body)) {
+        console.error('Grok AI chat failed:', error)
+        break
+      }
+      console.warn(`Grok chat model "${m}" unavailable, trying next: ${error}`)
+    } catch (aiErr: any) {
+      clearTimeout(chatTimeoutId)
+      error = aiErr?.name === 'AbortError' ? `AI Timeout (${AI_CHAT_TIMEOUT_MS}ms limit)` : (aiErr?.message || String(aiErr))
+      console.error('Grok AI multi-item interpretation error:', error)
+      break
+    }
+  }
+  return { items, error, model }
 }
 
 // -----------------------------------------------------------------------------
@@ -344,6 +512,87 @@ function looksUnrecognizable(transcript: string, catalogNames: string[]): boolea
   return true
 }
 
+/**
+ * Aligns each AI-parsed item to the deterministic segmenter's own per-item segment,
+ * so per-item price intent (see classifySegmentPriceIntent) can be applied to the
+ * right item instead of guessed positionally when counts disagree.
+ *
+ * When the AI returned exactly as many items as the segmenter found, pairing is
+ * positional -- this is the overwhelmingly common case and phonetic matching adds
+ * risk (a near-miss match could pair the wrong two items) for no benefit. When counts
+ * differ (the AI split/merged something the segmenter didn't), fall back to a
+ * best-effort phonetic-key match so at least the items that DID align 1:1 still get
+ * their own price; anything left unmatched gets `null` and falls through to the AI's
+ * own self-reported price_intent instead of a wrong deterministic override.
+ */
+function alignSegmentsToItems(parsedItems: any[], segments: RawItemSegment[]): (RawItemSegment | null)[] {
+  if (parsedItems.length === segments.length) {
+    return segments.map(s => s)
+  }
+  const used = new Set<number>()
+  return parsedItems.map(rawItem => {
+    const rawKey = phoneticKey((rawItem.item_name || '').trim())
+    if (!rawKey) return null
+    let bestIdx = -1
+    let bestDist = Infinity
+    segments.forEach((seg, idx) => {
+      if (used.has(idx)) return
+      const segKey = phoneticKey(seg.itemTokens.join(' '))
+      if (!segKey) return
+      const dist = normalizedDistance(rawKey, segKey)
+      if (dist < bestDist) { bestDist = dist; bestIdx = idx }
+    })
+    if (bestIdx !== -1 && bestDist <= 0.35) {
+      used.add(bestIdx)
+      return segments[bestIdx]
+    }
+    return null
+  })
+}
+
+/**
+ * Defends against the AI leaving a quantity/unit word inside item_name instead of the
+ * quantity/unit fields (prompt rule 9 asks it not to, but a real production trace
+ * still returned {item_name:"पांच किलो बैंगन", quantity:1, unit:"PACKET"} for job
+ * 47e1ee0b -- see ISSUE-029). Strips leading NUM/UNIT tokens from item_name and, when
+ * the AI's own quantity/unit still look defaulted, substitutes the stripped values.
+ */
+function stripLeadingQtyUnitFromItemName(
+  rawName: string,
+  aiQuantity: number | undefined,
+  aiUnit: string | undefined
+): { name: string; quantity: number | undefined; unit: string | undefined } {
+  const tokens = rawName.trim().split(/\s+/).filter(Boolean)
+  let strippedQty: number | null = null
+  let strippedUnit: string | null = null
+  let i = 0
+  while (i < tokens.length) {
+    const tok = tokens[i].toLowerCase()
+    const numVal = parseHindiOrNumericValue(tok)
+    if (numVal !== null && numVal > 0 && strippedQty === null) {
+      strippedQty = numVal
+      i++
+      continue
+    }
+    if (UNIT_SET.includes(tok) && strippedUnit === null) {
+      strippedUnit = normalizeUnit(tok)
+      i++
+      continue
+    }
+    break
+  }
+  if (i === 0) return { name: rawName, quantity: aiQuantity, unit: aiUnit }
+
+  const cleanedName = tokens.slice(i).join(' ').trim() || rawName
+  const aiQtyLooksDefaulted = aiQuantity === undefined || aiQuantity === null || aiQuantity === 1.0
+  const aiUnitLooksDefaulted = !aiUnit || aiUnit === 'PACKET'
+  return {
+    name: cleanedName,
+    quantity: strippedQty !== null && aiQtyLooksDefaulted ? strippedQty : aiQuantity,
+    unit: strippedUnit !== null && aiUnitLooksDefaulted ? strippedUnit : aiUnit,
+  }
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: CORS_HEADERS })
@@ -383,6 +632,7 @@ serve(async (req) => {
     const metadataRaw = formData.get('metadata') as string | null
     const shopId = formData.get('shopId') as string | null
     const onDeviceTranscript = (formData.get('onDeviceTranscript') as string | null) || ''
+    const onDeviceStatus = (formData.get('onDeviceStatus') as string | null) || ''
     const previousJobId = formData.get('previousJobId') as string | null
     const precedingGapMsRaw = formData.get('precedingGapMs') as string | null
     const precedingGapMs = precedingGapMsRaw ? parseInt(precedingGapMsRaw, 10) : -1
@@ -501,6 +751,7 @@ serve(async (req) => {
         audioCloudUrl,
         catalogNamesRaw,
         onDeviceTranscript,
+        onDeviceStatus,
         previousJobId,
         precedingGapMs,
         supabase
@@ -537,11 +788,12 @@ async function processVoiceJob(args: {
   audioCloudUrl: string
   catalogNamesRaw: string | null
   onDeviceTranscript?: string
+  onDeviceStatus?: string
   previousJobId?: string | null
   precedingGapMs?: number
   supabase: ReturnType<typeof createClient>
 }) {
-  const { jobId, shopId, metadata, audioBuffer, audioCloudUrl, catalogNamesRaw, onDeviceTranscript = '', previousJobId = null, precedingGapMs = -1, supabase } = args
+  const { jobId, shopId, metadata, audioBuffer, audioCloudUrl, catalogNamesRaw, onDeviceTranscript = '', onDeviceStatus = '', previousJobId = null, precedingGapMs = -1, supabase } = args
   const resolvedShopId = getNullSafeShopId(shopId)
 
   try {
@@ -723,7 +975,7 @@ async function processVoiceJob(args: {
           // Surface the winning re-decode to the AI step as well.
           if (c.label.startsWith('grok')) rawGrokTranscript = c.outcome.transcript
           else rawSarvamTranscript = c.outcome.transcript
-          sttProvider = providerOf(rawGrokTranscript, rawSarvamTranscript) + '+redecode'
+          sttProvider = providerOf(rawGrokTranscript, rawSarvamTranscript, rawOnDeviceTranscript) + '+redecode'
         }
       }
       console.log(`Re-decode for ${jobId}: ${passesDetail.length} variants, bestScore now ${bestScore}`)
@@ -737,9 +989,14 @@ async function processVoiceJob(args: {
     let parsedRawItems: any[] = []
     let aiError: string | null = null
     let aiModelUsed: string | null = null
+    let parseSource: 'grok_ai' | 'memory' | 'segmenter_fallback' = 'grok_ai'
 
-    if ((rawGrokTranscript || rawSarvamTranscript || transcript) && xaiApiKey) {
-      const systemPrompt = `You are a phonetic-aware parser for an Indian shopkeeper's voice orders.
+    const hasAiInput = !!((rawGrokTranscript || rawSarvamTranscript || transcript) && xaiApiKey)
+
+    // Prompts are built unconditionally (pure string work, no network cost) so the
+    // canary re-verification path below can issue the identical Grok call without
+    // rebuilding them.
+    const systemPrompt = `You are a phonetic-aware parser for an Indian shopkeeper's voice orders.
 Shopkeepers speak rapidly in Hindi, Hinglish (romanized Hindi), or English —
 often mixed in the same sentence, often without pauses between words.
 
@@ -766,7 +1023,7 @@ Rules:
    find the closest phonetic match among:
    - Numbers: एक/1/ek, दो/2/do, तीन/3/teen, चार/4/chaar, पांच/5/paanch, आधा/0.5, पाव/0.25, ढाई/2.5, डेढ़/1.5
    - Units: किलो/kg/kilo, ग्राम/gram/g, लीटर/litre/l, पैकेट/packet/pkt, Piece/pc/पीस, Dozen/दर्जन
-   - Catalog items: ${catalogContextStr}
+   - Catalog items: see the "Shop catalog" list in the user message below
 2. If one token looks like multiple fused words (e.g. "चरगलो", "ग्लोसोना", "tinggal"),
    split it at whichever point best matches known vocabulary — approximate
    phonetic closeness counts, exact spelling match is NOT required.
@@ -787,7 +1044,13 @@ Rules:
    wrong, especially for item names outside its vocabulary. Treat it as one
    hint among three. When it conflicts with what the raw STT transcripts plus
    your own phonetic/catalog reasoning suggest, trust your own reasoning.
-8. RATE UPDATES vs BULK TOTAL SALES vs AMBIGUOUS NUMBERS:
+8. RATE UPDATES vs BULK TOTAL SALES vs AMBIGUOUS NUMBERS — EACH ITEM HAS ITS OWN
+   price_intent. One utterance can contain a RATE UPDATE for one item AND a STANDARD
+   SALE for another — never let one item's price bleed onto a different item.
+   Example: "आलू तीस रुपये किलो, दो किलो प्याज" is TWO items: Aaloo gets
+   {price_intent:"RATE_UPDATE", price_at_sale:30, quantity:1, total:30} and Pyaz gets
+   {price_intent:"NONE", quantity:2, unit:"KG", price_at_sale:0, total:0} — Pyaz must
+   NOT also receive Aaloo's 30 rupee price, and Aaloo must NOT receive Pyaz's quantity.
    - RATE UPDATE (Item name + price number + Rupee word, e.g. "गोल्ड पचास रुपये", "आलू 50 रुपये", "प्याज 30 Rs", with NO quantity before item):
      Set "price_intent": "RATE_UPDATE", "price_at_sale": 50, "quantity": 1, "total": 50, "confidence": 0.90.
    - BULK TOTAL SALE (Quantity/unit before item + item name + total price + Rupee word at end, e.g. "पाँच पैकेट गोल्ड दो सौ पचास रुपये", "5 KG Aaloo 200 Rs"):
@@ -796,6 +1059,17 @@ Rules:
      Set "price_intent": "NONE", "quantity": 5, "unit": "PIECE", "price_at_sale": 0, "total": 0, "confidence": 0.85+.
    - AMBIGUOUS NUMBER (Number present at end without any Rupee word, e.g. "पाँच आलू पचास"):
      Set "price_intent": "AMBIGUOUS_UNTRUSTED", "confidence": 0.40.
+9. "item_name" is a NAME ONLY — it must never contain a quantity or unit word.
+   WRONG: {item_name:"पांच किलो बैंगन"}. RIGHT: {item_name:"Baingan", quantity:5, unit:"KG"}.
+   If you catch yourself writing a number or a unit word inside item_name, move it to
+   the quantity/unit fields instead.
+10. One transcript below is marked [ADOPTED]. It scored highest on resolving to real
+   shopkeeper vocabulary, so when the transcripts DISAGREE on an item name, the ADOPTED
+   reading is the better acoustic evidence. Do NOT substitute a word that appears only
+   in a non-adopted transcript unless the adopted reading matches no known vocabulary
+   at all. Real failure this rule exists to prevent: the shopkeeper said "पाँच किलो अमचूर",
+   Sarvam [ADOPTED] transcribed "अमचूर" correctly, Grok misheard "अंगूर" — and the parse
+   came back "Angoor", corrupting a transcript that was already right.
 
 Output ONLY valid JSON, no prose, in exactly this shape:
 {
@@ -816,85 +1090,134 @@ Output ONLY valid JSON, no prose, in exactly this shape:
       const userPrompt = `Shop catalog: ${catalogContextStr}
 
 DUAL STT TRANSCRIPTIONS RECEIVED (these are the actual audio-derived signal —
-weight them over the preprocessed transcript):
-- Grok STT Transcript: "${rawGrokTranscript || '(none)'}"
-- Sarvam AI STT Transcript: "${rawSarvamTranscript || '(none)'}"
+weight them over the preprocessed transcript). Exactly one is marked ADOPTED: it won
+a scoring pass measuring how well it resolves to real shopkeeper vocabulary, so it is
+the strongest acoustic evidence available — see rule 10.
+- Grok STT Transcript${chosenRaw === rawGrokTranscript && rawGrokTranscript ? ' [ADOPTED]' : ''}: "${rawGrokTranscript || '(none)'}"
+- Sarvam AI STT Transcript${chosenRaw === rawSarvamTranscript && rawSarvamTranscript ? ' [ADOPTED]' : ''}: "${rawSarvamTranscript || '(none)'}"
 - Preprocessed Transcript (rule-based phonetic segmenter, may be wrong — see rule 7): "${transcript || '(none)'}"
 
 Parse this order.`
 
+    // ---- Learned Parse Memory lookup (ISSUE-031) ----
+    // Coalesces onto DEFAULT_LEARNED_PARSE_SHOP_ID when the request carries no real
+    // shop_id (verified to be the norm in production today, not the exception -- see
+    // that constant's comment) so the feature actually activates instead of silently
+    // never firing.
+    const memoKey = phoneticKey(normalizeTranscript(chosenRaw, fullCatalogList))
+    const catalogFingerprint = computeCatalogFingerprint(fullCatalogList)
+    const memoryShopId = resolvedShopId || DEFAULT_LEARNED_PARSE_SHOP_ID
+    const memoryEnabled = !!memoKey
+
+    let memoryHit: { canonical_items: MemoItemShape[] } | null = null
+    if (memoryEnabled) {
+      try {
+        const { data: memoRow } = await withTimeout(
+          supabase.from('learned_parses')
+            .select('canonical_items, catalog_fingerprint, promoted, permanently_blocked')
+            .eq('shop_id', memoryShopId)
+            .eq('memo_key', memoKey)
+            .maybeSingle(),
+          3000,
+          'learned_parses lookup'
+        )
+        if (memoRow && (memoRow as any).promoted && !(memoRow as any).permanently_blocked &&
+          (memoRow as any).catalog_fingerprint === catalogFingerprint) {
+          memoryHit = { canonical_items: (memoRow as any).canonical_items as MemoItemShape[] }
+        }
+      } catch (memoLookupErr) {
+        console.warn(`learned_parses lookup failed for ${jobId}, falling back to Grok:`, memoLookupErr)
+      }
+    }
+
+    // The safety belt: a memo is only ever used when the deterministic segmenter (an
+    // entirely independent engine) resolves to the SAME item identities on THIS
+    // recording. A miss here just means "call Grok anyway" -- never a wrong skip.
+    const memoCorroborated = memoryHit ? itemsCorroboratedBySegmenter(memoryHit.canonical_items, step3Segments) : false
+
+    // Permanent insurance premium on the promotion warm-up being only 2 observations:
+    // a sample of hits still gets a real (background, non-blocking) Grok call to
+    // verify against. Env-tunable; higher than the eventual steady-state rate because
+    // this pipeline skipped the "watch a week of logs before enabling the skip" step.
+    const CANARY_RATE = Number(Deno.env.get('LEARNED_PARSE_CANARY_RATE') || '0.25')
+    const isCanarySample = !!(memoryHit && memoCorroborated) && Math.random() < CANARY_RATE
+
+    if (memoryHit && memoCorroborated) {
+      parsedRawItems = memoryHit.canonical_items.map(it => ({
+        item_name: it.item_name,
+        quantity: it.quantity,
+        unit: it.unit,
+        price_at_sale: 0,
+        total: 0,
+        price_intent: it.price_intent,
+        confidence: undefined,
+        matched_catalog: false,
+        source: 'memory' as const,
+      }))
+      aiModelUsed = 'memory'
+      aiError = null
+      parseSource = 'memory'
+
+      if (isCanarySample && xaiApiKey) {
+        const canaryMemoItems = memoryHit.canonical_items
+        const canaryShopId = memoryShopId
+        const canaryMemoKey = memoKey
+        EdgeRuntime.waitUntil((async () => {
+          const canaryResult = await callGrokChatInterpretation(
+            xaiApiKey, systemPrompt, userPrompt,
+            () => knownGoodChatModel, (m) => { knownGoodChatModel = m }
+          )
+          if (canaryResult.error || canaryResult.items.length === 0) return
+          if (!itemsMatchCanonical(canaryResult.items, canaryMemoItems)) {
+            console.warn(`Canary mismatch for job ${jobId}, memo ${canaryMemoKey}: demoting`)
+            await supabase.rpc('reset_learned_parse', {
+              p_shop_id: canaryShopId,
+              p_memo_key: canaryMemoKey,
+              p_reason: 'canary_mismatch',
+              p_increment_corrections: true,
+            })
+          }
+        })().catch(e => console.warn(`Canary verification failed for ${jobId}:`, e)))
+      }
+    } else if (hasAiInput) {
       // Walk the model chain on deprecation errors, exactly as the STT calls do. This
       // stage returned "Model not found: grok-2-latest" on every job in the ISSUE-021
       // trace, which meant the app's most capable interpreter had been silently absent
       // the whole time and every sale was riding on the rule-based segmenter alone.
-      for (const model of modelChain(XAI_CHAT_MODELS, knownGoodChatModel)) {
-        const chatController = new AbortController()
-        // 8s was too tight — trace e0b68f80 timed out here, which silently removed the
-        // only stage capable of arbitrating between the two disagreeing transcripts and
-        // left the rule-based segmenter's guess to be booked unchallenged.
-        const chatTimeoutId = setTimeout(() => chatController.abort(), AI_CHAT_TIMEOUT_MS)
-        try {
-          const grokResp = await fetch('https://api.x.ai/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${xaiApiKey}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              model,
-              // A real user turn plus JSON mode: the previous version put everything in
-              // a single system message with no user turn and no response_format, which
-              // is a weak configuration for structured extraction.
-              messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt },
-              ],
-              response_format: { type: 'json_object' },
-              temperature: 0,
-              ...(supportsReasoningEffort(model) ? { reasoning_effort: XAI_REASONING_EFFORT } : {}),
-            }),
-            signal: chatController.signal
-          })
-          clearTimeout(chatTimeoutId)
-
-          if (grokResp.ok) {
-            const grokData = await grokResp.json()
-            const content = grokData.choices?.[0]?.message?.content || '{}'
-            const cleanContent = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
-            const match = cleanContent.match(/\{[\s\S]*\}/)
-            if (match) {
-              const parsedJson = JSON.parse(match[0])
-              if (Array.isArray(parsedJson.parsed_items)) {
-                parsedRawItems = parsedJson.parsed_items
-              }
-            }
-            knownGoodChatModel = model
-            aiModelUsed = model
-            aiError = null
-            break
-          }
-
-          const body = await grokResp.text().catch(() => '')
-          aiError = `HTTP ${grokResp.status}: ${body.slice(0, 300)}`
-          if (!isModelUnavailableError(grokResp.status, body)) {
-            console.error('Grok AI chat failed:', aiError)
-            break
-          }
-          console.warn(`Grok chat model "${model}" unavailable, trying next: ${aiError}`)
-        } catch (aiErr: any) {
-          clearTimeout(chatTimeoutId)
-          aiError = aiErr?.name === 'AbortError' ? `AI Timeout (${AI_CHAT_TIMEOUT_MS}ms limit)` : (aiErr?.message || String(aiErr))
-          console.error('Grok AI multi-item interpretation error:', aiError)
-          break
-        }
-      }
+      const result = await callGrokChatInterpretation(
+        xaiApiKey, systemPrompt, userPrompt,
+        () => knownGoodChatModel, (m) => { knownGoodChatModel = m }
+      )
+      parsedRawItems = result.items
+      aiError = result.error
+      aiModelUsed = result.model
     } else if (!xaiApiKey) {
       aiError = 'XAI_API_KEY not configured'
+    }
+
+    // Every genuinely fresh (non-memoized) Grok success is one observation toward
+    // promotion -- see record_learned_parse_observation() in the migration for the
+    // full promotion rule.
+    if (memoryEnabled && parseSource === 'grok_ai' && !aiError && parsedRawItems.length > 0) {
+      const corroborated = itemsCorroboratedBySegmenter(parsedRawItems, step3Segments)
+      try {
+        await supabase.rpc('record_learned_parse_observation', {
+          p_shop_id: memoryShopId,
+          p_memo_key: memoKey,
+          p_canonical_items: toMemoShape(parsedRawItems),
+          p_catalog_fingerprint: catalogFingerprint,
+          p_job_id: jobId,
+          p_corroborated: corroborated,
+        })
+      } catch (recordErr) {
+        console.warn(`record_learned_parse_observation failed for ${jobId}:`, recordErr)
+      }
     }
 
     // Segmenter fallback if Grok AI failed or returned nothing.
     if (parsedRawItems.length === 0 && step3Segments.length > 0) {
       console.log(`Using deterministic phonetic segmenter output as fallback (${step3Segments.length} items)`)
+      parseSource = 'segmenter_fallback'
       parsedRawItems = step3Segments.map(seg => {
         const rawName = seg.itemTokens.join(' ').trim()
         const normN = rawName.charAt(0).toUpperCase() + rawName.slice(1)
@@ -950,26 +1273,66 @@ Parse this order.`
       if (k && !catalogByKey.has(k)) catalogByKey.set(k, dbItem)
     }
 
-    // Run deterministic price intent detection on raw STT transcript (server-side mirror of VoiceParser.kt)
-    const deterministicPrice = detectPriceIntent(chosenRaw)
+    // Per-item price intent (ISSUE-029): the deterministic segmenter attaches its own
+    // spokenPrice/hasLeadingQty to EACH segment while walking the token lattice (see
+    // phonetic.ts segmentTranscript), so classification below is scoped to one item
+    // and cannot leak into a sibling item's price the way a single whole-utterance
+    // detectPriceIntent(chosenRaw) call used to. `alignedSegments[i]` is the segment
+    // paired to `parsedRawItems[i]`, or null when no confident pairing was found.
+    const alignedSegments = alignSegmentsToItems(parsedRawItems, step3Segments)
 
-    const finalParsedItems: any[] = parsedRawItems.map(rawItem => {
-      const rawName = (rawItem.item_name || "").trim()
-      const lowerN = rawName.toLowerCase()
+    // Basket-total guard: "दो किलो आलू तीन किलो प्याज दो सौ रुपये" is genuinely
+    // ambiguous -- the trailing price could be Pyaz's own bulk total, or the combined
+    // total for both items, and nothing in the transcript resolves that on its own.
+    // Rather than guess a split, only withhold auto-confirm when the shopkeeper
+    // actually said a total-indicating word ("कुल"/"total"/"मिलाकर") alongside more
+    // than one item -- an ordinary "N kg X, M kg Y ₹P" with no such word is NOT
+    // flagged here; that is just an unremarkable bulk sale on the last item.
+    const TOTAL_INDICATOR_WORDS = ['कुल', 'total', 'सब', 'मिलाकर', 'सबका', 'grand total']
+    const hasTotalIndicatorWord = TOTAL_INDICATOR_WORDS.some(w => chosenRaw.toLowerCase().includes(w))
+    const isBasketTotalAmbiguous = hasTotalIndicatorWord && step3Segments.length > 1
 
-      let matched = dbCatalogItems.find(dbItem => {
-        const dbN = dbItem.name.toLowerCase().trim()
-        return dbN === lowerN || lowerN.includes(dbN) || dbN.includes(lowerN)
-      })
-      if (!matched) matched = catalogByKey.get(phoneticKey(rawName))
+    const finalParsedItems: any[] = parsedRawItems.map((rawItem, itemIdx) => {
+      const alignedSeg = alignedSegments[itemIdx]
+      const stripped = stripLeadingQtyUnitFromItemName(
+        (rawItem.item_name || "").trim(),
+        rawItem.quantity,
+        rawItem.unit
+      )
+      if (stripped.name !== (rawItem.item_name || "").trim()) {
+        rawItem = { ...rawItem, item_name: stripped.name, quantity: stripped.quantity, unit: stripped.unit }
+      }
+      const aiName = (rawItem.item_name || "").trim()
+      const findCatalog = (name: string) => {
+        const lowered = name.toLowerCase()
+        const bySubstring = dbCatalogItems.find(dbItem => {
+          const dbN = dbItem.name.toLowerCase().trim()
+          return dbN === lowered || lowered.includes(dbN) || dbN.includes(lowered)
+        })
+        return bySubstring ?? catalogByKey.get(phoneticKey(name))
+      }
 
-      // Price Intent Determination: Deterministic Pre-Check takes precedence over LLM guess
-      const intent: PriceIntent = deterministicPrice.priceIntent !== 'NONE'
-        ? deterministicPrice.priceIntent
+      // When the segmenter has a near-exact match on the ADOPTED transcript and the AI
+      // named something else, the segmenter wins and the line is flagged either way.
+      // See item_resolution.ts / ISSUE-030 for why this is not gated on catalog match.
+      const nameResolution = resolveItemName(aiName, alignedSeg)
+      const rawName = nameResolution.name
+      const sttDisagreementReason = nameResolution.disagreementReason
+      const segDisagreesWithAi = nameResolution.usedSegmenterOverride
+      const segMatchNorm = alignedSeg?.itemMatchNorm ?? null
+
+      const matched = findCatalog(rawName)
+
+      // Price Intent Determination: this item's own segment takes precedence over the
+      // LLM's guess (it saw only this item's tokens); when no segment aligned to this
+      // item at all, trust the AI's self-reported per-item price_intent instead.
+      const segClassification = classifySegmentPriceIntent(alignedSeg)
+      const intent: PriceIntent = segClassification.priceIntent !== 'NONE'
+        ? segClassification.priceIntent
         : ((rawItem.price_intent as PriceIntent) || 'NONE')
 
       let qty = rawItem.quantity || 1.0
-      let spokenPrice = deterministicPrice.spokenPrice ?? 0.0
+      let spokenPrice = segClassification.spokenPrice ?? 0.0
       if (spokenPrice === 0.0) {
         spokenPrice = (typeof rawItem.price_at_sale === 'number' && rawItem.price_at_sale > 0)
           ? rawItem.price_at_sale
@@ -999,18 +1362,69 @@ Parse this order.`
       const isCatalogMatched = matched !== undefined
       const unit = rawItem.unit || (matched ? matched.unit_id : "PACKET")
 
+      // Match evidence: AI-parsed items carry none of their own (item_match_norm is only
+      // ever populated on the segmenter-fallback path), so fall back to the aligned
+      // segment's. Without this the distance-aware confidence model from ISSUE-022 never
+      // applied to AI items at all, and a review-queue entry could not explain itself.
+      const matchNorm = rawItem.item_match_norm ?? segMatchNorm ?? null
+      const matchMargin = rawItem.item_margin ?? alignedSeg?.itemMargin ?? null
+      const top3 = (rawItem.top3_candidates && rawItem.top3_candidates.length > 0)
+        ? rawItem.top3_candidates
+        : (alignedSeg?.top3Candidates ?? [])
+
       let confidence: number
       if (intent === 'AMBIGUOUS_UNTRUSTED') {
         confidence = 0.40
       } else if (typeof rawItem.confidence === 'number') {
         confidence = isCatalogMatched ? rawItem.confidence : Math.min(rawItem.confidence, 0.60)
       } else if (isCatalogMatched) {
-        confidence = confidenceFromMatchNorm(rawItem.item_match_norm)
+        confidence = confidenceFromMatchNorm(matchNorm)
       } else {
         confidence = 0.60
       }
 
       let implausibility = implausibilityReason(unit, qty, total, chosenRaw, priceAtSale)
+
+      if (sttDisagreementReason) {
+        implausibility = implausibility ? `${implausibility} | ${sttDisagreementReason}` : sttDisagreementReason
+      }
+
+      // P0-2: Never auto-confirm a defaulted quantity on a squeezed window
+      const pressStartMs = metadata.pressStartMs || 0
+      const audioStartMs = metadata.audioStartMs || 0
+      const preRollActualMs = (pressStartMs > 0 && audioStartMs > 0) ? (pressStartMs - audioStartMs) : 300
+
+      const tokens = chosenRaw.trim().split(/\s+/).filter(Boolean)
+      const firstTokenNorm = tokens[0] ? tokens[0].toLowerCase() : ''
+      const isFirstTokenUnit = UNIT_SET.includes(firstTokenNorm)
+      const transcriptHasExplicitNumber = extractSpokenNumbers(chosenRaw).length > 0 || /\d+/.test(chosenRaw) || Object.keys(HINDI_NUMBER_MAP).some(k => chosenRaw.toLowerCase().includes(k.toLowerCase()))
+      const isDefaultedQty = isFirstTokenUnit || (qty === 1.0 && !transcriptHasExplicitNumber)
+
+      if (preRollActualMs < 150 && isDefaultedQty) {
+        const clipReason = `leading quantity may have been clipped (pre-roll only ${preRollActualMs}ms)`
+        implausibility = implausibility ? `${implausibility} | ${clipReason}` : clipReason
+      }
+
+      // The client's RollingAudioBuffer holds exactly 30s of PCM; a hold at or beyond
+      // that silently loses its OWN leading audio (minStartAllowed truncates the window
+      // front with no error signal) -- a long multi-item recitation is exactly the case
+      // that can hit this. Never auto-confirm a line whose recording may have been
+      // truncated. See ISSUE-029.
+      if ((metadata.holdDurationMs || 0) >= 29000) {
+        const longHoldReason = `recording held ${metadata.holdDurationMs}ms, at/beyond the 30s rolling buffer -- leading audio may have been truncated`
+        implausibility = implausibility ? `${implausibility} | ${longHoldReason}` : longHoldReason
+      }
+
+      // P0-3: Make rawLooksUnrecognizable block auto-confirm
+      if (rawLooksUnrecognizable) {
+        const unrecReason = `transcript text looks unrecognized / corrupt`
+        implausibility = implausibility ? `${implausibility} | ${unrecReason}` : unrecReason
+      }
+
+      if (rawLooksUnrecognizable && matched && rawName && rawName.trim().length > 0 && rawName !== matched.name) {
+        const disagreeReason = `AI item '${rawName}' disagrees with segmenter match '${matched.name}' on unrecognizable raw text`
+        implausibility = implausibility ? `${implausibility} | ${disagreeReason}` : disagreeReason
+      }
 
       // A4: Cross-job duplicate number guard
       if (prevJobTranscript) {
@@ -1027,10 +1441,22 @@ Parse this order.`
         }
       }
 
-      // A5: Orphan classification (price/quantity without matched catalog item)
-      const isOrphan = !isCatalogMatched && (priceAtSale > 0 || total > 0 || qty > 0) && intent !== 'RATE_UPDATE'
+      if (isBasketTotalAmbiguous) {
+        const basketReason = `spoken total may cover the whole basket, not just this item`
+        implausibility = implausibility ? `${implausibility} | ${basketReason}` : basketReason
+      }
+
+      // The reason the shopkeeper actually reads on the review card. See ISSUE-030.
+      const priceReason = unpricedLineReason(rawName, isCatalogMatched, priceAtSale, total, intent)
+      if (priceReason) {
+        implausibility = implausibility ? `${implausibility} | ${priceReason}` : priceReason
+      }
+
+      // P1: Narrowed Orphan Definition — genuine orphans are price/qty announcements with NO item name at all
+      const hasItemName = rawName && rawName.trim().length > 0 && rawName !== "Unrecognized Item"
+      const isOrphan = !hasItemName && (priceAtSale > 0 || total > 0) && intent !== 'RATE_UPDATE'
       if (isOrphan) {
-        const orphanReason = `Price/quantity specified without a recognized catalog item (orphan sale)`
+        const orphanReason = `Price/quantity specified without any item name (orphan sale)`
         implausibility = implausibility ? `${implausibility} | ${orphanReason}` : orphanReason
       }
 
@@ -1049,36 +1475,114 @@ Parse this order.`
         is_orphan: isOrphan,
         suggested_item_name: isOrphan && prevJobItemName ? prevJobItemName : null,
         // Surfaced in the trace so a review-queue entry explains itself (Phase 0a logging).
-        item_match_norm: rawItem.item_match_norm ?? null,
-        item_margin: rawItem.item_margin ?? null,
-        top3_candidates: rawItem.top3_candidates ?? [],
+        // These now fall back to the aligned segment's evidence for AI-parsed items,
+        // which previously reported all-null here (ISSUE-030).
+        item_match_norm: matchNorm,
+        item_margin: matchMargin,
+        top3_candidates: top3,
         implausibility_reason: implausibility,
         parse_source: rawItem.source ?? 'ai',
+        // Names the stage that decided the item name, so the "why does this say Amchoor
+        // when the AI said Angoor" question is answerable from the trace alone.
+        item_name_source: segDisagreesWithAi ? 'segmenter_override' : (rawItem.source ?? 'ai'),
+        ai_item_name: aiName,
       }
     })
+
+    // Catalog-Learning-From-History (ISSUE-033): a genuinely unmatched item previously
+    // needed a shopkeeper to set a price during review to ever enter the catalog -- skip
+    // that review once and the item started from zero again on every future mention (the
+    // real-world case: "Amchur" recurring unmatched with no path to ever being learned).
+    // Once the SAME item name (by phonetic key) has recurred unmatched across
+    // CATALOG_LEARNING_THRESHOLD distinct jobs for this shop, auto-add it to
+    // catalog_items at price 0 so it starts matching immediately. This does not book any
+    // money (price stays 0 until a rate is set) -- unpricedLineReason then explains the
+    // line correctly as "has no price -- set a rate" instead of "not in your catalog
+    // yet", and the shopkeeper only has to set a rate ONCE for it to stick going forward.
+    for (const item of finalParsedItems) {
+      if (
+        item.is_matched_to_catalog ||
+        item.is_orphan ||
+        !item.item_name ||
+        item.item_name.trim().length === 0 ||
+        item.item_name === "Unrecognized Item"
+      ) continue
+
+      try {
+        const key = phoneticKey(item.item_name)
+        const { data: obsRow, error: obsErr } = await supabase.rpc('record_unmatched_item_observation', {
+          p_shop_id: resolvedShopId,
+          p_phonetic_key: key,
+          p_item_name: item.item_name,
+          p_unit_id: item.unit,
+          p_job_id: jobId,
+          p_threshold: CATALOG_LEARNING_THRESHOLD,
+        })
+        if (obsErr) {
+          console.error(`record_unmatched_item_observation failed for '${item.item_name}' on job ${jobId}:`, obsErr.message)
+          continue
+        }
+        const result: any = Array.isArray(obsRow) ? obsRow[0] : obsRow
+        if (result?.is_in_catalog && result.catalog_item_id) {
+          // Re-derive the exact "not in your catalog yet" substring unpricedLineReason
+          // burned into implausibility_reason above, and swap it for the "matched but
+          // unpriced" phrasing now that this item IS in the catalog -- same function,
+          // just isCatalogMatched flipped, so the two strings are guaranteed to agree.
+          const oldReason = unpricedLineReason(item.item_name, false, item.price_at_sale, item.total, item.price_intent)
+          const newReason = unpricedLineReason(item.item_name, true, item.price_at_sale, item.total, item.price_intent)
+          if (oldReason && item.implausibility_reason && item.implausibility_reason.includes(oldReason)) {
+            item.implausibility_reason = newReason
+              ? item.implausibility_reason.split(' | ').map((r: string) => r === oldReason ? newReason : r).join(' | ')
+              : (item.implausibility_reason.split(' | ').filter((r: string) => r !== oldReason).join(' | ') || null)
+          }
+          item.item_id = result.catalog_item_id
+          item.is_matched_to_catalog = true
+          if (result.newly_promoted) {
+            console.log(`Catalog learning: auto-added '${item.item_name}' to catalog (shop ${resolvedShopId}) after ${CATALOG_LEARNING_THRESHOLD} unmatched recurrences, job ${jobId}`)
+          }
+        }
+      } catch (learnErr: any) {
+        // Never let this best-effort learning step break the main response.
+        console.error(`Catalog-learning observation threw for '${item.item_name}' on job ${jobId}:`, learnErr?.message ?? learnErr)
+      }
+    }
+
+    // Every item keeps the index it holds in finalParsedItems as its `lineNo` -- stable
+    // across sale/rate-update/committed/pending splits below, so a `transactions` row
+    // and an `unmatched_queue` row for the SAME utterance never collide on line number
+    // and the shopkeeper's review UI can show pending lines in their original spoken
+    // order alongside the ones that already booked. See ISSUE-029.
+    const itemsWithLineNo = finalParsedItems.map((item, lineNo) => ({ item, lineNo }))
 
     // RATE_UPDATE items never become sale transactions — a bare "<item> <price> रुपये" with
     // no quantity is a standing-price announcement, not a sale (mirrors VoiceParser.kt / the
     // RATE_UPDATE branch in BackgroundSttProcessor.kt, which writes catalogDao().insertOrUpdate()
     // and explicitly sets autoConfirmedToLedger=false). Without this split every rate update was
     // being inserted into `transactions` as a fake qty=1 sale (see ISSUE-025 follow-up).
-    const rateUpdateItems = finalParsedItems.filter(item => item.price_intent === 'RATE_UPDATE')
-    const saleItems = finalParsedItems.filter(item => item.price_intent !== 'RATE_UPDATE')
+    const rateUpdateEntries = itemsWithLineNo.filter(e => e.item.price_intent === 'RATE_UPDATE')
+    const saleEntries = itemsWithLineNo.filter(e => e.item.price_intent !== 'RATE_UPDATE')
 
     const isValidRateUpdate = (item: any) =>
       item.item_id != null &&
       item.confidence >= 0.80 &&
       item.price_at_sale > 0.0 &&
       item.implausibility_reason === null
-    const validRateUpdates = rateUpdateItems.filter(isValidRateUpdate)
-    const rateUpdatesHandled = rateUpdateItems.length > 0 && validRateUpdates.length === rateUpdateItems.length
+    const validRateUpdateEntries = rateUpdateEntries.filter(e => isValidRateUpdate(e.item))
+    const pendingRateUpdateEntries = rateUpdateEntries.filter(e => !isValidRateUpdate(e.item))
+    const rateUpdatesHandled = rateUpdateEntries.length > 0 && validRateUpdateEntries.length === rateUpdateEntries.length
 
-    // Smart Auto-Confirm Gate: Item is auto-confirmed ONLY IF:
+    // Per-item commit gate (ISSUE-029): a sale item is committed to the ledger ONLY IF
     // 1. confidence >= 0.80 (which now encodes match quality, not just match existence)
     // 2. price_at_sale > 0.0 and total > 0.0 (No ₹0 sales in confirmed ledger!)
     // 3. valid, non-empty item name
     // 4. quantity/unit/value are plausible for a kirana shop
-    const isAutoConfirmed = saleItems.length > 0 && saleItems.every(item =>
+    //
+    // This used to be `saleItems.every(...)` -- one weak item in a 3-item recording
+    // discarded the whole utterance, all 3 items included, with zero rows reaching the
+    // ledger. Now each item is judged on its own: confident lines book immediately,
+    // weak lines go to unmatched_queue for review, and the shopkeeper sees both in one
+    // place instead of losing the confident ones along with the weak one.
+    const isCommittable = (item: any) =>
       item.confidence >= 0.80 &&
       item.price_at_sale > 0.0 &&
       item.total > 0.0 &&
@@ -1086,8 +1590,15 @@ Parse this order.`
       item.item_name.trim().length > 0 &&
       item.item_name !== "Unrecognized Item" &&
       item.implausibility_reason === null
-    )
-    const finalStatus = isAutoConfirmed ? "AUTO_CONFIRMED" : (rateUpdatesHandled ? "RATE_UPDATED" : "PARSED")
+
+    const committedSaleEntries = saleEntries.filter(e => isCommittable(e.item))
+    const pendingSaleEntries = saleEntries.filter(e => !isCommittable(e.item))
+    const isAutoConfirmed = saleEntries.length > 0 && committedSaleEntries.length === saleEntries.length
+    const finalStatus = isAutoConfirmed
+      ? "AUTO_CONFIRMED"
+      : committedSaleEntries.length > 0
+        ? "PARTIALLY_CONFIRMED"
+        : (rateUpdatesHandled ? "RATE_UPDATED" : "PARSED")
 
     // Assemble diagnostic trace
     const traceObj = {
@@ -1120,7 +1631,18 @@ Parse this order.`
           model: sarvamOutcome.model ?? null,
           mode: sarvamOutcome.model && supportsModeParam(sarvamOutcome.model) ? SARVAM_STT_MODE : null,
         },
-        transcriptScores: { grok: grokScored.score, sarvam: sarvamScored.score, adopted: bestScore },
+        onDeviceTranscript: rawOnDeviceTranscript,
+        onDeviceStt: {
+          status: onDeviceStatus || (rawOnDeviceTranscript ? 'ok' : 'unavailable'),
+          latencyMs: null
+        },
+        transcriptScores: { grok: grokScored.score, sarvam: sarvamScored.score, onDevice: onDeviceScored.score, adopted: bestScore },
+        // Diagnostic-only: the OLD whole-utterance classification, kept in the trace so
+        // a divergence from each item's own per-segment classification (which is what
+        // actually drives price_intent below) is visible when debugging. Not used for
+        // any decision since ISSUE-029.
+        wholeUtterancePriceIntentLegacy: detectPriceIntent(chosenRaw),
+        basketTotalAmbiguous: isBasketTotalAmbiguous,
       },
       step_3_deterministic_ordering_segmenter: {
         carryoverQty: null,
@@ -1140,7 +1662,22 @@ Parse this order.`
       // `step_4_ai_error: "AI Timeout"`, which read as though the AI had agreed with a
       // parse it never saw. `parse_source` on each item now says which stage produced it.
       step_4_grok_ai_interpretation: finalParsedItems,
-      step_4_interpretation_source: aiError ? 'segmenter_fallback' : 'grok_ai',
+      // The untouched pre-catalog-match answer (item_name/quantity/unit/price_intent
+      // only) -- Phase 0 instrumentation for ISSUE-031, kept separately from
+      // finalParsedItems above (which has prices/confidence/catalog-matching applied)
+      // so a memory hit/miss and Grok's literal answer can be reconstructed from the
+      // trace alone.
+      step_4_raw_ai_items: parsedRawItems,
+      step_4_interpretation_source: parseSource,
+      step_4_learned_parse_memory: {
+        memoKey,
+        catalogFingerprint,
+        memoryShopId,
+        enabled: memoryEnabled,
+        hit: !!memoryHit,
+        corroborated: memoCorroborated,
+        canarySampled: isCanarySample,
+      },
       step_5_adaptive_audio_expansion_engine: {
         // Honest reporting: this records what was actually re-run. When no re-decode
         // was needed the pass list is empty rather than claiming a fabricated pass.
@@ -1153,9 +1690,11 @@ Parse this order.`
       },
       step_4_ai_error: aiError,
       step_4_ai_model: aiModelUsed,
-      step_6_final_outcome: finalParsedItems.map(item => {
+      step_6_final_outcome: itemsWithLineNo.map(({ item, lineNo }) => {
         const isRateUpdate = item.price_intent === 'RATE_UPDATE'
+        const committed = isRateUpdate ? isValidRateUpdate(item) : isCommittable(item)
         return {
+          lineNo,
           itemName: item.item_name,
           matchedCatalogId: item.item_id,
           quantity: item.quantity,
@@ -1163,14 +1702,15 @@ Parse this order.`
           priceAtSale: item.price_at_sale,
           estimatedTotal: item.total,
           confidence: item.confidence,
-          isSanityFlagged: isRateUpdate ? !isValidRateUpdate(item) : !isAutoConfirmed,
+          isSanityFlagged: !committed,
           // Rate updates are never written to the transactions ledger — see rateUpdatesHandled above.
-          autoConfirmedToLedger: isRateUpdate ? false : isAutoConfirmed
+          autoConfirmedToLedger: isRateUpdate ? false : committed
         }
       })
     }
 
     const firstItem = finalParsedItems[0] || null
+    const lineCount = finalParsedItems.length
 
     const sttErrorSummary = [
       grokOutcome.error ? `grok: ${grokOutcome.error}` : null,
@@ -1187,21 +1727,29 @@ Parse this order.`
       hold_duration_ms: metadata.holdDurationMs || 0,
       status: finalStatus,
       raw_transcript: transcript || rawGrokTranscript || rawSarvamTranscript,
+      // parsed_* columns stay a single-line summary (line 0) for backward-compat
+      // consumers; the full per-line breakdown is step_6_final_outcome above and the
+      // real per-line rows below in transactions/unmatched_queue.
       parsed_item_name: firstItem ? firstItem.item_name : "Unrecognized Item",
       parsed_qty: firstItem ? firstItem.quantity : 1.0,
       parsed_unit: firstItem ? firstItem.unit : "PACKET",
       parsed_total: firstItem ? firstItem.total : 0.0,
-      is_sanity_flagged: !isAutoConfirmed && !rateUpdatesHandled,
+      line_count: lineCount,
+      is_sanity_flagged: finalStatus !== 'AUTO_CONFIRMED' && finalStatus !== 'RATE_UPDATED',
       error_message: transcript ? sttErrorSummary : (sttErrorSummary || "Empty transcript from STT"),
       diagnostic_trace_json: JSON.stringify(traceObj),
       audio_cloud_url: audioCloudUrl
     }
 
-    await supabase.from('stt_job_logs').upsert([logPayload], { onConflict: 'job_id' })
+    const { error: logErr } = await supabase.from('stt_job_logs').upsert([logPayload], { onConflict: 'job_id' })
+    if (logErr) console.error(`Failed to write stt_job_logs for job ${jobId}:`, logErr.message)
 
-    // Write to transactions ONLY for actual sale items (RATE_UPDATE never reaches here)
-    if (isAutoConfirmed && saleItems.length > 0) {
-      const txInserts = saleItems.map(item => ({
+    // Write to transactions for every COMMITTED sale line (RATE_UPDATE never reaches
+    // here). One row per line, keyed (job_id, line_no) -- a job can now produce more
+    // than one transaction row, which the old job_id-only unique index made
+    // impossible (the upsert failed with 42P10 and was never checked; see ISSUE-029).
+    if (committedSaleEntries.length > 0) {
+      const txInserts = committedSaleEntries.map(({ item, lineNo }) => ({
         job_id: jobId,
         shop_id: resolvedShopId,
         item_id: item.item_id,
@@ -1213,15 +1761,21 @@ Parse this order.`
         total: item.total,
         payment_mode: 'CASH',
         source: 'VOICE',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        line_no: lineNo,
+        line_count: lineCount,
       }))
-      await supabase.from('transactions').upsert(txInserts, { onConflict: 'job_id' })
-      console.log(`Inserted ${txInserts.length} auto-confirmed transactions for job ${jobId}`)
+      const { error: txErr } = await supabase.from('transactions').upsert(txInserts, { onConflict: 'job_id,line_no' })
+      if (txErr) {
+        console.error(`Failed to insert ${txInserts.length} transaction(s) for job ${jobId}:`, txErr.message)
+      } else {
+        console.log(`Inserted ${txInserts.length} committed transaction(s) for job ${jobId} (${lineCount} total lines)`)
+      }
     }
 
     // RATE_UPDATE: update the catalog's standing price directly, no transaction created.
-    if (validRateUpdates.length > 0) {
-      for (const item of validRateUpdates) {
+    if (validRateUpdateEntries.length > 0) {
+      for (const { item } of validRateUpdateEntries) {
         const { error: rateUpdateError } = await supabase
           .from('catalog_items')
           .update({ price: item.price_at_sale, updated_at: new Date().toISOString() })
@@ -1230,24 +1784,54 @@ Parse this order.`
           console.log(`Failed to apply rate update for catalog item ${item.item_id} on job ${jobId}: ${rateUpdateError.message}`)
         }
       }
-      console.log(`Applied ${validRateUpdates.length} rate update(s) to catalog_items for job ${jobId}`)
+      console.log(`Applied ${validRateUpdateEntries.length} rate update(s) to catalog_items for job ${jobId}`)
     }
 
-    // Always keep permanent record in unmatched_queue if the job wasn't fully resolved
-    // (either as a confirmed sale or as a fully-applied rate update)
-    if ((!isAutoConfirmed && !rateUpdatesHandled) || finalParsedItems.length === 0) {
-      await supabase.from('unmatched_queue').upsert([{
+    // Every line that did NOT commit (weak sale lines + unresolved rate updates) gets
+    // its own unmatched_queue row, keyed (job_id, line_no) -- previously this was one
+    // row per JOB with no item/qty/price columns at all, so a 3-item recording with one
+    // weak line surfaced as a single generic "review this" row carrying only the raw
+    // transcript; the shopkeeper had to re-listen and guess which item needed fixing.
+    const pendingEntries = [...pendingSaleEntries, ...pendingRateUpdateEntries]
+    if (pendingEntries.length > 0) {
+      const pendingInserts = pendingEntries.map(({ item, lineNo }) => ({
         job_id: jobId,
         shop_id: resolvedShopId,
         audio_ref: audioCloudUrl,
         raw_transcript: transcript || rawGrokTranscript || rawSarvamTranscript || "Voice Recording (Pending Review)",
         status: 'PENDING',
-        timestamp: new Date().toISOString()
-      }], { onConflict: 'job_id' })
-      console.log(`Routed unlisted voice job ${jobId} to unmatched_queue (shop_id: ${resolvedShopId})`)
+        timestamp: new Date().toISOString(),
+        line_no: lineNo,
+        item_name: item.item_name,
+        quantity: item.quantity,
+        unit: item.unit,
+        price_at_sale: item.price_at_sale,
+        total: item.total,
+        price_intent: item.price_intent,
+        implausibility_reason: item.implausibility_reason,
+      }))
+      const { error: uqErr } = await supabase.from('unmatched_queue').upsert(pendingInserts, { onConflict: 'job_id,line_no' })
+      if (uqErr) {
+        console.error(`Failed to write ${pendingInserts.length} unmatched_queue row(s) for job ${jobId}:`, uqErr.message)
+      } else {
+        console.log(`Routed ${pendingInserts.length} pending line(s) of job ${jobId} to unmatched_queue (shop_id: ${resolvedShopId})`)
+      }
+    } else if (finalParsedItems.length === 0) {
+      // Nothing parsed at all -- still keep a permanent record so the recording isn't
+      // silently lost from every table.
+      const { error: uqErr } = await supabase.from('unmatched_queue').upsert([{
+        job_id: jobId,
+        shop_id: resolvedShopId,
+        audio_ref: audioCloudUrl,
+        raw_transcript: transcript || rawGrokTranscript || rawSarvamTranscript || "Voice Recording (Pending Review)",
+        status: 'PENDING',
+        timestamp: new Date().toISOString(),
+        line_no: 0,
+      }], { onConflict: 'job_id,line_no' })
+      if (uqErr) console.error(`Failed to write empty-parse unmatched_queue row for job ${jobId}:`, uqErr.message)
     }
 
-    console.log(`Job ${jobId} finished background processing with status ${finalStatus}`)
+    console.log(`Job ${jobId} finished background processing with status ${finalStatus} (${committedSaleEntries.length} committed / ${pendingEntries.length} pending / ${lineCount} total lines)`)
 
   } catch (err: any) {
     console.error(`Unhandled exception in background processing for job ${jobId}:`, err)
@@ -1268,8 +1852,9 @@ Parse this order.`
         audio_ref: audioCloudUrl,
         raw_transcript: 'Processing failed — system error',
         status: 'ERROR',
-        timestamp: new Date().toISOString()
-      }], { onConflict: 'job_id' })
+        timestamp: new Date().toISOString(),
+        line_no: 0,
+      }], { onConflict: 'job_id,line_no' })
     } catch (writeErr) {
       console.error(`Failed to write ERROR status for job ${jobId}:`, writeErr)
     }

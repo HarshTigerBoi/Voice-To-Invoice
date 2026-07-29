@@ -4,18 +4,22 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -36,6 +40,7 @@ fun DailySummaryScreen(
     onRangeModeChange: (RangeMode) -> Unit,
     costPriceByItemId: Map<String, Double> = emptyMap(),
     onUpdateTxPrice: (TransactionRecord, Double) -> Unit = { _, _ -> },
+    onVoidTransaction: (TransactionRecord) -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -64,6 +69,11 @@ fun DailySummaryScreen(
     // Dialog for setting pending price
     var selectedTxForPriceSet by remember { mutableStateOf<TransactionRecord?>(null) }
     var priceInputText by remember { mutableStateOf("") }
+
+    // Swipe-to-void: a wrongly recorded sale is voided (soft deleted), never hard
+    // deleted -- this is also the correction signal the server-side Learned Parse
+    // Memory relies on to demote a self-consistent-but-wrong memoized parse.
+    var txPendingVoid by remember { mutableStateOf<TransactionRecord?>(null) }
 
     val timeFormat = SimpleDateFormat("hh:mm a", Locale.getDefault())
 
@@ -231,83 +241,113 @@ fun DailySummaryScreen(
                 }
             } else {
                 LazyColumn {
-                    items(rangeTransactions) { tx ->
+                    items(rangeTransactions, key = { it.id }) { tx ->
                         val isPending = tx.total == 0.0 || tx.priceAtSale == 0.0
                         val isPlaying = playingTxId == tx.id
                         val hasAudio = tx.audioFilePath.isNotBlank() && File(tx.audioFilePath).exists()
 
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp)
-                                .clickable {
-                                    selectedTxForPriceSet = tx
-                                    priceInputText = if (tx.priceAtSale > 0) tx.priceAtSale.toString() else ""
-                                },
-                            colors = CardDefaults.cardColors(
-                                containerColor = if (isPending) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f)
-                                else MaterialTheme.colorScheme.surfaceVariant
-                            )
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(12.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = tx.itemName,
-                                        style = MaterialTheme.typography.titleMedium
-                                    )
-                                    if (tx.rawTranscript.isNotBlank()) {
-                                        Text(
-                                            text = "🎙️ Spoken: \"${tx.rawTranscript}\"",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.primary,
-                                            fontWeight = FontWeight.SemiBold
-                                        )
-                                    }
-                                    Text(
-                                        text = if (isPending) "${tx.quantity} qty • PENDING PRICE (Tap to set)"
-                                        else "${tx.quantity} @ ₹${tx.priceAtSale} • ${timeFormat.format(Date(tx.timestamp))}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = if (isPending) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                        val dismissState = rememberSwipeToDismissBoxState(
+                            confirmValueChange = { value ->
+                                if (value == SwipeToDismissBoxValue.EndToStart || value == SwipeToDismissBoxValue.StartToEnd) {
+                                    txPendingVoid = tx
+                                }
+                                // Never let the framework auto-commit the dismiss -- voiding
+                                // only actually happens if the confirm dialog below is accepted.
+                                false
+                            }
+                        )
+
+                        SwipeToDismissBox(
+                            state = dismissState,
+                            modifier = Modifier.padding(vertical = 4.dp),
+                            backgroundContent = {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(MaterialTheme.colorScheme.error, RoundedCornerShape(8.dp))
+                                        .padding(horizontal = 20.dp),
+                                    contentAlignment = if (dismissState.dismissDirection == SwipeToDismissBoxValue.EndToStart) Alignment.CenterEnd else Alignment.CenterStart
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Delete,
+                                        contentDescription = "Void sale",
+                                        tint = Color.White
                                     )
                                 }
-
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    if (hasAudio) {
-                                        IconButton(
-                                            onClick = {
-                                                if (isPlaying) {
-                                                    audioFileManager.stopAudio()
-                                                    playingTxId = null
-                                                } else {
-                                                    playingTxId = tx.id
-                                                    audioFileManager.playAudio(tx.audioFilePath) {
-                                                        playingTxId = null
-                                                    }
-                                                }
-                                            },
-                                            modifier = Modifier.size(36.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.PlayArrow,
-                                                contentDescription = "Play Recording",
-                                                tint = if (isPlaying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                                modifier = Modifier.size(20.dp)
+                            }
+                        ) {
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        selectedTxForPriceSet = tx
+                                        priceInputText = if (tx.priceAtSale > 0) tx.priceAtSale.toString() else ""
+                                    },
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isPending) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f)
+                                    else MaterialTheme.colorScheme.surfaceVariant
+                                )
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = tx.itemName,
+                                            style = MaterialTheme.typography.titleMedium
+                                        )
+                                        if (tx.rawTranscript.isNotBlank()) {
+                                            Text(
+                                                text = "🎙️ Spoken: \"${tx.rawTranscript}\"",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.primary,
+                                                fontWeight = FontWeight.SemiBold
                                             )
                                         }
-                                        Spacer(Modifier.width(4.dp))
+                                        Text(
+                                            text = if (isPending) "${tx.quantity} qty • PENDING PRICE (Tap to set)"
+                                            else "${tx.quantity} @ ₹${tx.priceAtSale} • ${timeFormat.format(Date(tx.timestamp))}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = if (isPending) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
                                     }
 
-                                    Text(
-                                        text = if (isPending) "Set Price" else "₹${tx.total.toInt()}",
-                                        style = MaterialTheme.typography.titleMedium,
-                                        color = if (isPending) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
-                                    )
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        if (hasAudio) {
+                                            IconButton(
+                                                onClick = {
+                                                    if (isPlaying) {
+                                                        audioFileManager.stopAudio()
+                                                        playingTxId = null
+                                                    } else {
+                                                        playingTxId = tx.id
+                                                        audioFileManager.playAudio(tx.audioFilePath) {
+                                                            playingTxId = null
+                                                        }
+                                                    }
+                                                },
+                                                modifier = Modifier.size(36.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.PlayArrow,
+                                                    contentDescription = "Play Recording",
+                                                    tint = if (isPlaying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    modifier = Modifier.size(20.dp)
+                                                )
+                                            }
+                                            Spacer(Modifier.width(4.dp))
+                                        }
+
+                                        Text(
+                                            text = if (isPending) "Set Price" else "₹${tx.total.toInt()}",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = if (isPending) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -376,6 +416,34 @@ fun DailySummaryScreen(
             },
             dismissButton = {
                 TextButton(onClick = { selectedTxForPriceSet = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Void Confirmation Dialog -- swiping a row never voids it directly, so an
+    // accidental swipe can't silently delete a real sale.
+    txPendingVoid?.let { tx ->
+        AlertDialog(
+            onDismissRequest = { txPendingVoid = null },
+            title = { Text("Void this sale?") },
+            text = {
+                Text("\"${tx.itemName}\" (${tx.quantity} @ ₹${tx.priceAtSale} = ₹${tx.total.toInt()}) will be removed from the ledger. This cannot be undone from here.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onVoidTransaction(tx)
+                        txPendingVoid = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Void Sale")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { txPendingVoid = null }) {
                     Text("Cancel")
                 }
             }

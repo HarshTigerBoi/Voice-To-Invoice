@@ -12,12 +12,18 @@ import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 
+data class OnDeviceResult(
+    val transcript: String,
+    val status: String
+)
+
 class OnDeviceSpeechRecognizer(private val context: Context) {
 
     private var speechRecognizer: SpeechRecognizer? = null
-    private var resultDeferred: CompletableDeferred<String>? = null
+    private var resultDeferred: CompletableDeferred<OnDeviceResult>? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var isListening = false
+    @Volatile private var latestPartialText: String = ""
 
     fun isAvailable(): Boolean {
         return try {
@@ -28,12 +34,16 @@ class OnDeviceSpeechRecognizer(private val context: Context) {
     }
 
     fun startListening(languageCode: String = "hi-IN") {
-        if (!isAvailable()) return
+        if (!isAvailable()) {
+            resultDeferred = CompletableDeferred(OnDeviceResult("", "unavailable"))
+            return
+        }
 
         mainHandler.post {
             try {
                 release()
                 resultDeferred = CompletableDeferred()
+                latestPartialText = ""
                 val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
                 speechRecognizer = recognizer
 
@@ -45,23 +55,46 @@ class OnDeviceSpeechRecognizer(private val context: Context) {
                     override fun onEndOfSpeech() {}
 
                     override fun onError(error: Int) {
-                        Log.w("OnDeviceRecognizer", "SpeechRecognizer error: $error")
+                        val statusStr = when (error) {
+                            SpeechRecognizer.ERROR_AUDIO -> "error_audio"
+                            SpeechRecognizer.ERROR_CLIENT -> "error_client"
+                            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "error_permissions"
+                            SpeechRecognizer.ERROR_NETWORK -> "error_network"
+                            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "error_network_timeout"
+                            SpeechRecognizer.ERROR_NO_MATCH -> "no_match"
+                            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "error_busy"
+                            SpeechRecognizer.ERROR_SERVER -> "error_server"
+                            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "error_speech_timeout"
+                            else -> "error_$error"
+                        }
+                        Log.w("OnDeviceRecognizer", "SpeechRecognizer error: $error ($statusStr)")
                         isListening = false
-                        resultDeferred?.complete("")
+                        
+                        if (latestPartialText.isNotBlank()) {
+                            resultDeferred?.complete(OnDeviceResult(latestPartialText, "partial_fallback"))
+                        } else {
+                            resultDeferred?.complete(OnDeviceResult("", statusStr))
+                        }
                     }
 
                     override fun onResults(results: Bundle?) {
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         val text = matches?.firstOrNull() ?: ""
                         isListening = false
-                        resultDeferred?.complete(text)
+                        if (text.isNotBlank()) {
+                            resultDeferred?.complete(OnDeviceResult(text, "ok"))
+                        } else if (latestPartialText.isNotBlank()) {
+                            resultDeferred?.complete(OnDeviceResult(latestPartialText, "partial_fallback"))
+                        } else {
+                            resultDeferred?.complete(OnDeviceResult("", "no_match"))
+                        }
                     }
 
                     override fun onPartialResults(partialResults: Bundle?) {
                         val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         val text = matches?.firstOrNull()
-                        if (!text.isNullOrBlank() && resultDeferred?.isCompleted == false) {
-                            // Keep partial in mind if needed
+                        if (!text.isNullOrBlank()) {
+                            latestPartialText = text.trim()
                         }
                     }
 
@@ -80,7 +113,7 @@ class OnDeviceSpeechRecognizer(private val context: Context) {
             } catch (e: Exception) {
                 Log.e("OnDeviceRecognizer", "Failed to start listening", e)
                 isListening = false
-                resultDeferred?.complete("")
+                resultDeferred?.complete(OnDeviceResult("", "error_exception"))
             }
         }
     }
@@ -97,15 +130,24 @@ class OnDeviceSpeechRecognizer(private val context: Context) {
         }
     }
 
-    suspend fun awaitTranscript(timeoutMs: Long = 4000L): String {
-        val deferred = resultDeferred ?: return ""
+    suspend fun awaitResult(timeoutMs: Long = 4000L): OnDeviceResult {
+        val deferred = resultDeferred ?: return OnDeviceResult("", "unavailable")
         return try {
             withTimeoutOrNull(timeoutMs) {
                 deferred.await()
-            } ?: ""
+            } ?: if (latestPartialText.isNotBlank()) {
+                OnDeviceResult(latestPartialText, "partial_fallback")
+            } else {
+                OnDeviceResult("", "timeout")
+            }
         } catch (e: Exception) {
-            ""
+            OnDeviceResult("", "error_exception")
         }
+    }
+
+    @Deprecated("Use awaitResult() instead", ReplaceWith("awaitResult(timeoutMs).transcript"))
+    suspend fun awaitTranscript(timeoutMs: Long = 4000L): String {
+        return awaitResult(timeoutMs).transcript
     }
 
     fun release() {
