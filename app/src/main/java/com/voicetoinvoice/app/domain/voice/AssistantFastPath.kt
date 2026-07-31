@@ -127,11 +127,11 @@ object AssistantFastPath {
                             audioEndMs = releaseMs + 300L,
                             synced = false
                         )
-                        val insertedId = db.sttJobDao().insert(job)
+                        db.sttJobDao().insertJob(job)
                         val workRequest = androidx.work.OneTimeWorkRequestBuilder<com.voicetoinvoice.app.domain.processor.SttWorker>()
                             .setInputData(
                                 androidx.work.workDataOf(
-                                    com.voicetoinvoice.app.domain.processor.SttWorker.KEY_JOB_ID to insertedId,
+                                    com.voicetoinvoice.app.domain.processor.SttWorker.KEY_JOB_ID to job.id,
                                     com.voicetoinvoice.app.domain.processor.SttWorker.KEY_AUDIO_PATH to extractedAudio.absolutePath
                                 )
                             )

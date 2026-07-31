@@ -46,10 +46,10 @@ interface SttJobDao {
     // PARTIALLY_CONFIRMED jobs (multi-item capture -- ISSUE-029) still have pending
     // lines needing review even though some of their lines already booked, so they
     // belong in the same review queue as PARSED jobs.
-    @Query("SELECT * FROM stt_jobs WHERE status IN ('PARSED', 'PARTIALLY_CONFIRMED') ORDER BY recordedAtMs DESC")
+    @Query("SELECT * FROM stt_jobs WHERE status IN ('PARSED', 'PARTIALLY_CONFIRMED', 'ERROR', 'FAILED') ORDER BY recordedAtMs DESC")
     fun getParsedJobsFlow(): Flow<List<SttJobRecord>>
 
-    @Query("SELECT COUNT(*) FROM stt_jobs WHERE status IN ('PARSED', 'PARTIALLY_CONFIRMED')")
+    @Query("SELECT COUNT(*) FROM stt_jobs WHERE status IN ('PARSED', 'PARTIALLY_CONFIRMED', 'ERROR', 'FAILED')")
     fun getParsedJobsCountFlow(): Flow<Int>
 
     // End-to-End Processing Trace Log Queries

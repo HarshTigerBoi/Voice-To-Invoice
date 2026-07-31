@@ -119,6 +119,26 @@
 - **Verification**: Verified with JVM unit tests (`BUILD SUCCESSFUL`), deployed edge function (`lyowklxsbfznnqridtgr`), assembled and installed debug APK (`VoiceToInvoice_v94.apk`) on connected Xiaomi Poco device `23049PCD8I`, and exported `VoiceToInvoice_v94.apk`.
 - **Status**: CLOSED
 
+#### [ISSUE-066] [2026-07-31] Build Break Resolution: Fixed 17 Kotlin Compiler Errors Across PttMicButton, AssistantFastPath & HomeScreen (VoiceToInvoice_v95.apk)
+- **Symptom**: Kotlin compilation (`compileDebugKotlin`) failed with 17 unresolved reference errors, preventing any newly edited code from building or running.
+- **Root Cause**:
+  1. `PttMicButton.kt` called `pttBurstCoalescer.onPressReleased` (nonexistent API) and referenced non-existent fields (`isCoalesced`, `boundariesJson`).
+  2. `AssistantFastPath.kt` called `db.sttJobDao().insert(job)` expecting a return ID, whereas the DAO method is `insertJob(job): Unit` (IDs are generated client-side).
+  3. `HomeScreen.kt` referenced `Icons.Default.RateReview` (missing from core material icons without extended icons dependency).
+- **Resolution**:
+  1. Replaced `PttMicButton.kt` assistant mic fallback block with proper `recordPressRelease` + `forceFlush` API and real entity properties (`pressCount`, `utteranceBoundariesJson()`).
+  2. Replaced `insert` with `insertJob` in `AssistantFastPath.kt` and updated ID references to `job.id`.
+  3. Replaced `RateReview` icon with `Icons.Default.List` and imported it in `HomeScreen.kt`. Also updated `SttJobDao.kt` `getParsedJobsFlow()` query to include `ERROR` and `FAILED` status records so unparsed and failed recordings remain accessible in the review queue.
+- **Verification**: Verified clean build via `./gradlew.bat compileDebugKotlin` (`BUILD SUCCESSFUL in 9s`), full JVM test suite (`BUILD SUCCESSFUL in 21s`), assembled and installed `VoiceToInvoice_v95.apk` on physical device `23049PCD8I`, and exported `VoiceToInvoice_v95.apk`.
+- **Status**: CLOSED
+
+#### [ISSUE-067] [2026-07-31] Live Verification of `ensure_shop` Postgres RPC Function on Supabase DB
+- **Symptom**: Edge function `process-voice-job` was calling `ensure_shop` RPC on start, but prior to live migration application, the RPC function did not exist in Postgres, causing foreign key violations.
+- **Root Cause**: Migration file `20260731020000_shop_row_autoprovision.sql` was written but required live execution against the remote Supabase database.
+- **Resolution**: Applied migration `20260731020000_shop_row_autoprovision.sql` live via `npx supabase db push`. Probed the live endpoint directly via Node.js script.
+- **Verification**: Direct HTTP RPC call `POST /rest/v1/rpc/ensure_shop` with sentinel shop UUID `00000000-0000-0000-0000-000000000001` returned `STATUS: 200` and response `"00000000-0000-0000-0000-000000000001"`.
+- **Status**: CLOSED
+
 #### [ISSUE-060] [2026-07-31] Phase 2 Feature Expansion Complete — Snooze Persistence (DB v23), Item Velocity Bucketing, Expiry Batching & Tracking, Bill PNG Builder, and Repeat Order Sheet
 - **Symptom**: Feature expansion required for Phase 2:
   1. Snoozing/dismissing alerts was in-memory only and lost on app restart.
@@ -860,4 +880,4 @@ CREATE TABLE IF NOT EXISTS public.transactions (
 - **Primary Edge Function**: [process-voice-job/index.ts](file:///C:/Users/harsh/Documents/Voice%20To%20Invoice/supabase/functions/process-voice-job/index.ts)
 - **DB Setup Function**: [db-setup/index.ts](file:///C:/Users/harsh/Documents/Voice%20To%20Invoice/supabase/functions/db-setup/index.ts)
 - **Android Background Worker**: [SttWorker.kt](file:///C:/Users/harsh/Documents/Voice%20To%20Invoice/app/src/main/java/com/voicetoinvoice/app/domain/processor/SttWorker.kt)
-- **Latest Debug APK**: `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v94.apk`
+- **Latest Debug APK**: `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v95.apk`

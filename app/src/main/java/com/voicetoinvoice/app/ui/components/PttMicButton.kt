@@ -179,45 +179,44 @@ fun PttMicButton(
                                             releaseMs = assistantReleaseTs
                                         )
                                     } else {
-                                        pttBurstCoalescer.onPressReleased(
-                                            pressStartMs = assistantPressTs,
-                                            releaseMs = assistantReleaseTs,
-                                            onGroupReady = { burstGroup ->
-                                                scope.launch(Dispatchers.IO) {
-                                                    val targetFile = File.createTempFile("voice_record_", ".wav", context.cacheDir)
-                                                    val extractedAudio = rollingAudioBuffer.extractAudioWindow(
-                                                        startMs = burstGroup.startMs,
-                                                        endMs = burstGroup.endMs,
-                                                        outputFile = targetFile,
-                                                        floorStartMs = burstGroup.startMs
-                                                    )
-                                                    if (extractedAudio != null && extractedAudio.length() > 0) {
-                                                        pttWindowLedger.commitWindow(burstGroup.startMs, burstGroup.endMs)
-                                                        val job = SttJobRecord(
-                                                            audioFilePath = extractedAudio.absolutePath,
-                                                            status = SttJobStatus.QUEUED,
-                                                            captureIntent = CaptureIntent.ASSISTANT,
-                                                            audioStartMs = burstGroup.startMs,
-                                                            audioEndMs = burstGroup.endMs,
-                                                            isCoalescedBurst = burstGroup.isCoalesced,
-                                                            coalescedPressCount = burstGroup.pressCount,
-                                                            utteranceBoundariesJson = burstGroup.boundariesJson
-                                                        )
-                                                        val insertedId = db.sttJobDao().insert(job)
-                                                        val workRequest = OneTimeWorkRequestBuilder<SttWorker>()
-                                                            .setInputData(
-                                                                androidx.work.workDataOf(
-                                                                    SttWorker.KEY_JOB_ID to insertedId,
-                                                                    SttWorker.KEY_AUDIO_PATH to extractedAudio.absolutePath
-                                                                )
-                                                            )
-                                                            .setExpedited(androidx.work.OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-                                                            .build()
-                                                        WorkManager.getInstance(context).enqueue(workRequest)
-                                                    }
-                                                }
-                                            }
+                                        val flushed = pttBurstCoalescer.recordPressRelease(
+                                            assistantPressTs, assistantReleaseTs, pttWindowLedger.lastConsumedEndMs()
                                         )
+                                        val group = flushed ?: pttBurstCoalescer.forceFlush(pttWindowLedger.lastConsumedEndMs())
+                                        if (group != null) {
+                                            val targetFile = File.createTempFile("voice_record_", ".wav", context.cacheDir)
+                                            val extractedAudio = rollingAudioBuffer.extractAudioWindow(
+                                                startMs = group.startMs,
+                                                endMs = group.endMs,
+                                                outputFile = targetFile,
+                                                floorStartMs = group.startMs
+                                            )
+                                            if (extractedAudio != null && extractedAudio.length() > 0) {
+                                                pttWindowLedger.commitWindow(group.startMs, group.endMs)
+                                                val job = SttJobRecord(
+                                                    audioFilePath = extractedAudio.absolutePath,
+                                                    status = SttJobStatus.QUEUED,
+                                                    pressStartMs = group.firstPressMs,
+                                                    releaseMs = group.lastReleaseMs,
+                                                    audioStartMs = group.startMs,
+                                                    audioEndMs = group.endMs,
+                                                    utteranceBoundariesJson = group.utteranceBoundariesJson(),
+                                                    pressCount = group.pressCount,
+                                                    captureIntent = CaptureIntent.ASSISTANT
+                                                )
+                                                db.sttJobDao().insertJob(job)
+                                                val workRequest = OneTimeWorkRequestBuilder<SttWorker>()
+                                                    .setInputData(
+                                                        workDataOf(
+                                                            SttWorker.KEY_JOB_ID to job.id,
+                                                            SttWorker.KEY_AUDIO_PATH to extractedAudio.absolutePath
+                                                        )
+                                                    )
+                                                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                                                    .build()
+                                                WorkManager.getInstance(context).enqueue(workRequest)
+                                            }
+                                        }
                                     }
                                 }
                                 return@detectTapGestures

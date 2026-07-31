@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Keyboard
+import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Receipt
@@ -230,7 +231,7 @@ fun HomeScreen(
                 title = { Text("Shop Ledger") },
                 actions = {
                     IconButton(onClick = { showPendingSheet = true }) {
-                        Icon(androidx.compose.material.icons.Icons.Default.RateReview, contentDescription = "समीक्षा (Pending Review)")
+                        Icon(Icons.Default.List, contentDescription = "समीक्षा (Pending Review)")
                     }
                     IconButton(onClick = onNavigateToSummary) {
                         Icon(Icons.Default.Receipt, contentDescription = "Summary")
