@@ -1,8 +1,8 @@
 # Remaining Work Plan — handoff
 
-**Written**: 2026-07-31 · **Last build**: `VoiceToInvoice_v92.apk` · **Tests**: 17 instrumented + full JVM suite, all green on the real device (`23049PCD8I`, Android 15)
+**Written**: 2026-07-31 · **Last build**: `VoiceToInvoice_v93.apk` · **Tests**: 20 instrumented + full JVM suite, all green on the real device (`23049PCD8I`, Android 15)
 
-This is the to-do list for everything NOT finished. For what *is* done, see the status block at the top of [master_build_plan.md](master_build_plan.md) and ISSUE-049…059 in [audit.md](audit.md).
+This is the to-do list for everything NOT finished. For what *is* done, see the status block at the top of [master_build_plan.md](master_build_plan.md) and ISSUE-049…064 in [audit.md](audit.md).
 
 ---
 

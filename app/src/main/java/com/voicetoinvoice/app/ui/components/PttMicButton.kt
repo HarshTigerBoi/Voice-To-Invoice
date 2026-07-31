@@ -140,12 +140,28 @@ fun PttMicButton(
                             // AssistantFastPath's doc comment for why that trade is acceptable
                             // for a question mic.
                             if (intent == CaptureIntent.ASSISTANT) {
-                                rollingAudioBuffer.stopRollingBuffer()
+                                pttWindowLedger.recordPress(pressTimestamp)
                                 try { onDeviceRecognizer.startListening("hi-IN") } catch (e: Exception) {}
 
                                 tryAwaitRelease()
 
                                 val assistantReleaseTs = System.currentTimeMillis()
+                                val holdDurationMs = Math.max(assistantReleaseTs - pressTimestamp, 100L)
+
+                                if (holdDurationMs >= LONG_HOLD_WARNING_MS) {
+                                    Toast.makeText(
+                                        context,
+                                        "बहुत लंबी रिकॉर्डिंग — कृपया थोड़े आइटम एक बार में बोलें",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
+
+                                try {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+
                                 isRecording = false
                                 onRecordingStateChange?.invoke(false)
                                 try { onDeviceRecognizer.finishListening() } catch (e: Exception) {}
@@ -153,18 +169,56 @@ fun PttMicButton(
                                 val assistantPressTs = pressTimestamp
                                 scope.launch(Dispatchers.IO) {
                                     val result = onDeviceRecognizer.awaitResult(2500L)
-                                    // Mic hygiene restored immediately -- before answer
-                                    // composition/TTS, which can take a moment -- the ring
-                                    // buffer must not stay paused any longer than the press.
-                                    rollingAudioBuffer.startRollingBuffer()
-                                    com.voicetoinvoice.app.domain.voice.AssistantFastPath.handle(
-                                        context = context,
-                                        db = db,
-                                        rollingAudioBuffer = rollingAudioBuffer,
-                                        transcript = result.transcript,
-                                        pressStartMs = assistantPressTs,
-                                        releaseMs = assistantReleaseTs
-                                    )
+                                    if (result.transcript.isNotBlank()) {
+                                        com.voicetoinvoice.app.domain.voice.AssistantFastPath.handle(
+                                            context = context,
+                                            db = db,
+                                            rollingAudioBuffer = rollingAudioBuffer,
+                                            transcript = result.transcript,
+                                            pressStartMs = assistantPressTs,
+                                            releaseMs = assistantReleaseTs
+                                        )
+                                    } else {
+                                        pttBurstCoalescer.onPressReleased(
+                                            pressStartMs = assistantPressTs,
+                                            releaseMs = assistantReleaseTs,
+                                            onGroupReady = { burstGroup ->
+                                                scope.launch(Dispatchers.IO) {
+                                                    val targetFile = File.createTempFile("voice_record_", ".wav", context.cacheDir)
+                                                    val extractedAudio = rollingAudioBuffer.extractAudioWindow(
+                                                        startMs = burstGroup.startMs,
+                                                        endMs = burstGroup.endMs,
+                                                        outputFile = targetFile,
+                                                        floorStartMs = burstGroup.startMs
+                                                    )
+                                                    if (extractedAudio != null && extractedAudio.length() > 0) {
+                                                        pttWindowLedger.commitWindow(burstGroup.startMs, burstGroup.endMs)
+                                                        val job = SttJobRecord(
+                                                            audioFilePath = extractedAudio.absolutePath,
+                                                            status = SttJobStatus.QUEUED,
+                                                            captureIntent = CaptureIntent.ASSISTANT,
+                                                            audioStartMs = burstGroup.startMs,
+                                                            audioEndMs = burstGroup.endMs,
+                                                            isCoalescedBurst = burstGroup.isCoalesced,
+                                                            coalescedPressCount = burstGroup.pressCount,
+                                                            utteranceBoundariesJson = burstGroup.boundariesJson
+                                                        )
+                                                        val insertedId = db.sttJobDao().insert(job)
+                                                        val workRequest = OneTimeWorkRequestBuilder<SttWorker>()
+                                                            .setInputData(
+                                                                androidx.work.workDataOf(
+                                                                    SttWorker.KEY_JOB_ID to insertedId,
+                                                                    SttWorker.KEY_AUDIO_PATH to extractedAudio.absolutePath
+                                                                )
+                                                            )
+                                                            .setExpedited(androidx.work.OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                                                            .build()
+                                                        WorkManager.getInstance(context).enqueue(workRequest)
+                                                    }
+                                                }
+                                            }
+                                        )
+                                    }
                                 }
                                 return@detectTapGestures
                             }

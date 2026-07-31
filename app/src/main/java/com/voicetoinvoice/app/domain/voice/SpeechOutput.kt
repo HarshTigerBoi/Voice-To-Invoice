@@ -1,12 +1,14 @@
 package com.voicetoinvoice.app.domain.voice
 
 import android.content.Context
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import com.voicetoinvoice.app.network.SupabaseConfig
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -16,8 +18,6 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-
-import android.media.AudioAttributes
 
 class SpeechOutput(
     private val context: Context,
@@ -46,30 +46,28 @@ class SpeechOutput(
      *   assistant's fast path (§3.3), where the whole point is answering before the
      *   shopkeeper has time to wonder if the press registered -- everything else keeps
      *   the higher-quality Grok voice as the default. */
-    suspend fun speak(text: String, preferOffline: Boolean = false, onComplete: (() -> Unit)? = null) = withContext(Dispatchers.IO) {
-        stop()
-
-        rollingAudioBuffer?.setSuppressed(true)
-
-        if (!preferOffline) {
-            // 1. Try Grok TTS via Edge Proxy
-            val audioFile = fetchGrokTtsAudio(text)
-            if (audioFile != null && audioFile.exists() && audioFile.length() > 0) {
-                playAudioFile(audioFile) {
-                    rollingAudioBuffer?.setSuppressed(false)
-                    onComplete?.invoke()
+    suspend fun speak(text: String, preferOffline: Boolean = false, onComplete: (() -> Unit)? = null) =
+        withContext(Dispatchers.IO + NonCancellable) {
+            stop()
+            rollingAudioBuffer?.setSuppressed(true)
+            try {
+                if (!preferOffline) {
+                    // 1. Try Grok TTS via Edge Proxy
+                    val audioFile = fetchGrokTtsAudio(text)
+                    if (audioFile != null && audioFile.exists() && audioFile.length() > 0) {
+                        playAudioFile(audioFile)
+                        onComplete?.invoke()
+                        return@withContext
+                    }
                 }
-                return@withContext
+
+                // 2. Android System TextToSpeech -- either the preferred path (preferOffline)
+                //    or the fallback when Grok TTS failed/was skipped.
+                speakOffline(text, onComplete)
+            } finally {
+                rollingAudioBuffer?.setSuppressed(false)
             }
         }
-
-        // 2. Android System TextToSpeech -- either the preferred path (preferOffline)
-        //    or the fallback when Grok TTS failed/was skipped.
-        speakOffline(text) {
-            rollingAudioBuffer?.setSuppressed(false)
-            onComplete?.invoke()
-        }
-    }
 
     /** Speaks via the on-device engine and calls [onComplete] when speech actually
      *  finishes, via UtteranceProgressListener -- the previous version invoked
@@ -117,7 +115,6 @@ class SpeechOutput(
     }
 
     fun stop() {
-        rollingAudioBuffer?.setSuppressed(false)
         try {
             activeMediaPlayer?.stop()
             activeMediaPlayer?.release()
@@ -166,7 +163,7 @@ class SpeechOutput(
         return@withContext null
     }
 
-    private fun playAudioFile(file: File, onComplete: (() -> Unit)?) {
+    private suspend fun playAudioFile(file: File) = suspendCancellableCoroutine<Unit> { cont ->
         try {
             val mp = MediaPlayer().apply {
                 setAudioAttributes(
@@ -180,16 +177,18 @@ class SpeechOutput(
                 setOnCompletionListener {
                     it.release()
                     activeMediaPlayer = null
-                    rollingAudioBuffer?.setSuppressed(false)
-                    onComplete?.invoke()
+                    if (cont.isActive) cont.resumeWith(Result.success(Unit))
+                }
+                setOnErrorListener { _, _, _ ->
+                    if (cont.isActive) cont.resumeWith(Result.success(Unit))
+                    true
                 }
                 start()
             }
             activeMediaPlayer = mp
         } catch (e: Exception) {
             Log.e("SpeechOutput", "MediaPlayer play failed", e)
-            rollingAudioBuffer?.setSuppressed(false)
-            onComplete?.invoke()
+            if (cont.isActive) cont.resumeWith(Result.success(Unit))
         }
     }
 

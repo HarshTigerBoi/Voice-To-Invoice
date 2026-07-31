@@ -111,13 +111,41 @@ object AssistantFastPath {
                 AssistantIntent.STOCK_IN, AssistantIntent.WASTE,
                 AssistantIntent.RETURN, AssistantIntent.PRICE_UPDATE,
                 AssistantIntent.EXPIRY_WRITEOFF -> {
-                    // No audio was captured during this press (mic was handed to the
-                    // on-device recognizer) -- cannot route this to commitParsedLines or
-                    // any item-level handler, which needs the server's audio-based parse.
-                    // Redirect instead of silently doing nothing or guessing.
-                    answer = "यह बिक्री जैसा लगा। कृपया नकद, उधार या माल बटन दबाकर बोलिए।"
-                    finalStatus = SttJobStatus.PARSED
-                    clientTrace.put("outcome", "redirected_write_shaped_no_audio")
+                    val targetFile = java.io.File.createTempFile("voice_record_", ".wav", context.cacheDir)
+                    val extractedAudio = rollingAudioBuffer.extractAudioWindow(
+                        startMs = pressStartMs - 300L,
+                        endMs = releaseMs + 300L,
+                        outputFile = targetFile
+                    )
+                    if (extractedAudio != null && extractedAudio.length() > 0) {
+                        val job = SttJobRecord(
+                            audioFilePath = extractedAudio.absolutePath,
+                            status = SttJobStatus.QUEUED,
+                            rawTranscript = clean,
+                            captureIntent = CaptureIntent.ASSISTANT,
+                            audioStartMs = pressStartMs - 300L,
+                            audioEndMs = releaseMs + 300L,
+                            synced = false
+                        )
+                        val insertedId = db.sttJobDao().insert(job)
+                        val workRequest = androidx.work.OneTimeWorkRequestBuilder<com.voicetoinvoice.app.domain.processor.SttWorker>()
+                            .setInputData(
+                                androidx.work.workDataOf(
+                                    com.voicetoinvoice.app.domain.processor.SttWorker.KEY_JOB_ID to insertedId,
+                                    com.voicetoinvoice.app.domain.processor.SttWorker.KEY_AUDIO_PATH to extractedAudio.absolutePath
+                                )
+                            )
+                            .setExpedited(androidx.work.OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                            .build()
+                        androidx.work.WorkManager.getInstance(context).enqueue(workRequest)
+                        answer = "प्रोसेस किया जा रहा है..."
+                        finalStatus = SttJobStatus.QUEUED
+                        clientTrace.put("outcome", "enqueued_write_shaped_assistant_job")
+                    } else {
+                        answer = "यह बिक्री जैसा लगा। कृपया नकद, उधार या माल बटन दबाकर बोलिए।"
+                        finalStatus = SttJobStatus.PARSED
+                        clientTrace.put("outcome", "redirected_write_shaped_no_audio")
+                    }
                 }
                 else -> {
                     answer = ResponseComposer.formatUnrecognized()

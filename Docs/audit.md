@@ -33,6 +33,7 @@
 | **Catalog pull/merge (server→client)** | `SyncEngine.pullCatalogFromCloud()`, run **last** in `syncAllUnsynced()`. Never overwrites a local `synced = false` row; otherwise last-write-wins on `updatedAt`; inserts unknown ids; skips server rows whose name already exists locally; never deletes locally. | `SyncEngine.kt`, `CloudSyncManager.fetchCatalogFromCloud()` | Added in ISSUE-035. The **only** server→client read path in the app — everything else is push-only. Exists because two server paths originate catalog data the phone cannot otherwise see: ISSUE-033's auto-add and ISSUE-026's server-side `RATE_UPDATE` price write. `fetchCatalogFromCloud` returns `null` (not an empty list) on failure specifically so a dropped connection can never be mistaken for an empty catalog. |
 | **EntityResolver Thresholds** | `THRESHOLD = 0.80`, `MARGIN = 0.15` | `EntityResolver.kt` | Added in ISSUE-037. `EntityResolver` scores candidates across phonetic name (0.50), keyword (0.30), exact code/phone (0.80), recency (0.05), and frequency (0.05). Returns `AUTO_ASSIGN` if `top1 >= 0.80 && (top1 - top2) >= 0.15`, else `ASK`. Pool non-empty guarantee enforced. |
 | **Room Database Version** | **`version = 23`** | `AppDatabase.kt` (`MIGRATION_22_23`) | Updated in ISSUE-060. Added `alert_dismissals` table (`AlertDismissal` entity, `AlertDismissalDao`). |
+| **RollingAudioBuffer Invariants & Suppression Watchdog** | `MIN_WINDOW_BYTES` = **9600** (~300ms), `MAX_SUPPRESSION_MS` = **20,000ms** (20s watchdog), `bufferCapacity` = **3,840,000 bytes** (120s @ 16kHz 16-bit mono), `stopRollingBuffer` join timeout = **500ms** | `RollingAudioBuffer.kt` | Added in ISSUE-061 / ISSUE-063. Enforces ring buffer addressing invariant `writeHead == totalBytesWritten % bufferCapacity`, auto-clears TTS suppression leaks after 20s, and blocks up to 500ms on thread join for mic release. |
 
 ---
 
@@ -74,6 +75,34 @@
 ---
 
 ### 🟢 RESOLVED ISSUES
+
+#### [ISSUE-061] [2026-07-31] Audio Pipeline BUG-A Fix: Ring Buffer Addressing Invariant Restored
+- **Symptom**: App background/foreground cycles or assistant mic presses caused `RollingAudioBuffer` to return zero-byte audio files or extract wrong audio segments from up to 120s prior.
+- **Root Cause**: `startRollingBuffer()` reset `totalBytesWritten = 0L` without resetting `writeHead = 0`, breaking the invariant `writeHead == totalBytesWritten % bufferCapacity`.
+- **Resolution**: Reset `writeHead = 0`, `totalBytesWritten = 0L`, `lastWriteAtMs = 0L`, and `isSuppressed.set(false)` inside `synchronized(ringBuffer)` in `startRollingBuffer()`.
+- **Verification**: Verified with 5 unit tests in `RollingBufferWindowTest.kt` and instrumented test `RollingBufferRestartTest.restartResetsWriteHeadWithCounter` on physical device `23049PCD8I`.
+- **Status**: CLOSED
+
+#### [ISSUE-062] [2026-07-31] Audio Pipeline BUG-B Fix: Mic Release Blocking Join in stopRollingBuffer
+- **Symptom**: Assistant mic recording returned blank transcripts 100% of the time, and subsequent speech recognition failed after buffer stops.
+- **Root Cause**: `stopRollingBuffer()` returned immediately while `AudioRecord` was stopped/released asynchronously on the capture thread, leaving the microphone locked.
+- **Resolution**: Moved `audioRecord.stop()` and `audioRecord.release()` into `finally` block on capture thread, and added `thread?.join(500L)` in `stopRollingBuffer()`.
+- **Verification**: Verified with instrumented test `RollingBufferRestartTest.stopReleasesMicBeforeReturning` on physical device `23049PCD8I`.
+- **Status**: CLOSED
+
+#### [ISSUE-063] [2026-07-31] Audio Pipeline BUG-C Fix: TTS Suppression Leak Prevention & Watchdog
+- **Symptom**: Coroutine cancellation during TTS playback left `isSuppressed = true` permanently, filling all subsequent mic recordings with digital silence.
+- **Root Cause**: `SpeechOutput.speak()` relied on non-guaranteed completion callbacks to clear suppression.
+- **Resolution**: Wrapped `speak()` in `withContext(Dispatchers.IO + NonCancellable)` with `try { ... } finally { rollingAudioBuffer?.setSuppressed(false) }`. Made `playAudioFile` suspend until completion. Added 20s watchdog in `RollingAudioBuffer` to auto-clear stale suppression.
+- **Verification**: Verified with instrumented test `RollingBufferRestartTest.suppressionDoesNotSurviveRestart` on physical device `23049PCD8I`.
+- **Status**: CLOSED
+
+#### [ISSUE-064] [2026-07-31] Audio Pipeline BUG-D Fix: Absolute Time Offset Calculation & Option A Assistant Audio Capture
+- **Symptom**: Clock drift accumulated over long sessions causing extracted audio windows to drift from wall-clock press times. Assistant mic presses cleared buffer audio and destroyed fast-path sales capability.
+- **Root Cause**: Window extraction used `recordingStartedAtMs` instead of actual PCM write timestamps (`lastWriteAtMs`). Assistant mic tore down buffer audio.
+- **Resolution**: Anchored `resolveWindowBytes` calculation to `lastWriteAtMs`. Implemented Option A in `PttMicButton.kt` (retaining audio capture on assistant mic, falling back to `SttWorker` when on-device STT is blank, and enabling write-shaped intent booking in `AssistantFastPath`).
+- **Verification**: Verified with 5 JVM unit tests in `RollingBufferWindowTest.kt`, 3 instrumented tests in `RollingBufferRestartTest.kt`, and installed `VoiceToInvoice_v93.apk` on physical device `23049PCD8I`.
+- **Status**: CLOSED
 
 #### [ISSUE-060] [2026-07-31] Phase 2 Feature Expansion Complete — Snooze Persistence (DB v23), Item Velocity Bucketing, Expiry Batching & Tracking, Bill PNG Builder, and Repeat Order Sheet
 - **Symptom**: Feature expansion required for Phase 2:

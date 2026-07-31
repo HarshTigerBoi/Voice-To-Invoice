@@ -23,12 +23,17 @@ class RollingAudioBuffer(private val context: Context) {
     private var isRecordingRunning = AtomicBoolean(false)
     private var recordingThread: Thread? = null
     private val isSuppressed = AtomicBoolean(false)
+    @Volatile private var suppressedAtMs: Long = 0L
     @Volatile private var recordingStartedAtMs: Long = 0L
     @Volatile private var totalBytesWritten: Long = 0L
+    @Volatile private var lastWriteAtMs: Long = 0L
 
     /** While true the ring buffer keeps advancing but stores silence, so TTS playback
      *  never lands in a window the next PTT press extracts. */
-    fun setSuppressed(suppressed: Boolean) { isSuppressed.set(suppressed) }
+    fun setSuppressed(suppressed: Boolean) {
+        isSuppressed.set(suppressed)
+        suppressedAtMs = if (suppressed) System.currentTimeMillis() else 0L
+    }
 
     fun getRecordingStartedAtMs(): Long = recordingStartedAtMs
     fun getBufferDurationSeconds(): Int = bufferDurationSeconds
@@ -48,7 +53,13 @@ class RollingAudioBuffer(private val context: Context) {
 
         isRecordingRunning.set(true)
         recordingStartedAtMs = System.currentTimeMillis()
-        totalBytesWritten = 0L
+        synchronized(ringBuffer) {
+            totalBytesWritten = 0L
+            writeHead = 0
+            lastWriteAtMs = 0L
+            java.util.Arrays.fill(ringBuffer, 0.toByte())
+        }
+        isSuppressed.set(false)
 
         recordingThread = Thread {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
@@ -56,27 +67,22 @@ class RollingAudioBuffer(private val context: Context) {
             val audioFormat = AudioFormat.ENCODING_PCM_16BIT
             val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
 
-            val audioRecord = try {
-                AudioRecord(
+            var audioRecord: AudioRecord? = null
+            try {
+                audioRecord = AudioRecord(
                     MediaRecorder.AudioSource.VOICE_RECOGNITION,
                     sampleRate,
                     channelConfig,
                     audioFormat,
                     Math.max(minBufferSize, 4096)
                 )
-            } catch (e: Exception) {
-                Log.e("RollingAudioBuffer", "Failed to create AudioRecord", e)
-                isRecordingRunning.set(false)
-                return@Thread
-            }
 
-            if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e("RollingAudioBuffer", "AudioRecord state not initialized")
-                isRecordingRunning.set(false)
-                return@Thread
-            }
+                if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
+                    Log.e("RollingAudioBuffer", "AudioRecord state not initialized")
+                    isRecordingRunning.set(false)
+                    return@Thread
+                }
 
-            try {
                 audioRecord.startRecording()
                 val chunk = ByteArray(2048)
 
@@ -84,7 +90,12 @@ class RollingAudioBuffer(private val context: Context) {
                     val bytesRead = audioRecord.read(chunk, 0, chunk.size)
                     if (bytesRead > 0) {
                         if (isSuppressed.get()) {
-                            java.util.Arrays.fill(chunk, 0, bytesRead, 0.toByte())
+                            if (suppressedAtMs > 0L && System.currentTimeMillis() - suppressedAtMs > MAX_SUPPRESSION_MS) {
+                                Log.w("RollingAudioBuffer", "Suppression exceeded ${MAX_SUPPRESSION_MS}ms; force-clearing")
+                                setSuppressed(false)
+                            } else {
+                                java.util.Arrays.fill(chunk, 0, bytesRead, 0.toByte())
+                            }
                         }
                         synchronized(ringBuffer) {
                             for (i in 0 until bytesRead) {
@@ -92,24 +103,44 @@ class RollingAudioBuffer(private val context: Context) {
                                 writeHead = (writeHead + 1) % bufferCapacity
                             }
                             totalBytesWritten += bytesRead
+                            lastWriteAtMs = System.currentTimeMillis()
                         }
                     }
                 }
-                audioRecord.stop()
-                audioRecord.release()
             } catch (e: Exception) {
                 Log.e("RollingAudioBuffer", "Error in audio recording loop", e)
             } finally {
+                try {
+                    audioRecord?.stop()
+                    audioRecord?.release()
+                } catch (e: Exception) {
+                    Log.e("RollingAudioBuffer", "Error releasing AudioRecord", e)
+                }
                 isRecordingRunning.set(false)
             }
         }
         recordingThread?.start()
     }
 
+    /**
+     * Blocks until the capture thread has really exited and AudioRecord.release() has run.
+     * Without the join, this returned while AudioRecord still held the microphone, so a
+     * SpeechRecognizer started immediately afterwards failed to open it -- BUG-B, the cause of
+     * "the assistant records nothing". The timeout is a safety valve: a wedged capture thread
+     * must not freeze the UI thread.
+     */
     fun stopRollingBuffer() {
         isRecordingRunning.set(false)
-        recordingThread?.interrupt()
+        val thread = recordingThread
         recordingThread = null
+        try {
+            thread?.join(500L)
+            if (thread?.isAlive == true) {
+                Log.w("RollingAudioBuffer", "Capture thread did not exit within 500ms; mic may still be held")
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     /**
@@ -138,28 +169,22 @@ class RollingAudioBuffer(private val context: Context) {
                     return null
                 }
 
-                // Absolute byte offsets since recordingStartedAtMs
-                val startByteOffset = Math.max(0L, (effectiveStartMs - recStarted) * bytesPerSecond.toLong() / 1000L)
-                val endByteOffset = Math.max(startByteOffset, (endMs - recStarted) * bytesPerSecond.toLong() / 1000L)
-                val requestedBytes = (endByteOffset - startByteOffset).toInt()
-
-                val minStartAllowed = Math.max(0L, totalWritten - bufferCapacity)
-                if (startByteOffset < minStartAllowed) {
-                    Log.w("RollingAudioBuffer", "Requested start time was overwritten in ring buffer (start: $startByteOffset, minAllowed: $minStartAllowed)")
+                val anchor = if (lastWriteAtMs > 0L) lastWriteAtMs else System.currentTimeMillis()
+                val byteRange = resolveWindowBytes(
+                    startMs = effectiveStartMs,
+                    endMs = endMs,
+                    anchorMs = anchor,
+                    totalWritten = totalWritten,
+                    bufferCapacity = bufferCapacity,
+                    bytesPerSecond = bytesPerSecond
+                ) ?: run {
+                    Log.w("RollingAudioBuffer", "Window resolution returned null for [$effectiveStartMs, $endMs]")
                     return null
                 }
 
-                val actualEndOffset = Math.min(endByteOffset, totalWritten)
-                val actualBytesToExtract = (actualEndOffset - startByteOffset).toInt()
-
-                // Minimum ~300ms window threshold (9600 bytes at 32,000 bytes/sec)
-                if (actualBytesToExtract < 9600) {
-                    Log.w("RollingAudioBuffer", "Audio window too short after clamping ($actualBytesToExtract bytes < 9600)")
-                    return null
-                }
-
+                val actualBytesToExtract = byteRange.last - byteRange.first + 1
                 val extractedBytes = ByteArray(actualBytesToExtract)
-                val startRingIndex = (startByteOffset % bufferCapacity).toInt()
+                val startRingIndex = (byteRange.first.toLong() % bufferCapacity).toInt()
 
                 for (i in 0 until actualBytesToExtract) {
                     extractedBytes[i] = ringBuffer[(startRingIndex + i) % bufferCapacity]
@@ -175,6 +200,9 @@ class RollingAudioBuffer(private val context: Context) {
     }
 
     companion object {
+        const val MIN_WINDOW_BYTES = 9600
+        const val MAX_SUPPRESSION_MS = 20_000L
+
         @Volatile
         private var instance: RollingAudioBuffer? = null
 
@@ -182,6 +210,37 @@ class RollingAudioBuffer(private val context: Context) {
             return instance ?: synchronized(this) {
                 instance ?: RollingAudioBuffer(context.applicationContext).also { instance = it }
             }
+        }
+
+        /**
+         * Pure form of the window->byte-range mapping, factored out so it is unit-testable without a
+         * microphone. `anchorMs` is the wall-clock time corresponding to byte offset `totalWritten`.
+         * Returns null when the requested window is unrecoverable (already overwritten, or shorter
+         * than [MIN_WINDOW_BYTES] after clamping).
+         */
+        fun resolveWindowBytes(
+            startMs: Long, endMs: Long, anchorMs: Long,
+            totalWritten: Long, bufferCapacity: Int, bytesPerSecond: Int
+        ): IntRange? {
+            if (totalWritten <= 0L || endMs <= startMs) return null
+
+            fun byteOffsetFor(tsMs: Long): Long =
+                totalWritten - (anchorMs - tsMs) * bytesPerSecond.toLong() / 1000L
+
+            val startByteOffset = Math.max(0L, byteOffsetFor(startMs))
+            val endByteOffset = Math.max(startByteOffset, byteOffsetFor(endMs))
+            val minStartAllowed = Math.max(0L, totalWritten - bufferCapacity)
+
+            if (startByteOffset < minStartAllowed) return null
+
+            val actualEndOffset = Math.min(endByteOffset, totalWritten)
+            val actualBytesToExtract = (actualEndOffset - startByteOffset).toInt()
+
+            if (actualBytesToExtract < MIN_WINDOW_BYTES) return null
+
+            val startIdx = startByteOffset.toInt()
+            val endIdx = startIdx + actualBytesToExtract - 1
+            return startIdx..endIdx
         }
     }
 }
