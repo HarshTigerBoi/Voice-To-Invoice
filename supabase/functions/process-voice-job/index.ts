@@ -656,6 +656,11 @@ serve(async (req) => {
     const supabase = createClient(supabaseUrl, serviceRoleKey)
     const resolvedShopId = getNullSafeShopId(shopId)
 
+    if (resolvedShopId) {
+      const { error: shopErr } = await supabase.rpc('ensure_shop', { p_shop_id: resolvedShopId })
+      if (shopErr) console.error(`ensure_shop failed for ${resolvedShopId}:`, shopErr.message)
+    }
+
     // Step 0: Idempotency check
     const { data: existingLog } = await supabase
       .from('stt_job_logs')
@@ -1314,6 +1319,21 @@ Parse this order.`
       })
     }
 
+    // Forced AI fallback when parsedRawItems is still empty but raw transcript exists
+    if (parsedRawItems.length === 0 && transcript && transcript.trim().length > 0 && xaiApiKey) {
+      console.log(`parsedRawItems empty after segmenter. Forcing AI fallback for transcript: "${transcript}"`)
+      const forcedResult = await callGrokChatInterpretation(
+        xaiApiKey, systemPrompt, userPrompt,
+        () => knownGoodChatModel, (m) => { knownGoodChatModel = m }
+      )
+      if (forcedResult.items.length > 0) {
+        parsedRawItems = forcedResult.items
+        parseSource = 'forced_ai_fallback'
+        aiModelUsed = forcedResult.model
+        aiError = null
+      }
+    }
+
     // Fetch previous job transcript & parsed item for A4 duplicate guard & A5 orphan suggestion
     const MAX_ADJACENT_JOB_GAP_MS = 1500
     let prevJobTranscript = ''
@@ -1869,12 +1889,22 @@ Parse this order.`
       aiError ? `ai: ${aiError}` : null,
     ].filter(Boolean).join(' | ')
 
+    const persistence: Record<string, unknown> = {
+      ensureShopId: resolvedShopId ?? null,
+    }
+    const recordedAtMsRaw = Number(metadata?.recordedAtMs)
+    const recordedAtSafe = Number.isFinite(recordedAtMsRaw) && recordedAtMsRaw > 0 ? Math.floor(recordedAtMsRaw) : Date.now()
+    const createdAtIso = new Date(recordedAtSafe).toISOString()
+
+    persistence.recordedAtMsRaw = metadata?.recordedAtMs ?? null
+    persistence.recordedAtUsed = recordedAtSafe
+
     // Final write to stt_job_logs (PERMANENT STORAGE - NEVER DELETED)
     const logPayload = {
       job_id: jobId,
       shop_id: resolvedShopId,
-      recorded_at_ms: metadata.recordedAtMs || Date.now(),
-      created_at: new Date(metadata.recordedAtMs || Date.now()).toISOString(),
+      recorded_at_ms: recordedAtSafe,
+      created_at: createdAtIso,
       hold_duration_ms: metadata.holdDurationMs || 0,
       status: finalStatus,
       raw_transcript: transcript || rawGrokTranscript || rawSarvamTranscript,
@@ -1888,11 +1918,12 @@ Parse this order.`
       line_count: lineCount,
       is_sanity_flagged: finalStatus !== 'AUTO_CONFIRMED' && finalStatus !== 'RATE_UPDATED',
       error_message: transcript ? sttErrorSummary : (sttErrorSummary || "Empty transcript from STT"),
-      diagnostic_trace_json: JSON.stringify(traceObj),
+      diagnostic_trace_json: JSON.stringify({ ...traceObj, step_7_persistence: persistence }),
       audio_cloud_url: audioCloudUrl
     }
 
     const { error: logErr } = await supabase.from('stt_job_logs').upsert([logPayload], { onConflict: 'job_id' })
+    persistence.sttJobLogs = logErr ? { ok: false, code: logErr.code, message: logErr.message } : { ok: true }
     if (logErr) console.error(`Failed to write stt_job_logs for job ${jobId}:`, logErr.message)
 
     // Write to transactions for every COMMITTED sale line (RATE_UPDATE never reaches
@@ -1910,6 +1941,7 @@ Parse this order.`
         timestamp: new Date().toISOString(),
       }))
       const { error: stockErr } = await supabase.from('stock_in').insert(stockInserts)
+      persistence.stockIn = stockErr ? { ok: false, code: stockErr.code, message: stockErr.message } : { ok: true, count: stockInserts.length }
       if (stockErr) {
         console.error(`Failed to insert ${stockInserts.length} stock_in row(s) for job ${jobId} (intent ${captureIntent}):`, stockErr.message)
       } else {
@@ -1926,10 +1958,6 @@ Parse this order.`
         quantity: item.quantity,
         price_at_sale: item.price_at_sale,
         total: item.total,
-        // ISSUE-039: mirrors the client -- captureIntent decides payment mode. This branch
-        // used to hardcode CASH, so a job finished server-first (app closed) while the
-        // client was still uploading would double-book the sale as cash even if the
-        // client-side write later got it right.
         payment_mode: effIsCreditSale ? 'CREDIT' : 'CASH',
         source: 'VOICE',
         timestamp: new Date().toISOString(),
@@ -1940,14 +1968,12 @@ Parse this order.`
         .from('transactions')
         .upsert(txInserts, { onConflict: 'job_id,line_no' })
         .select('id, total')
+      persistence.transactions = txErr ? { ok: false, code: txErr.code, message: txErr.message } : { ok: true, count: txInserts.length }
       if (txErr) {
         console.error(`Failed to insert ${txInserts.length} transaction(s) for job ${jobId}:`, txErr.message)
       } else {
         console.log(`Inserted ${txInserts.length} committed transaction(s) for job ${jobId} (${lineCount} total lines)`)
 
-        // Book the credit immediately, customer_id left NULL -- resolution (which
-        // customer) must never hold the sale hostage. The app's Udhaar picker / assistant
-        // resolves customer_id onto these rows afterwards.
         if (effIsCreditSale && insertedTx && insertedTx.length > 0) {
           const creditInserts = insertedTx.map((tx: any) => ({
             shop_id: resolvedShopId,
@@ -1958,6 +1984,7 @@ Parse this order.`
             linked_transaction_id: tx.id,
           }))
           const { error: creditErr } = await supabase.from('credits').insert(creditInserts)
+          persistence.credits = creditErr ? { ok: false, code: creditErr.code, message: creditErr.message } : { ok: true, count: creditInserts.length }
           if (creditErr) {
             console.error(`Failed to insert ${creditInserts.length} credit(s) for job ${jobId}:`, creditErr.message)
           } else {
@@ -1982,11 +2009,9 @@ Parse this order.`
     }
 
     // Every line that did NOT commit (weak sale lines + unresolved rate updates) gets
-    // its own unmatched_queue row, keyed (job_id, line_no) -- previously this was one
-    // row per JOB with no item/qty/price columns at all, so a 3-item recording with one
-    // weak line surfaced as a single generic "review this" row carrying only the raw
-    // transcript; the shopkeeper had to re-listen and guess which item needed fixing.
+    // its own unmatched_queue row, keyed (job_id, line_no)
     const pendingEntries = [...pendingSaleEntries, ...pendingRateUpdateEntries]
+    let unmatchedRowsWritten = 0
     if ((shouldBookSale || shouldBookRateUpdate) && pendingEntries.length > 0) {
       const pendingInserts = pendingEntries.map(({ item, lineNo }) => ({
         job_id: jobId,
@@ -2005,16 +2030,14 @@ Parse this order.`
         implausibility_reason: item.implausibility_reason,
       }))
       const { error: uqErr } = await supabase.from('unmatched_queue').upsert(pendingInserts, { onConflict: 'job_id,line_no' })
+      persistence.unmatchedQueue = uqErr ? { ok: false, code: uqErr.code, message: uqErr.message } : { ok: true, count: pendingInserts.length }
       if (uqErr) {
         console.error(`Failed to write ${pendingInserts.length} unmatched_queue row(s) for job ${jobId}:`, uqErr.message)
       } else {
+        unmatchedRowsWritten = pendingInserts.length
         console.log(`Routed ${pendingInserts.length} pending line(s) of job ${jobId} to unmatched_queue (shop_id: ${resolvedShopId})`)
       }
     } else if (assistantNeedsReview) {
-      // Classified as RETURN/PAYMENT_RECEIVED/VOID_LAST/EXPIRY_WRITEOFF/ACTION_COMMAND/
-      // UNKNOWN -- these need customer resolution or ledger-reversal logic that only
-      // exists client-side. Queue it rather than mis-booking as a sale or losing it
-      // entirely when the app never reopens. See Docs/remaining_work_plan.md §1.1.
       const firstReviewItem = finalParsedItems[0] || null
       const { error: uqErr } = await supabase.from('unmatched_queue').upsert([{
         job_id: jobId,
@@ -2031,14 +2054,20 @@ Parse this order.`
         total: firstReviewItem?.total ?? null,
         implausibility_reason: `ASSISTANT intent=${assistantEffectiveIntent} (confidence ${(assistantClassification?.confidence ?? 0).toFixed(2)}) -- needs app review, server-side handling not implemented for this intent`,
       }], { onConflict: 'job_id,line_no' })
+      persistence.unmatchedQueueAssistant = uqErr ? { ok: false, code: uqErr.code, message: uqErr.message } : { ok: true }
       if (uqErr) {
         console.error(`Failed to write assistant-review unmatched_queue row for job ${jobId} (intent ${assistantEffectiveIntent}):`, uqErr.message)
       } else {
+        unmatchedRowsWritten = 1
         console.log(`Routed assistant job ${jobId} (classified ${assistantEffectiveIntent}, confidence ${assistantClassification?.confidence}) to unmatched_queue for review`)
       }
-    } else if (!isAssistant && finalParsedItems.length === 0) {
-      // Nothing parsed at all -- still keep a permanent record so the recording isn't
-      // silently lost from every table.
+    }
+
+    // Step 5.3: Widen safety net guard -- if no transactions and no unmatched_queue rows were written,
+    // write a fallback unmatched_queue row so every job leaves a reviewable record.
+    const committedCount = committedSaleEntries.length
+    if (committedCount === 0 && unmatchedRowsWritten === 0) {
+      const firstFallbackItem = finalParsedItems[0] || null
       const { error: uqErr } = await supabase.from('unmatched_queue').upsert([{
         job_id: jobId,
         shop_id: resolvedShopId,
@@ -2047,9 +2076,22 @@ Parse this order.`
         status: 'PENDING',
         timestamp: new Date().toISOString(),
         line_no: 0,
+        item_name: firstFallbackItem?.item_name ?? null,
+        quantity: firstFallbackItem?.quantity ?? null,
+        unit: firstFallbackItem?.unit ?? null,
+        price_at_sale: firstFallbackItem?.price_at_sale ?? null,
+        total: firstFallbackItem?.total ?? null,
+        implausibility_reason: `Safety fallback: job produced 0 ledger/review rows (intent: ${captureIntent}, status: ${finalStatus})`
       }], { onConflict: 'job_id,line_no' })
-      if (uqErr) console.error(`Failed to write empty-parse unmatched_queue row for job ${jobId}:`, uqErr.message)
+      persistence.unmatchedQueueFallback = uqErr ? { ok: false, code: uqErr.code, message: uqErr.message } : { ok: true }
+      if (uqErr) console.error(`Failed to write fallback unmatched_queue row for job ${jobId}:`, uqErr.message)
     }
+
+    // Final update of stt_job_logs to persist step_7_persistence trace
+    traceObj.step_7_persistence = persistence
+    await supabase.from('stt_job_logs').update({
+      diagnostic_trace_json: JSON.stringify(traceObj)
+    }).eq('job_id', jobId)
 
     console.log(`Job ${jobId} finished background processing with status ${finalStatus} (${committedSaleEntries.length} committed / ${pendingEntries.length} pending / ${lineCount} total lines)`)
 

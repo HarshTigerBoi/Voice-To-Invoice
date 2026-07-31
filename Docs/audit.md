@@ -104,6 +104,21 @@
 - **Verification**: Verified with 5 JVM unit tests in `RollingBufferWindowTest.kt`, 3 instrumented tests in `RollingBufferRestartTest.kt`, and installed `VoiceToInvoice_v93.apk` on physical device `23049PCD8I`.
 - **Status**: CLOSED
 
+#### [ISSUE-065] [2026-07-31] STT Blackout Prevention, Shop Auto-Provisioning & Review Queue Accessibility Fix (VoiceToInvoice_v94.apk)
+- **Symptom**: Spoken voice jobs were producing HTTP 200/202 responses but disappearing from both `transactions` and `unmatched_queue` tables. Unparsed/failed jobs had 0 line items and were hidden from `pendingLineCount`, rendering the review queue completely unreachable.
+- **Root Cause**:
+  1. `recordedAtMs` non-numeric values caused `RangeError` during `ISOString` conversion inside `process-voice-job`.
+  2. `SttWorker.kt` passed `null` shopId, triggering Postgres `23503 foreign_key_violation` when writing rows with foreign keys on `shops(id)`.
+  3. Edge Function swallowed persistence errors and returned HTTP 200, leaving jobs silently dropped.
+  4. `HomeScreen.kt` `pendingLineCount` ignored empty-parse jobs (0 lines), hiding the review banner.
+- **Resolution**:
+  1. Applied Supabase migration `20260731020000_shop_row_autoprovision.sql` creating `public.ensure_shop(UUID)` RPC function live on Supabase Postgres.
+  2. Modified `process-voice-job/index.ts` to call `ensure_shop` RPC on start, defensively parse `recordedAtMs`, force AI interpretation fallback when `parsedRawItems.length === 0 && transcript.isNotBlank()`, record `step_7_persistence` diagnostics, and enforce a zero-rows safety fallback to write an `unmatched_queue` row. Deployed edge function (`lyowklxsbfznnqridtgr`).
+  3. Modified `SttWorker.kt` to pass real `ShopContext.requireShopId()` on all uploads and review item inserts. Added `ensureShopExists` RPC call in `CloudSyncManager.kt` and `SyncEngine.kt`.
+  4. Updated `HomeScreen.kt` to count empty-parse jobs as 1 review item and added a permanent `RateReview` `IconButton` in `TopAppBar`. Updated `PendingConfirmationsSheet.kt` to render an actionable card for unparsed jobs with play audio, "फिर कोशिश करें" (re-enqueue via `WorkManager`), and "हाथ से भरें" buttons.
+- **Verification**: Verified with JVM unit tests (`BUILD SUCCESSFUL`), deployed edge function (`lyowklxsbfznnqridtgr`), assembled and installed debug APK (`VoiceToInvoice_v94.apk`) on connected Xiaomi Poco device `23049PCD8I`, and exported `VoiceToInvoice_v94.apk`.
+- **Status**: CLOSED
+
 #### [ISSUE-060] [2026-07-31] Phase 2 Feature Expansion Complete — Snooze Persistence (DB v23), Item Velocity Bucketing, Expiry Batching & Tracking, Bill PNG Builder, and Repeat Order Sheet
 - **Symptom**: Feature expansion required for Phase 2:
   1. Snoozing/dismissing alerts was in-memory only and lost on app restart.
@@ -845,4 +860,4 @@ CREATE TABLE IF NOT EXISTS public.transactions (
 - **Primary Edge Function**: [process-voice-job/index.ts](file:///C:/Users/harsh/Documents/Voice%20To%20Invoice/supabase/functions/process-voice-job/index.ts)
 - **DB Setup Function**: [db-setup/index.ts](file:///C:/Users/harsh/Documents/Voice%20To%20Invoice/supabase/functions/db-setup/index.ts)
 - **Android Background Worker**: [SttWorker.kt](file:///C:/Users/harsh/Documents/Voice%20To%20Invoice/app/src/main/java/com/voicetoinvoice/app/domain/processor/SttWorker.kt)
-- **Latest Debug APK**: `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v92.apk`
+- **Latest Debug APK**: `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v94.apk`

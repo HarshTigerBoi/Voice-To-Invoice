@@ -32,6 +32,31 @@ class CloudSyncManager(
     }
 
     /**
+     * Calls ensure_shop RPC on Supabase so the shops row exists before pushing
+     * transactions, credits, or stock rows with a real shopId foreign key.
+     */
+    suspend fun ensureShopExists(shopId: String): Boolean = withContext(Dispatchers.IO) {
+        if (shopId.isBlank()) return@withContext false
+        try {
+            val url = URL("$supabaseUrl/rest/v1/rpc/ensure_shop")
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("apikey", anonKey)
+            conn.setRequestProperty("Authorization", "Bearer $anonKey")
+            conn.doOutput = true
+
+            val body = JSONObject().apply { put("p_shop_id", shopId) }.toString()
+            conn.outputStream.write(body.toByteArray(Charsets.UTF_8))
+            val code = conn.responseCode
+            code in 200..299
+        } catch (e: Exception) {
+            Log.w(TAG, "ensure_shop RPC call failed for $shopId: ${e.message}")
+            false
+        }
+    }
+
+    /**
      * Uploads audio file + diagnostic JSON trace to Supabase Cloud Storage & stt_job_logs table.
      * Called automatically after every voice recording job completes processing.
      */

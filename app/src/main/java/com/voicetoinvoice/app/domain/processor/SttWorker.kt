@@ -125,7 +125,7 @@ class SttWorker(
             val responseString = uploadAudioToEdgeFunction(
                 audioFile = audioFile,
                 jobId = jobId,
-                shopId = SupabaseConfig.getNullSafeShopId(null),
+                shopId = SupabaseConfig.getNullSafeShopId(com.voicetoinvoice.app.data.ShopContext.requireShopId()),
                 metadataJson = metadataJson,
                 catalogNames = catalogNames,
                 onDeviceTranscript = boundedJob.onDeviceTranscript,
@@ -453,7 +453,7 @@ class SttWorker(
                 else -> {
                     val unmatchedItem = com.voicetoinvoice.app.data.local.entity.UnmatchedQueueItem(
                         id = "$jobId#$i",
-                        shopId = SupabaseConfig.getNullSafeShopId(null),
+                        shopId = SupabaseConfig.getNullSafeShopId(com.voicetoinvoice.app.data.ShopContext.requireShopId()),
                         audioRef = audioCloudUrl,
                         rawTranscript = rawTranscript,
                         status = com.voicetoinvoice.app.data.local.entity.UnmatchedStatus.PENDING,
@@ -468,7 +468,7 @@ class SttWorker(
         if (lineCount == 0) {
             val unmatchedItem = com.voicetoinvoice.app.data.local.entity.UnmatchedQueueItem(
                 id = "$jobId#0",
-                shopId = SupabaseConfig.getNullSafeShopId(null),
+                shopId = SupabaseConfig.getNullSafeShopId(com.voicetoinvoice.app.data.ShopContext.requireShopId()),
                 audioRef = audioCloudUrl,
                 rawTranscript = rawTranscript,
                 status = com.voicetoinvoice.app.data.local.entity.UnmatchedStatus.PENDING,

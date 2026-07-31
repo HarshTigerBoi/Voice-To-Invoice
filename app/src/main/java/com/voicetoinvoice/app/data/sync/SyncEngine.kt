@@ -35,6 +35,9 @@ class SyncEngine(
     suspend fun syncAllUnsynced(): Int = withContext(Dispatchers.IO) {
         var count = 0
         try {
+            val currentShopId = com.voicetoinvoice.app.data.ShopContext.requireShopId()
+            cloudSyncManager.ensureShopExists(currentShopId)
+
             count += syncUnsyncedTransactions()
             count += syncUnsyncedJobTraces()
             count += syncUnsyncedCatalog()

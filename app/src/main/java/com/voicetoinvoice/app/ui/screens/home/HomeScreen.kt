@@ -143,7 +143,8 @@ fun HomeScreen(
     // where 2 already booked and 1 needs review; the pill should say "1", not "1 job".
     val pendingLineCount = remember(pendingJobs) {
         pendingJobs.sumOf { job ->
-            com.voicetoinvoice.app.ui.components.parsePendingLines(job).count { !it.committed && !it.resolved }
+            val lines = com.voicetoinvoice.app.ui.components.parsePendingLines(job)
+            if (lines.isEmpty()) 1 else lines.count { !it.committed && !it.resolved }
         }
     }
 
@@ -228,6 +229,9 @@ fun HomeScreen(
             TopAppBar(
                 title = { Text("Shop Ledger") },
                 actions = {
+                    IconButton(onClick = { showPendingSheet = true }) {
+                        Icon(androidx.compose.material.icons.Icons.Default.RateReview, contentDescription = "समीक्षा (Pending Review)")
+                    }
                     IconButton(onClick = onNavigateToSummary) {
                         Icon(Icons.Default.Receipt, contentDescription = "Summary")
                     }

@@ -15,6 +15,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -154,9 +155,11 @@ fun PendingConfirmationsSheet(
 
     val jobsWithPendingLines = remember(pendingJobs) {
         pendingJobs.map { job -> job to parsePendingLines(job) }
-            .filter { (_, lines) -> lines.any { !it.committed && !it.resolved } }
+            .filter { (_, lines) -> lines.isEmpty() || lines.any { !it.committed && !it.resolved } }
     }
-    val totalPendingLines = jobsWithPendingLines.sumOf { (_, lines) -> lines.count { !it.committed && !it.resolved } }
+    val totalPendingLines = jobsWithPendingLines.sumOf { (_, lines) ->
+        if (lines.isEmpty()) 1 else lines.count { !it.committed && !it.resolved }
+    }
 
     ModalBottomSheet(
         onDismissRequest = {
@@ -242,29 +245,116 @@ fun PendingConfirmationsSheet(
                                     }
                                 }
 
-                                if (committedLines.isNotEmpty()) {
-                                    Spacer(modifier = Modifier.height(6.dp))
-                                    committedLines.forEach { line ->
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Icon(
-                                                Icons.Default.CheckCircle,
-                                                contentDescription = null,
-                                                tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(14.dp)
-                                            )
+                                if (pendingLines.isEmpty() && committedLines.isEmpty()) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        text = "⚠️ ${if (job.rawTranscript.isNotBlank()) job.rawTranscript else "आवाज़ समझ नहीं आई"}",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.End,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                if (isPlaying) {
+                                                    audioFileManager.stopAudio()
+                                                    playingJobId = null
+                                                } else {
+                                                    playingJobId = job.id
+                                                    audioFileManager.playAudio(job.audioFilePath) {
+                                                        playingJobId = null
+                                                    }
+                                                }
+                                            },
+                                            shape = RoundedCornerShape(20.dp),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                        ) {
+                                            Icon(if (isPlaying) Icons.Default.Close else Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
                                             Spacer(modifier = Modifier.width(4.dp))
-                                            val summary = if (line.priceIntent == "RATE_UPDATE")
-                                                "${line.itemName} rate updated to ₹${line.priceAtSale}"
-                                            else
-                                                "${line.itemName} ${line.quantity} ${line.unit} • ₹${line.total} booked"
-                                            Text(summary, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Text(if (isPlaying) "Playing..." else "Audio", fontSize = 12.sp)
+                                        }
+
+                                        Spacer(modifier = Modifier.width(6.dp))
+
+                                        OutlinedButton(
+                                            onClick = {
+                                                val workRequest = androidx.work.OneTimeWorkRequestBuilder<com.voicetoinvoice.app.domain.processor.SttWorker>()
+                                                    .setInputData(
+                                                        androidx.work.workDataOf(
+                                                            com.voicetoinvoice.app.domain.processor.SttWorker.KEY_JOB_ID to job.id,
+                                                            com.voicetoinvoice.app.domain.processor.SttWorker.KEY_AUDIO_PATH to job.audioFilePath
+                                                        )
+                                                    )
+                                                    .setExpedited(androidx.work.OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                                                    .build()
+                                                androidx.work.WorkManager.getInstance(context).enqueue(workRequest)
+                                                android.widget.Toast.makeText(context, "फिर से प्रोसेस किया जा रहा है...", android.widget.Toast.LENGTH_SHORT).show()
+                                            },
+                                            shape = RoundedCornerShape(20.dp),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                        ) {
+                                            Icon(Icons.Default.Refresh, contentDescription = "Retry", modifier = Modifier.size(16.dp))
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("फिर कोशिश करें", fontSize = 12.sp)
+                                        }
+
+                                        Spacer(modifier = Modifier.width(6.dp))
+
+                                        Button(
+                                            onClick = {
+                                                val dummyLine = PendingLine(
+                                                    lineNo = 0,
+                                                    itemName = "",
+                                                    itemId = null,
+                                                    quantity = 1.0,
+                                                    unit = "PACKET",
+                                                    priceAtSale = 0.0,
+                                                    total = 0.0,
+                                                    priceIntent = "NONE",
+                                                    implausibilityReason = null,
+                                                    committed = false,
+                                                    resolved = false,
+                                                    captureIntent = job.captureIntent
+                                                )
+                                                editingLine = job to dummyLine
+                                            },
+                                            shape = RoundedCornerShape(20.dp),
+                                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                                        ) {
+                                            Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(18.dp))
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("हाथ से भरें")
                                         }
                                     }
-                                }
+                                } else {
+                                    if (committedLines.isNotEmpty()) {
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        committedLines.forEach { line ->
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Icon(
+                                                    Icons.Default.CheckCircle,
+                                                    contentDescription = null,
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                val summary = if (line.priceIntent == "RATE_UPDATE")
+                                                    "${line.itemName} rate updated to ₹${line.priceAtSale}"
+                                                else
+                                                    "${line.itemName} ${line.quantity} ${line.unit} • ₹${line.total} booked"
+                                                Text(summary, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
+                                        }
+                                    }
 
-                                Spacer(modifier = Modifier.height(8.dp))
+                                    Spacer(modifier = Modifier.height(8.dp))
 
-                                pendingLines.forEachIndexed { idx, line ->
+                                    pendingLines.forEachIndexed { idx, line ->
                                     if (idx > 0) {
                                         HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                                     }
@@ -388,6 +478,7 @@ fun PendingConfirmationsSheet(
                                         }
                                     }
                                 }
+                            }
                             }
                         }
                     }
