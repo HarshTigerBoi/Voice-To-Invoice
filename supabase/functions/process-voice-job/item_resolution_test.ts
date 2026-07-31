@@ -1,7 +1,19 @@
 import assert from 'node:assert'
 import { test } from 'node:test'
-import { segmentTranscript } from './phonetic.ts'
+import { segmentTranscript, normalizedLiteralDistance } from './phonetic.ts'
 import { resolveItemName, unpricedLineReason, SEGMENTER_OVERRIDE_MAX_NORM } from './item_resolution.ts'
+import { implausibilityReason } from './price_intent.ts'
+
+// ---------------------------------------------------------------------------
+// implausibilityReason — STOCK mode (ISSUE-041)
+// ---------------------------------------------------------------------------
+
+test('implausibilityReason STOCK mode higher limits and no sale floor', () => {
+  assert.strictEqual(implausibilityReason('KG', 500, 0, '', 0, 'STOCK'), null)
+  assert.notStrictEqual(implausibilityReason('KG', 500, 0, '', 0, 'SALE'), null)
+  assert.strictEqual(implausibilityReason('KG', 50, 0, 'पचास किलो आलू आया', 0, 'STOCK'), null)
+  assert.notStrictEqual(implausibilityReason('GRAM', 5, 0, '', 0, 'STOCK'), null)
+})
 
 // ---------------------------------------------------------------------------
 // resolveItemName — ISSUE-030
@@ -131,4 +143,15 @@ test('RATE_UPDATE and AMBIGUOUS_UNTRUSTED are exempt (zero total is correct for 
 
 test('a bulk sale with a real total gains no reason', () => {
   assert.strictEqual(unpricedLineReason('Paneer', true, 50, 250, 'BULK_SALE_TOTAL'), null)
+})
+
+test('Kela vs Kheera literal distance rejection test (ISSUE-040)', () => {
+  const dist = normalizedLiteralDistance('Kela', 'Kheera')
+  assert.ok(dist > 0.15, `Kela vs Kheera literal distance (${dist}) must exceed 0.15`)
+
+  const distDeva = normalizedLiteralDistance('केला', 'खीरा')
+  assert.ok(distDeva > 0.15, `केला vs खीरा literal distance (${distDeva}) must exceed 0.15`)
+
+  const distMatch = normalizedLiteralDistance('केला', 'Kela')
+  assert.ok(distMatch <= 0.15, `केला vs Kela literal distance (${distMatch}) must be <= 0.15`)
 })

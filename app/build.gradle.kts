@@ -15,6 +15,10 @@ android {
         targetSdk = 36
         versionCode = 2
         versionName = "1.1"
+        // Without this, AGP falls back to the legacy `android.test.InstrumentationTestRunner`,
+        // which cannot run AndroidJUnit4 tests -- the run died with "Instrumentation run failed
+        // due to Process crashed" and reported zero tests.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -80,6 +84,17 @@ dependencies {
   // Local tests: jUnit, coroutines, Android runner
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
+  // Real org.json on the unit-test classpath. The mockable android.jar stubs every
+  // org.json method to throw "not mocked", which made IntentRouterTest fail on the
+  // first JSONObject.put(). The parser/router contract is JSONArray-based, so tests
+  // need a working implementation rather than returnDefaultValues.
+  testImplementation("org.json:json:20240303")
+  // Room in-memory DB tests run as instrumented tests on a device/emulator rather than
+  // under Robolectric -- Robolectric has no android-all jar for compileSdk 36 and would
+  // make `./gradlew test` depend on a network fetch. Pure logic (WAC costing, intent
+  // scoring, bill rendering) is covered by JVM tests with no Android context.
+  androidTestImplementation("androidx.room:room-testing:2.6.1")
+  androidTestImplementation(libs.kotlinx.coroutines.test)
 
   // Instrumented tests: jUnit rules and runners
   androidTestImplementation(libs.androidx.test.core)

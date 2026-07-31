@@ -8,7 +8,7 @@ import java.util.UUID
 data class SupplierRecord(
     @PrimaryKey
     val id: String = UUID.randomUUID().toString(),
-    val shopId: String = "default_shop",
+    val shopId: String = com.voicetoinvoice.app.data.ShopContext.currentOrLegacy(),
     val name: String,
     val phone: String? = null,
     val balanceOwed: Double = 0.0,

@@ -186,20 +186,31 @@ const MIN_PLAUSIBLE_SALE_VALUE = 5.0
  *
  * Returns a human-readable reason, or null when the combination is plausible.
  */
-export function implausibilityReason(unit: string, qty: number, total: number, rawTranscript: string = '', priceAtSale: number = 0): string | null {
+export function implausibilityReason(
+  unit: string,
+  qty: number,
+  total: number,
+  rawTranscript: string = '',
+  priceAtSale: number = 0,
+  mode: 'SALE' | 'STOCK' = 'SALE'
+): string | null {
   const u = (unit || '').toUpperCase()
   if (!(qty > 0)) return `quantity ${qty} is not positive`
 
+  const maxGram = mode === 'STOCK' ? 100000 : 5000
+  const maxKg = mode === 'STOCK' ? 5000 : 200
+  const maxPiece = mode === 'STOCK' ? 10000 : 500
+
   if (u === 'GRAM' || u === 'ML') {
     if (qty < 10) return `${qty} ${u} is below any real retail quantity (likely a mis-heard KG/LITRE)`
-    if (qty > 5000) return `${qty} ${u} exceeds a plausible single sale`
+    if (qty > maxGram) return `${qty} ${u} exceeds a plausible single ${mode === 'STOCK' ? 'delivery' : 'sale'}`
   } else if (u === 'KG' || u === 'LITRE') {
-    if (qty > 200) return `${qty} ${u} exceeds a plausible single sale`
+    if (qty > maxKg) return `${qty} ${u} exceeds a plausible single ${mode === 'STOCK' ? 'delivery' : 'sale'}`
   } else if (u === 'PIECE' || u === 'PACKET' || u === 'DOZEN') {
-    if (qty > 500) return `${qty} ${u} exceeds a plausible single sale`
+    if (qty > maxPiece) return `${qty} ${u} exceeds a plausible single ${mode === 'STOCK' ? 'delivery' : 'sale'}`
   }
 
-  if (total > 0 && total < MIN_PLAUSIBLE_SALE_VALUE) {
+  if (mode === 'SALE' && total > 0 && total < MIN_PLAUSIBLE_SALE_VALUE) {
     return `sale value ₹${total.toFixed(2)} is below the ₹${MIN_PLAUSIBLE_SALE_VALUE} auto-confirm floor`
   }
 

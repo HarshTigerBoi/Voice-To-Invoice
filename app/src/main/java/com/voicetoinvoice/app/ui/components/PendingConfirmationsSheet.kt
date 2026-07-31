@@ -50,7 +50,8 @@ data class PendingLine(
     /** Resolved by the shopkeeper in THIS UI (confirmed or discarded) -- also no
      *  longer actionable, persisted back into parsedItemsJson so it survives
      *  recomposition and app restarts. */
-    val resolved: Boolean
+    val resolved: Boolean,
+    val captureIntent: com.voicetoinvoice.app.data.local.entity.CaptureIntent = com.voicetoinvoice.app.data.local.entity.CaptureIntent.SALE
 )
 
 /** Parses a job's per-line breakdown, falling back to a single line built from the
@@ -69,7 +70,8 @@ fun parsePendingLines(job: SttJobRecord): List<PendingLine> {
                 priceIntent = "NONE",
                 implausibilityReason = null,
                 committed = false,
-                resolved = false
+                resolved = false,
+                captureIntent = job.captureIntent
             )
         )
     }
@@ -82,8 +84,6 @@ fun parsePendingLines(job: SttJobRecord): List<PendingLine> {
             val priceAtSale = o.optDouble("price_at_sale", 0.0)
             val total = o.optDouble("total", 0.0)
             val itemName = o.optString("item_name", "Unrecognized Item")
-            // org.json returns the literal string "null" from optString on a JSON null,
-            // so isNull() must be checked first for both nullable fields.
             val implausibility = if (o.isNull("implausibility_reason")) null else o.optString("implausibility_reason", "").ifBlank { null }
             val itemId = if (o.isNull("item_id")) null else o.optString("item_id", "").ifBlank { null }
             val isValidRateUpdate = priceIntent == "RATE_UPDATE" && itemId != null && confidence >= 0.80 && priceAtSale > 0.0 && implausibility == null
@@ -100,7 +100,8 @@ fun parsePendingLines(job: SttJobRecord): List<PendingLine> {
                 priceIntent = priceIntent,
                 implausibilityReason = implausibility,
                 committed = isValidRateUpdate || isCommittableSale,
-                resolved = o.optBoolean("client_resolved", false)
+                resolved = o.optBoolean("client_resolved", false),
+                captureIntent = job.captureIntent
             )
         }
     } catch (_: Exception) {
@@ -175,7 +176,7 @@ fun PendingConfirmationsSheet(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text(
-                    text = "Pending Voice Sales ($totalPendingLines)",
+                    text = "पेंडिंग ($totalPendingLines)",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold
                 )
@@ -215,11 +216,31 @@ fun PendingConfirmationsSheet(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Column(modifier = Modifier.padding(14.dp)) {
-                                Text(
-                                    text = "Spoken: \"${job.rawTranscript}\"",
-                                    fontSize = 13.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    val intentChip = job.captureIntent.hindiLabel
+                                    Text(
+                                        text = "Spoken: \"${job.rawTranscript}\"",
+                                        fontSize = 13.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = MaterialTheme.colorScheme.secondaryContainer
+                                    ) {
+                                        Text(
+                                            text = intentChip,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
 
                                 if (committedLines.isNotEmpty()) {
                                     Spacer(modifier = Modifier.height(6.dp))
@@ -347,7 +368,8 @@ fun PendingConfirmationsSheet(
 
                                         Spacer(modifier = Modifier.width(6.dp))
 
-                                        val isConfirmable = line.total > 0.0 && line.itemName.isNotBlank() && line.itemName != "Unrecognized Item"
+                                        val isStockIntent = line.captureIntent == com.voicetoinvoice.app.data.local.entity.CaptureIntent.STOCK_IN || line.captureIntent == com.voicetoinvoice.app.data.local.entity.CaptureIntent.WASTE
+                                        val isConfirmable = if (isStockIntent) line.quantity > 0.0 && line.itemName.isNotBlank() && line.itemName != "Unrecognized Item" else line.total > 0.0 && line.itemName.isNotBlank() && line.itemName != "Unrecognized Item"
 
                                         Button(
                                             onClick = {
@@ -444,14 +466,15 @@ private fun PendingLineEditDialog(
         distinct.firstOrNull { it.name.trim().lowercase() == query }
     }
 
+    val isStockIntent = line.captureIntent == com.voicetoinvoice.app.data.local.entity.CaptureIntent.STOCK_IN || line.captureIntent == com.voicetoinvoice.app.data.local.entity.CaptureIntent.WASTE
     val qtyVal = editQty.toDoubleOrNull() ?: line.quantity
     val rateVal = editRate.toDoubleOrNull() ?: 0.0
     val computedTotal = qtyVal * rateVal
-    val canSave = editName.isNotBlank() && rateVal > 0.0 && qtyVal > 0.0
+    val canSave = if (isStockIntent) editName.isNotBlank() && qtyVal > 0.0 else editName.isNotBlank() && rateVal > 0.0 && qtyVal > 0.0
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (line.itemId == null) "नया आइटम — भाव डालें" else "Edit Pending Sale") },
+        title = { Text(if (line.itemId == null) "नया आइटम — भाव डालें" else "Edit Pending Line") },
         text = {
             Column(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -568,7 +591,7 @@ private fun PendingLineEditDialog(
                 OutlinedTextField(
                     value = editRate,
                     onValueChange = { editRate = it },
-                    label = { Text("भाव (₹ प्रति ${editUnit.ifBlank { "unit" }})") },
+                    label = { Text(if (isStockIntent) "लागत भाव (₹ प्रति ${editUnit.ifBlank { "unit" }}) — वैकल्पिक" else "भाव (₹ प्रति ${editUnit.ifBlank { "unit" }})") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     modifier = Modifier.fillMaxWidth()

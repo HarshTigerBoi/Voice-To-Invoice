@@ -21,14 +21,21 @@ class AppForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Cold entry point: this service can be restarted by the system with no Activity alive,
+        // so it must resolve shop identity itself rather than assuming MainActivity already did.
+        com.voicetoinvoice.app.data.ShopContext.initialize(this)
         createNotificationChannel()
         startPeriodicSync()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // §5 (Docs/assistant_speed_and_pipeline_fix_plan.md): the microphone is no
+        // longer held open by this service or while the app is backgrounded -- it only
+        // runs while a screen is actually visible (see MainActivity's lifecycle-bound
+        // RollingAudioBuffer start/stop). This text must not claim otherwise.
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Voice Shop Ledger Active")
-            .setContentText("Listening for UPI payments & sync active")
+            .setContentText("UPI payments & sync active")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
@@ -53,7 +60,12 @@ class AppForegroundService : Service() {
                 db.catalogDao(),
                 db.creditDao(),
                 db.sttJobDao(),
-                db.supplierDao()
+                db.supplierDao(),
+                db.customerDao(),
+                db.stockLedgerDao(),
+                db.stockBatchDao(),
+                db.customerPaymentDao(),
+                db.shopLearningDao()
             )
             while (isActive) {
                 try {

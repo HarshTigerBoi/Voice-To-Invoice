@@ -38,10 +38,10 @@ fun DailySummaryScreen(
     rangeTransactions: List<TransactionRecord>,
     rangeMode: RangeMode,
     onRangeModeChange: (RangeMode) -> Unit,
-    costPriceByItemId: Map<String, Double> = emptyMap(),
     onUpdateTxPrice: (TransactionRecord, Double) -> Unit = { _, _ -> },
     onVoidTransaction: (TransactionRecord) -> Unit = {},
-    onNavigateBack: () -> Unit
+    onNavigateBack: () -> Unit,
+    onNavigateToReports: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val audioFileManager = remember { AudioFileManager(context) }
@@ -58,10 +58,18 @@ fun DailySummaryScreen(
     val upiTotal = rangeTransactions.filter { it.paymentMode == PaymentMode.UPI }.sumOf { it.total }
     val creditTotal = rangeTransactions.filter { it.paymentMode == PaymentMode.CREDIT }.sumOf { it.total }
 
-    val totalMargin = rangeTransactions.sumOf { tx ->
-        val cost = costPriceByItemId[tx.itemId] ?: 0.0
-        tx.total - (cost * tx.quantity)
-    }
+    // Honest margin: only over lines whose cost was actually known AT THE TIME OF SALE
+    // (TransactionRecord.costAtSale, snapshotted by StockLedgerRepository). This used to look
+    // up each item's LATEST cost and apply it to every sale in range, including old ones --
+    // for vegetables, where cost swings ~40% week to week, that's not an estimate, it's a
+    // different number. Uncosted lines are excluded rather than treated as free (which would
+    // fabricate 100% margin), and the coverage caveat says exactly how much of revenue this
+    // figure actually speaks for. See ProfitCalculator for the same rule applied over SQL.
+    val costedTx = rangeTransactions.filter { it.costAtSale != null }
+    val revenueWithCost = costedTx.sumOf { it.total }
+    val cogs = costedTx.sumOf { it.quantity * it.costAtSale!! }
+    val totalMargin = revenueWithCost - cogs
+    val costCoveragePct = if (totalRevenue > 0.0) (revenueWithCost / totalRevenue) * 100.0 else 0.0
 
     val pendingPriceItems = rangeTransactions.filter { it.total == 0.0 || it.priceAtSale == 0.0 }
     var showExportSafeguardDialog by remember { mutableStateOf(false) }
@@ -92,7 +100,7 @@ fun DailySummaryScreen(
         sb.append("Cash Total:\t\t\t\t\t₹${cashTotal.toInt()}\t\n")
         sb.append("UPI Total:\t\t\t\t\t₹${upiTotal.toInt()}\t\n")
         sb.append("Udhaar Total:\t\t\t\t\t₹${creditTotal.toInt()}\t\n")
-        sb.append("Est. Margin:\t\t\t\t\t₹${totalMargin.toInt()}\t\n")
+        sb.append("Est. Margin:\t\t\t\t\t₹${totalMargin.toInt()} (${costCoveragePct.toInt()}% cost-covered)\t\n")
 
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val clip = ClipData.newPlainText("Sales Ledger Table", sb.toString())
@@ -115,6 +123,7 @@ fun DailySummaryScreen(
                 title = { Text("Sales Summary & Ledger") },
                 navigationIcon = { TextButton(onClick = onNavigateBack) { Text("Back") } },
                 actions = {
+                    TextButton(onClick = onNavigateToReports) { Text("रिपोर्ट") }
                     IconButton(onClick = { handleExportRequest() }) {
                         Icon(Icons.Default.ContentCopy, contentDescription = "Copy Table for Excel")
                     }
@@ -190,12 +199,30 @@ fun DailySummaryScreen(
                             style = MaterialTheme.typography.headlineSmall,
                             color = MaterialTheme.colorScheme.primary
                         )
-                        Text(
-                            text = "📈 Est. Margin: ₹${totalMargin.toInt()}",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.secondary,
-                            fontWeight = FontWeight.Bold
-                        )
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(
+                                text = "📈 मुनाफ़ा: ₹${totalMargin.toInt()}",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.secondary,
+                                fontWeight = FontWeight.Bold
+                            )
+                            // Never show a bare profit number with no caveat -- a confidently
+                            // wrong figure costs a shopkeeper's trust permanently, and coverage
+                            // is genuinely below 100% by design (costMissing stock-ins exist).
+                            if (costedTx.isNotEmpty() && costCoveragePct < 99.5) {
+                                Text(
+                                    text = "(${costCoveragePct.toInt()}% बिक्री का हिसाब)",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            } else if (costedTx.isEmpty()) {
+                                Text(
+                                    text = "(खरीद भाव दर्ज नहीं)",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
                     }
                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
                     Row(

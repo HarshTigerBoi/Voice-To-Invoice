@@ -21,3 +21,8 @@ node_modules/
 Web app/*/node_modules/
 Web app/_extracted/
 
+# JVM crash dumps from local Gradle/Kotlin daemon failures (OneDrive-sync file-lock
+# issue documented in CLAUDE.md) -- these land in the repo root, not app/build/.
+hs_err_pid*.log
+replay_pid*.log
+

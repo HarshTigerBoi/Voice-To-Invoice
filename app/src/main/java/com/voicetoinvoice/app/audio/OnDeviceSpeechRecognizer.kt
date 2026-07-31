@@ -41,7 +41,8 @@ class OnDeviceSpeechRecognizer(private val context: Context) {
 
         mainHandler.post {
             try {
-                release()
+                speechRecognizer?.destroy()
+                speechRecognizer = null
                 resultDeferred = CompletableDeferred()
                 latestPartialText = ""
                 val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
@@ -106,6 +107,10 @@ class OnDeviceSpeechRecognizer(private val context: Context) {
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, languageCode)
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                     putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                    // Use the on-device model when the device has one downloaded, instead
+                    // of implicitly falling back to network STT -- see
+                    // Docs/assistant_speed_and_pipeline_fix_plan.md §4.
+                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
                 }
 
                 recognizer.startListening(intent)

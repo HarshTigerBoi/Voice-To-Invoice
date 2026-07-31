@@ -3,7 +3,12 @@ package com.voicetoinvoice.app.network
 import android.util.Log
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
 import com.voicetoinvoice.app.data.local.entity.CreditRecord
+import com.voicetoinvoice.app.data.local.entity.CustomerPayment
+import com.voicetoinvoice.app.data.local.entity.CustomerRecord
+import com.voicetoinvoice.app.data.local.entity.ShopLearning
+import com.voicetoinvoice.app.data.local.entity.StockBatch
 import com.voicetoinvoice.app.data.local.entity.StockInRecord
+import com.voicetoinvoice.app.data.local.entity.StockLedgerEntry
 import com.voicetoinvoice.app.data.local.entity.SttJobRecord
 import com.voicetoinvoice.app.data.local.entity.SupplierRecord
 import com.voicetoinvoice.app.data.local.entity.TransactionRecord
@@ -102,8 +107,22 @@ class CloudSyncManager(
                 } else if (!transaction.jobId.isNull_or_empty()) {
                     put("audio_cloud_url", "$supabaseUrl/storage/v1/object/public/voice-recordings/${transaction.jobId}.wav")
                 }
+                if (transaction.customerId != null) put("customer_id", transaction.customerId)
             }
-            val resCode = upsertToRestApi("/rest/v1/transactions", payload)
+            // ISSUE-056: for a voice-sourced transaction, `process-voice-job` has ALREADY
+            // inserted a row server-side for this exact (job_id, line_no) -- upserted with
+            // `onConflict: 'job_id,line_no'` (index_transactions_job_line in schema.sql).
+            // Upserting here on `id` instead (the client's own, different, random UUID) does
+            // not match that row, so Postgres accepts the id-conflict clause but then rejects
+            // the insert with a 23505 unique_violation on the SEPARATE (job_id, line_no) index
+            // -- a 409 that made `success` false forever. `markSynced` never ran, so this row
+            // retried on every single sync sweep (every screen load, per CLAUDE.md) for the
+            // rest of the app's life, and the retry count only grew as more voice sales
+            // accumulated. Targeting the SAME conflict key the server already used makes this
+            // an idempotent update of that row instead -- the fix is which column(s) to upsert
+            // on, not a new code path.
+            val onConflict = if (!transaction.jobId.isNull_or_empty()) "job_id,line_no" else "id"
+            val resCode = upsertToRestApi("/rest/v1/transactions", payload, onConflictColumn = onConflict)
             if (resCode in 200..299) {
                 Log.i(TAG, "✅ Synced transaction '${transaction.itemName}' to Supabase cloud")
                 true
@@ -162,6 +181,7 @@ class CloudSyncManager(
                     }.format(java.util.Date(credit.dueDate)))
                 }
                 if (credit.linkedTransactionId != null) put("linked_transaction_id", credit.linkedTransactionId)
+                if (credit.customerId != null) put("customer_id", credit.customerId)
                 put("updated_at", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
                     it.timeZone = java.util.TimeZone.getTimeZone("UTC")
                 }.format(java.util.Date(credit.updatedAt)))
@@ -176,6 +196,42 @@ class CloudSyncManager(
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to sync credit record to cloud: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Syncs a customer record to Supabase 'customers' table.
+     */
+    suspend fun syncCustomerToCloud(customer: CustomerRecord): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val payload = JSONObject().apply {
+                put("id", customer.id)
+                put("shop_id", customer.shopId)
+                put("code", customer.code)
+                put("name", customer.name)
+                if (customer.keyword != null) put("keyword", customer.keyword)
+                if (customer.phone != null) put("phone", customer.phone)
+                if (customer.photoPath != null) put("photo_path", customer.photoPath)
+                put("phonetic_key", customer.phoneticKey)
+                if (customer.keywordPhoneticKey != null) put("keyword_phonetic_key", customer.keywordPhoneticKey)
+                put("last_seen_ms", customer.lastSeenMs)
+                put("txn_count", customer.txnCount)
+                if (customer.mergedIntoId != null) put("merged_into_id", customer.mergedIntoId)
+                put("created_at", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
+                    it.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                }.format(java.util.Date(customer.createdAt)))
+            }
+            val resCode = upsertToRestApi("/rest/v1/customers", payload)
+            if (resCode in 200..299) {
+                Log.i(TAG, "✅ Synced customer record for '${customer.name}' to Supabase cloud")
+                true
+            } else {
+                Log.w(TAG, "❌ Customer record sync HTTP $resCode for '${customer.name}'")
+                false
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to sync customer record to cloud: ${e.message}")
             false
         }
     }
@@ -218,6 +274,7 @@ class CloudSyncManager(
                 put("item_name", stockIn.itemName)
                 put("quantity", stockIn.quantity)
                 put("cost_price", stockIn.costPrice)
+                put("cost_missing", stockIn.costMissing)
                 if (stockIn.supplier != null) put("supplier", stockIn.supplier)
                 put("timestamp", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
                     it.timeZone = java.util.TimeZone.getTimeZone("UTC")
@@ -233,6 +290,140 @@ class CloudSyncManager(
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to sync stock-in record to cloud: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Syncs one append-only stock movement to Supabase 'stock_ledger' table (Docs/remaining_work_plan.md §1.2).
+     */
+    suspend fun syncStockLedgerEntryToCloud(entry: StockLedgerEntry): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val payload = JSONObject().apply {
+                put("id", entry.id)
+                put("shop_id", entry.shopId)
+                put("item_id", entry.itemId)
+                put("item_name", entry.itemName)
+                put("delta_qty", entry.deltaQty)
+                put("reason", entry.reason.name)
+                if (entry.unitCost != null) put("unit_cost", entry.unitCost)
+                if (entry.refId != null) put("ref_id", entry.refId)
+                if (entry.batchId != null) put("batch_id", entry.batchId)
+                if (entry.note != null) put("note", entry.note)
+                put("occurred_at", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
+                    it.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                }.format(java.util.Date(entry.occurredAtMs)))
+            }
+            val resCode = upsertToRestApi("/rest/v1/stock_ledger", payload)
+            if (resCode in 200..299) {
+                Log.i(TAG, "✅ Synced stock_ledger entry for '${entry.itemName}' (${entry.reason}) to Supabase cloud")
+                true
+            } else {
+                Log.w(TAG, "❌ stock_ledger sync HTTP $resCode for '${entry.itemName}'")
+                false
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to sync stock_ledger entry to cloud: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Syncs one expiry-tracked stock batch to Supabase 'stock_batches' table.
+     */
+    suspend fun syncStockBatchToCloud(batch: StockBatch): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val payload = JSONObject().apply {
+                put("id", batch.id)
+                put("shop_id", batch.shopId)
+                put("item_id", batch.itemId)
+                put("item_name", batch.itemName)
+                put("received_qty", batch.receivedQty)
+                put("remaining_qty", batch.remainingQty)
+                if (batch.unitCost != null) put("unit_cost", batch.unitCost)
+                if (batch.expiryDateMs != null) {
+                    put("expiry_date", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
+                        it.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                    }.format(java.util.Date(batch.expiryDateMs)))
+                }
+                put("received_at", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
+                    it.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                }.format(java.util.Date(batch.receivedAtMs)))
+            }
+            val resCode = upsertToRestApi("/rest/v1/stock_batches", payload)
+            if (resCode in 200..299) {
+                Log.i(TAG, "✅ Synced stock_batch for '${batch.itemName}' to Supabase cloud")
+                true
+            } else {
+                Log.w(TAG, "❌ stock_batches sync HTTP $resCode for '${batch.itemName}'")
+                false
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to sync stock_batch to cloud: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Syncs one Udhaar repayment to Supabase 'customer_payments' table.
+     */
+    suspend fun syncCustomerPaymentToCloud(payment: CustomerPayment): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val payload = JSONObject().apply {
+                put("id", payment.id)
+                put("shop_id", payment.shopId)
+                put("customer_id", payment.customerId)
+                put("customer_name", payment.customerName)
+                put("amount", payment.amount)
+                put("mode", payment.mode.name)
+                if (payment.note != null) put("note", payment.note)
+                if (payment.jobId != null) put("job_id", payment.jobId)
+                put("received_at", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
+                    it.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                }.format(java.util.Date(payment.receivedAtMs)))
+            }
+            val resCode = upsertToRestApi("/rest/v1/customer_payments", payload)
+            if (resCode in 200..299) {
+                Log.i(TAG, "✅ Synced customer_payment for '${payment.customerName}' to Supabase cloud")
+                true
+            } else {
+                Log.w(TAG, "❌ customer_payments sync HTTP $resCode for '${payment.customerName}'")
+                false
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to sync customer_payment to cloud: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Syncs one per-shop learning entry to Supabase 'shop_learning' table. Keyed on the
+     * composite (shop_id, kind, key) -- there is no surrogate id locally, so the upsert's
+     * on_conflict target is the same triple.
+     */
+    suspend fun syncShopLearningToCloud(entry: ShopLearning): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val payload = JSONObject().apply {
+                put("shop_id", entry.shopId)
+                put("kind", entry.kind.name)
+                put("key", entry.key)
+                put("value", entry.value)
+                put("hit_count", entry.hitCount)
+                put("last_used_at", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
+                    it.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                }.format(java.util.Date(entry.lastUsedAtMs)))
+                put("confidence", entry.confidence)
+            }
+            val resCode = upsertToRestApi("/rest/v1/shop_learning", payload, onConflictColumn = "shop_id,kind,key")
+            if (resCode in 200..299) {
+                Log.i(TAG, "✅ Synced shop_learning entry '${entry.kind}:${entry.key}' to Supabase cloud")
+                true
+            } else {
+                Log.w(TAG, "❌ shop_learning sync HTTP $resCode for '${entry.kind}:${entry.key}'")
+                false
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to sync shop_learning entry to cloud: ${e.message}")
             false
         }
     }
@@ -322,14 +513,23 @@ class CloudSyncManager(
                 put("created_at", sdf.format(java.util.Date(job.recordedAtMs)))
                 put("hold_duration_ms", job.holdDurationMs)
                 put("status", job.status.name)
-                put("raw_transcript", job.rawTranscript ?: "")
                 put("parsed_item_name", job.parsedItemName ?: "")
                 put("parsed_qty", job.parsedQty)
                 put("parsed_unit", job.parsedUnit ?: "")
                 put("parsed_total", job.parsedTotal)
                 put("is_sanity_flagged", job.isSanityFlagged)
                 put("error_message", job.errorMessage ?: "")
-                put("diagnostic_trace_json", traceObj.toString())
+                // ISSUE-044: a blank/empty client-side trace must never clobber a
+                // populated server trace on this upsert -- omitting the key leaves
+                // whatever the server already wrote for this job_id untouched, instead
+                // of upserting "{}" over it. See Docs/assistant_speed_and_pipeline_fix_plan.md §1.2.
+                val traceStr = traceObj.toString()
+                if (traceStr.isNotBlank() && traceStr != "{}") {
+                    put("diagnostic_trace_json", traceStr)
+                }
+                if (job.rawTranscript.isNotBlank()) {
+                    put("raw_transcript", job.rawTranscript)
+                }
                 put("audio_cloud_url", "$supabaseUrl/storage/v1/object/public/voice-recordings/${job.id}.wav")
             }
 

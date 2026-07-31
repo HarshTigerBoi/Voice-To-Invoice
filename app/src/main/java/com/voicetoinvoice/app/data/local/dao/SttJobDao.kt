@@ -23,6 +23,23 @@ interface SttJobDao {
     @Query("SELECT * FROM stt_jobs WHERE status = 'QUEUED' ORDER BY recordedAtMs ASC")
     suspend fun getQueuedJobsList(): List<SttJobRecord>
 
+    /**
+     * How many jobs recorded strictly before [ts] have not yet reached a terminal status.
+     *
+     * This is the predicate `CommitSequencer` polls to decide whether a job may commit: STT and
+     * parsing run in parallel for speed, but if job B (spoken second) finishes its network
+     * round-trip before job A (spoken first, e.g. "aaloo ka rate 30 kar do" before "5 kilo
+     * aaloo"), committing in arrival order would book the sale at the wrong price. Ordering is
+     * enforced only at the commit step, not the parse step, so the mic stays responsive.
+     */
+    @Query(
+        """
+        SELECT COUNT(*) FROM stt_jobs
+        WHERE recordedAtMs < :ts AND status IN ('QUEUED', 'TRANSCRIBING')
+        """
+    )
+    suspend fun countUnterminatedBefore(ts: Long): Int
+
     @Query("UPDATE stt_jobs SET status = 'PARSED', rawTranscript = 'Voice Recording (Server Timeout)', errorMessage = 'Server Timeout', isSanityFlagged = 1 WHERE status IN ('QUEUED', 'TRANSCRIBING') AND recordedAtMs < :thresholdMs")
     suspend fun markStuckJobsAsFailed(thresholdMs: Long)
 

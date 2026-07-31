@@ -13,6 +13,9 @@ interface CreditDao {
     @Query("SELECT * FROM credits ORDER BY status ASC, dueDate ASC")
     suspend fun getAllCreditsList(): List<CreditRecord>
 
+    @Query("SELECT * FROM credits WHERE id = :id LIMIT 1")
+    suspend fun getById(id: String): CreditRecord?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertOrUpdate(credit: CreditRecord)
 

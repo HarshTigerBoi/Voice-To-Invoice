@@ -170,6 +170,52 @@ export function normalizedDistance(a: string, b: string): number {
   return phoneticDistance(a, b) / Math.max(a.length, b.length)
 }
 
+function toNormalizedLatinText(s: string): string {
+  let str = (s || '').toLowerCase().trim()
+  if (isDevanagari(str)) str = devanagariToLatin(str)
+  str = str.replace(/[^a-z0-9]/g, '')
+  return str.replace(/aa/g, 'a').replace(/ee/g, 'i').replace(/oo/g, 'u').replace(/ii/g, 'i').replace(/uu/g, 'u')
+}
+
+export function literalLevenshteinDistance(aStr: string, bStr: string): number {
+  const a = (aStr || '').toLowerCase().trim()
+  const b = (bStr || '').toLowerCase().trim()
+  if (a === b) return 0
+  if (!a.length) return b.length
+  if (!b.length) return a.length
+
+  const matrix: number[][] = []
+  for (let i = 0; i <= b.length; i++) {
+    matrix[i] = [i]
+  }
+  for (let j = 0; j <= a.length; j++) {
+    matrix[0][j] = j
+  }
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1]
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        )
+      }
+    }
+  }
+  return matrix[b.length][a.length]
+}
+
+export function normalizedLiteralDistance(a: string, b: string): number {
+  const cleanA = toNormalizedLatinText(a)
+  const cleanB = toNormalizedLatinText(b)
+  const maxLen = Math.max(cleanA.length, cleanB.length)
+  if (maxLen === 0) return 0.0
+  return literalLevenshteinDistance(cleanA, cleanB) / maxLen
+}
+
 // ---------------------------------------------------------------------------
 // Vocabulary — mirrors OrderingSegmenter.kt's companion object.
 // ---------------------------------------------------------------------------
@@ -471,7 +517,7 @@ function matchVocab(
   fragment: string,
   vocab: VocabEntry[],
   maxNorm: number,
-  opts: { allowElision?: boolean; allowEcho?: boolean } = {}
+  opts: { allowElision?: boolean; allowEcho?: boolean; rawFragment?: string } = {}
 ): VocabHit | null {
   if (!fragment || !vocab.length) return null
   const candidateMap = new Map<string, VocabHit>()
@@ -488,10 +534,21 @@ function matchVocab(
     const existing = candidateMap.get(entry.key)
     if (!existing || norm < existing.normalized) {
       candidateMap.set(entry.key, { entry, normalized: norm })
+    } else if (norm === existing.normalized) {
+      const compareText = opts.rawFragment || fragment
+      const existingLitDist = normalizedLiteralDistance(compareText, existing.entry.surface)
+      const newLitDist = normalizedLiteralDistance(compareText, entry.surface)
+      if (newLitDist < existingLitDist) {
+        candidateMap.set(entry.key, { entry, normalized: norm })
+      }
     }
   }
   if (!candidateMap.size) return null
-  const candidates = Array.from(candidateMap.values()).sort((a, b) => a.normalized - b.normalized)
+  const candidates = Array.from(candidateMap.values()).sort((a, b) => {
+    if (a.normalized !== b.normalized) return a.normalized - b.normalized
+    const compareText = opts.rawFragment || fragment
+    return normalizedLiteralDistance(compareText, a.entry.surface) - normalizedLiteralDistance(compareText, b.entry.surface)
+  })
   const best = candidates[0]
   if (best.normalized > maxNorm) return null
   const second = candidates.length > 1 ? candidates[1] : null
@@ -538,7 +595,7 @@ function wholeTokenExpansions(raw: string, vocab: SegmenterVocabulary): Expansio
     const u = matchVocab(key, vocab.units, WHOLE_TOKEN_MAX_NORM, { allowElision: true })
     if (u) out.push({ emissions: [{ type: 'UNIT', cost: u.normalized, surface: raw, heardText: raw, canonicalUnit: u.entry.canonicalUnit }], emissionCost: u.normalized })
 
-    const it = matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, { allowEcho: true })
+    const it = matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, { allowEcho: true, rawFragment: raw })
     if (it) {
       const cost = ITEM_MATCHED_BASE_COST + it.normalized
       out.push({

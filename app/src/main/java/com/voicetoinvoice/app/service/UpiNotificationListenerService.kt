@@ -1,10 +1,5 @@
 package com.voicetoinvoice.app.service
 
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.os.Build
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
@@ -18,57 +13,19 @@ import kotlinx.coroutines.launch
 class UpiNotificationListenerService : NotificationListenerService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var testReceiver: BroadcastReceiver? = null
+
+    // ISSUE-018 (resolved, see ISSUE-050): an exported BroadcastReceiver listening for
+    // `SEED_TEST_TX` / `TEST_UPI` used to be registered here with RECEIVER_EXPORTED and no
+    // debug guard, letting ANY app on the phone insert fake sales into the real ledger or
+    // falsely mark a pending/Udhaar sale as UPI-paid. It has been removed outright -- manual
+    // UPI testing now goes through a real notification or an instrumented test, never through
+    // an IPC surface that ships to shopkeepers.
 
     override fun onCreate() {
         super.onCreate()
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == "com.voicetoinvoice.app.SEED_TEST_TX") {
-                    val amount = intent.getDoubleExtra("amount", 150.0)
-                    serviceScope.launch {
-                        val db = AppDatabase.getInstance(applicationContext)
-                        val tx = com.voicetoinvoice.app.data.local.entity.TransactionRecord(
-                            itemId = "test-item-id",
-                            itemName = "Test Pyaz",
-                            quantity = 2.0,
-                            priceAtSale = amount / 2.0,
-                            total = amount,
-                            paymentMode = com.voicetoinvoice.app.data.local.entity.PaymentMode.CASH,
-                            source = com.voicetoinvoice.app.data.local.entity.TransactionSource.VOICE,
-                            timestamp = System.currentTimeMillis()
-                        )
-                        db.transactionDao().insert(tx)
-                        Log.d("UpiListener", "SEED TEST TX Success: inserted ₹$amount CASH transaction ID ${tx.id}")
-                    }
-                    return
-                }
-
-                val title = intent?.getStringExtra("title") ?: ""
-                val text = intent?.getStringExtra("text") ?: ""
-                Log.d("UpiListener", "TEST UPI Broadcast Received - title: '$title', text: '$text'")
-                val amount = parseUpiAmount(title, text)
-                if (amount > 0.0) {
-                    Log.d("UpiListener", "UPI Payment Detected via Test Broadcast: ₹$amount")
-                    reconcileUpiPayment(amount)
-                }
-            }
-        }
-        testReceiver = receiver
-        val filter = IntentFilter().apply {
-            addAction("com.voicetoinvoice.app.TEST_UPI")
-            addAction("com.voicetoinvoice.app.SEED_TEST_TX")
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(receiver, filter, RECEIVER_EXPORTED)
-        } else {
-            registerReceiver(receiver, filter)
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        testReceiver?.let { unregisterReceiver(it) }
+        // Cold entry point: the system binds this listener independently of the Activity, and
+        // `reconcileUpiPayment` writes to shop-scoped tables.
+        com.voicetoinvoice.app.data.ShopContext.initialize(this)
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -105,7 +62,7 @@ class UpiNotificationListenerService : NotificationListenerService() {
                     Log.i("UpiListener", "Successfully reconciled UPI payment of ₹$amount to transaction ID: ${matchedTx.id}")
 
                     // Sweep sync to cloud
-                    val syncEngine = SyncEngine(db.transactionDao(), db.stockInDao(), db.catalogDao(), db.creditDao(), db.sttJobDao(), db.supplierDao())
+                    val syncEngine = SyncEngine(db.transactionDao(), db.stockInDao(), db.catalogDao(), db.creditDao(), db.sttJobDao(), db.supplierDao(), db.customerDao(), db.stockLedgerDao(), db.stockBatchDao(), db.customerPaymentDao(), db.shopLearningDao())
                     syncEngine.syncAllUnsynced()
                 } else if (candidates.size > 1) {
                     Log.w("UpiListener", "Ambiguous UPI payment: found ${candidates.size} transactions for ₹$amount within 2 mins. Leaving un-reconciled.")

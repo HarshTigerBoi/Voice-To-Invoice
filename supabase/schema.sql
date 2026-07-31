@@ -139,6 +139,7 @@ CREATE TABLE IF NOT EXISTS public.stock_in (
     item_name TEXT NOT NULL,
     quantity DOUBLE PRECISION NOT NULL,
     cost_price DOUBLE PRECISION NOT NULL,
+    cost_missing BOOLEAN NOT NULL DEFAULT FALSE,
     supplier TEXT,
     supplier_id UUID REFERENCES public.suppliers(id),
     timestamp TIMESTAMPTZ DEFAULT NOW()
@@ -589,3 +590,35 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_unmatched_queue_job_line ON public.unmatch
 CREATE INDEX IF NOT EXISTS idx_catalog_shop_active ON public.catalog_items(shop_id, active);
 CREATE INDEX IF NOT EXISTS idx_credits_shop_status ON public.credits(shop_id, status);
 CREATE INDEX IF NOT EXISTS idx_stt_job_logs_time ON public.stt_job_logs(created_at DESC);
+
+-- 11. Customers Table (Voice Assistant & Customer Ledger Phase 0)
+CREATE TABLE IF NOT EXISTS public.customers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    shop_id TEXT NOT NULL DEFAULT 'default_shop',
+    code INT NOT NULL,
+    name TEXT NOT NULL,
+    keyword TEXT,
+    phone TEXT,
+    photo_path TEXT,
+    phonetic_key TEXT NOT NULL,
+    keyword_phonetic_key TEXT,
+    last_seen_ms BIGINT NOT NULL DEFAULT 0,
+    txn_count INT NOT NULL DEFAULT 0,
+    merged_into_id UUID REFERENCES public.customers(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+ALTER TABLE public.customers ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Allow all read access to customers" ON public.customers FOR SELECT USING (true);
+CREATE POLICY "Allow all insert access to customers" ON public.customers FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow all update access to customers" ON public.customers FOR UPDATE USING (true);
+
+CREATE INDEX IF NOT EXISTS idx_customers_phonetic_key ON public.customers(phonetic_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_code ON public.customers(code);
+CREATE INDEX IF NOT EXISTS idx_customers_phone ON public.customers(phone);
+
+ALTER TABLE public.credits ADD COLUMN IF NOT EXISTS customer_id UUID REFERENCES public.customers(id);
+ALTER TABLE public.transactions ADD COLUMN IF NOT EXISTS customer_id UUID REFERENCES public.customers(id);
+

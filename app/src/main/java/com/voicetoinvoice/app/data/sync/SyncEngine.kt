@@ -17,6 +17,11 @@ class SyncEngine(
     private val creditDao: CreditDao,
     private val sttJobDao: SttJobDao,
     private val supplierDao: SupplierDao,
+    private val customerDao: CustomerDao,
+    private val stockLedgerDao: StockLedgerDao,
+    private val stockBatchDao: StockBatchDao,
+    private val customerPaymentDao: CustomerPaymentDao,
+    private val shopLearningDao: ShopLearningDao,
     private val cloudSyncManager: CloudSyncManager = CloudSyncManager()
 ) {
 
@@ -36,6 +41,11 @@ class SyncEngine(
             count += syncUnsyncedCredits()
             count += syncUnsyncedSuppliers()
             count += syncUnsyncedStockIn()
+            count += syncUnsyncedCustomers()
+            count += syncUnsyncedStockLedger()
+            count += syncUnsyncedStockBatches()
+            count += syncUnsyncedCustomerPayments()
+            count += syncUnsyncedShopLearning()
             // Pull LAST, so local edits have already been pushed and the server copy we
             // merge against includes them. Pulling first would compare local changes
             // against a server state that predates them and look like a spurious conflict.
@@ -216,5 +226,97 @@ class SyncEngine(
             Log.i(TAG, "Synced ${syncedIds.size}/${unsynced.size} stock-in records to Supabase")
         }
         syncedIds.size
+    }
+
+    suspend fun syncUnsyncedCustomers(): Int = withContext(Dispatchers.IO) {
+        val unsynced = customerDao.getUnsyncedCustomers()
+        if (unsynced.isEmpty()) return@withContext 0
+
+        val syncedIds = mutableListOf<String>()
+        for (customer in unsynced) {
+            val success = cloudSyncManager.syncCustomerToCloud(customer)
+            if (success) syncedIds.add(customer.id)
+        }
+
+        if (syncedIds.isNotEmpty()) {
+            customerDao.markSynced(syncedIds)
+            Log.i(TAG, "Synced ${syncedIds.size}/${unsynced.size} customers to Supabase")
+        }
+        syncedIds.size
+    }
+
+    // §1.2 (Docs/remaining_work_plan.md): stock_ledger/stock_batches/customer_payments/
+    // shop_learning were local-only until now. daily_rollups is deliberately NOT swept here --
+    // it's a derived cache DailyRollupRepository recomputes from stock_ledger/transactions, so
+    // syncing it would ship a recomputable value over the wire for no server-side read path.
+
+    suspend fun syncUnsyncedStockLedger(): Int = withContext(Dispatchers.IO) {
+        val unsynced = stockLedgerDao.getUnsynced()
+        if (unsynced.isEmpty()) return@withContext 0
+
+        val syncedIds = mutableListOf<String>()
+        for (entry in unsynced) {
+            val success = cloudSyncManager.syncStockLedgerEntryToCloud(entry)
+            if (success) syncedIds.add(entry.id)
+        }
+
+        if (syncedIds.isNotEmpty()) {
+            stockLedgerDao.markSynced(syncedIds)
+            Log.i(TAG, "Synced ${syncedIds.size}/${unsynced.size} stock_ledger entries to Supabase")
+        }
+        syncedIds.size
+    }
+
+    suspend fun syncUnsyncedStockBatches(): Int = withContext(Dispatchers.IO) {
+        val unsynced = stockBatchDao.getUnsynced()
+        if (unsynced.isEmpty()) return@withContext 0
+
+        val syncedIds = mutableListOf<String>()
+        for (batch in unsynced) {
+            val success = cloudSyncManager.syncStockBatchToCloud(batch)
+            if (success) syncedIds.add(batch.id)
+        }
+
+        if (syncedIds.isNotEmpty()) {
+            stockBatchDao.markSynced(syncedIds)
+            Log.i(TAG, "Synced ${syncedIds.size}/${unsynced.size} stock batches to Supabase")
+        }
+        syncedIds.size
+    }
+
+    suspend fun syncUnsyncedCustomerPayments(): Int = withContext(Dispatchers.IO) {
+        val unsynced = customerPaymentDao.getUnsynced()
+        if (unsynced.isEmpty()) return@withContext 0
+
+        val syncedIds = mutableListOf<String>()
+        for (payment in unsynced) {
+            val success = cloudSyncManager.syncCustomerPaymentToCloud(payment)
+            if (success) syncedIds.add(payment.id)
+        }
+
+        if (syncedIds.isNotEmpty()) {
+            customerPaymentDao.markSynced(syncedIds)
+            Log.i(TAG, "Synced ${syncedIds.size}/${unsynced.size} customer payments to Supabase")
+        }
+        syncedIds.size
+    }
+
+    suspend fun syncUnsyncedShopLearning(): Int = withContext(Dispatchers.IO) {
+        val unsynced = shopLearningDao.getUnsynced()
+        if (unsynced.isEmpty()) return@withContext 0
+
+        var syncedCount = 0
+        for (entry in unsynced) {
+            val success = cloudSyncManager.syncShopLearningToCloud(entry)
+            if (success) {
+                shopLearningDao.markSynced(entry.shopId, entry.kind.name, entry.key)
+                syncedCount++
+            }
+        }
+
+        if (syncedCount > 0) {
+            Log.i(TAG, "Synced $syncedCount/${unsynced.size} shop_learning entries to Supabase")
+        }
+        syncedCount
     }
 }

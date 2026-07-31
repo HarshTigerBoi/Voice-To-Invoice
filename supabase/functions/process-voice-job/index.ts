@@ -5,6 +5,7 @@ import {
   normalizeTranscript,
   phoneticKey,
   normalizedDistance,
+  normalizedLiteralDistance,
   normalizeUnit,
   parseHindiOrNumericValue,
   DEFAULT_ITEM_VOCAB,
@@ -20,6 +21,7 @@ import {
   type PriceIntent,
 } from './price_intent.ts'
 import { resolveItemName, unpricedLineReason } from './item_resolution.ts'
+import { classifyIntent, captureIntentFor } from './intent_router.ts'
 
 // Deno Deploy / Supabase Edge Runtime global declaration
 declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void }
@@ -636,6 +638,10 @@ serve(async (req) => {
     const previousJobId = formData.get('previousJobId') as string | null
     const precedingGapMsRaw = formData.get('precedingGapMs') as string | null
     const precedingGapMs = precedingGapMsRaw ? parseInt(precedingGapMsRaw, 10) : -1
+    // ISSUE-039: which mic recorded this job -- CREDIT_SALE must book payment_mode=CREDIT
+    // and open a credits row. Server-first processing (this function can finish a job even
+    // if the app was closed) means this decision cannot live client-side only.
+    const captureIntent = (formData.get('captureIntent') as string | null) || 'SALE'
 
     if (!audioFile || !jobId) {
       return new Response(JSON.stringify({ error: 'Missing required parameters (file, jobId)' }), {
@@ -727,8 +733,10 @@ serve(async (req) => {
 
     const audioCloudUrl = `${supabaseUrl}/storage/v1/object/public/voice-recordings/${storagePath}`
 
-    // Step 1B: Immediately mark the job QUEUED
-    await supabase.from('stt_job_logs').upsert([{
+    // Step 1B: Immediately mark the job QUEUED. Errors on this write were previously
+    // unchecked -- if it silently failed, a job could be processed and finish (or be
+    // abandoned) with literally zero row ever existing for it. See ISSUE-044/§2.3.
+    const { error: queuedErr } = await supabase.from('stt_job_logs').upsert([{
       job_id: jobId,
       shop_id: resolvedShopId,
       recorded_at_ms: metadata.recordedAtMs || Date.now(),
@@ -740,33 +748,76 @@ serve(async (req) => {
       error_message: '',
       audio_cloud_url: audioCloudUrl
     }], { onConflict: 'job_id' })
+    if (queuedErr) {
+      console.error(`Failed to write QUEUED placeholder for job ${jobId}:`, queuedErr.message)
+    }
 
-    // Kick off AI pipeline asynchronously in background
-    EdgeRuntime.waitUntil(
-      processVoiceJob({
-        jobId,
-        shopId: resolvedShopId,
-        metadata,
-        audioBuffer,
-        audioCloudUrl,
-        catalogNamesRaw,
-        onDeviceTranscript,
-        onDeviceStatus,
-        previousJobId,
-        precedingGapMs,
-        supabase
+    // §2.1 (Docs/assistant_speed_and_pipeline_fix_plan.md): the pipeline measurably
+    // finishes in 2-4s (Grok/Sarvam STT + parse), but the client used to poll for up to
+    // 30s no matter what because this endpoint always returned 202/QUEUED immediately
+    // and did the real work in the background. Await the work directly and return the
+    // real result inline; only fall back to the old 202+background behavior if it
+    // genuinely runs long, so a slow job still finishes even if the phone gives up.
+    const work = processVoiceJob({
+      jobId,
+      shopId: resolvedShopId,
+      metadata,
+      audioBuffer,
+      audioCloudUrl,
+      catalogNamesRaw,
+      onDeviceTranscript,
+      onDeviceStatus,
+      previousJobId,
+      precedingGapMs,
+      captureIntent,
+      supabase
+    })
+
+    const INLINE_BUDGET_MS = 20000
+    const finished = await Promise.race([
+      work.then(() => 'done' as const),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), INLINE_BUDGET_MS))
+    ])
+
+    if (finished === 'timeout') {
+      EdgeRuntime.waitUntil(work)
+      return new Response(JSON.stringify({
+        status: 'QUEUED',
+        job_id: jobId,
+        audio_cloud_url: audioCloudUrl,
+        cached: false,
+        message: 'Still processing — poll stt_job_logs for this job_id.'
+      }), {
+        status: 202,
+        headers: { 'Content-Type': 'application/json', ...CORS_HEADERS }
       })
-    )
+    }
 
-    // Respond immediately to client
+    // Read back the row the pipeline just wrote so the response carries the same shape
+    // the "already processed" cache-hit branch above returns (snake_case keys -- the
+    // client reads raw_transcript/parsed_items/diagnostic_trace_json).
+    const { data: finishedRow } = await supabase
+      .from('stt_job_logs')
+      .select('status,raw_transcript,diagnostic_trace_json')
+      .eq('job_id', jobId)
+      .maybeSingle()
+
+    let inlineParsedItems: any[] = []
+    try {
+      const t = JSON.parse(finishedRow?.diagnostic_trace_json || '{}')
+      if (Array.isArray(t.step_4_grok_ai_interpretation)) inlineParsedItems = t.step_4_grok_ai_interpretation
+    } catch (_) {}
+
     return new Response(JSON.stringify({
-      status: 'QUEUED',
+      status: finishedRow?.status || 'PARSED',
       job_id: jobId,
+      raw_transcript: finishedRow?.raw_transcript || '',
+      diagnostic_trace_json: finishedRow?.diagnostic_trace_json || '',
+      parsed_items: inlineParsedItems,
       audio_cloud_url: audioCloudUrl,
-      cached: false,
-      message: 'Audio received and stored. Processing in background — poll or subscribe to stt_job_logs for this job_id.'
+      cached: false
     }), {
-      status: 202,
+      status: 200,
       headers: { 'Content-Type': 'application/json', ...CORS_HEADERS }
     })
 
@@ -791,10 +842,24 @@ async function processVoiceJob(args: {
   onDeviceStatus?: string
   previousJobId?: string | null
   precedingGapMs?: number
+  captureIntent?: string
   supabase: ReturnType<typeof createClient>
 }) {
-  const { jobId, shopId, metadata, audioBuffer, audioCloudUrl, catalogNamesRaw, onDeviceTranscript = '', onDeviceStatus = '', previousJobId = null, precedingGapMs = -1, supabase } = args
+  const { jobId, shopId, metadata, audioBuffer, audioCloudUrl, catalogNamesRaw, onDeviceTranscript = '', onDeviceStatus = '', previousJobId = null, precedingGapMs = -1, captureIntent = 'SALE', supabase } = args
+  const isCreditSale = captureIntent === 'CREDIT_SALE'
+  // Fix 6: माल आया / खराब mics -- these describe inventory changes, not sales. Writing
+  // them as CASH transactions (the old default) would corrupt every revenue and profit
+  // figure the assistant later reports. WASTE books a negative stock_in row instead of a
+  // fake ₹0 sale -- see Docs/gap_analysis_and_fix_plan.md Fix 6.
+  const isStockCapture = captureIntent === 'STOCK_IN' || captureIntent === 'WASTE'
+  const isWaste = captureIntent === 'WASTE'
+  // ASSISTANT jobs get the full transcribe + parse pipeline but write no ledger rows
+  // here. The client routes the parse to the right pipeline after intent classification
+  // (SttWorker.handleAssistantJob), so a server-side write would double-book it.
+  const isAssistant = captureIntent === 'ASSISTANT'
   const resolvedShopId = getNullSafeShopId(shopId)
+  const pressCount = (metadata && metadata.pressCount) ? Number(metadata.pressCount) : 1
+  const utteranceBoundaries = (metadata && Array.isArray(metadata.utteranceBoundaries)) ? metadata.utteranceBoundaries : []
 
   try {
     let dbCatalogItems: Array<{ id: string, name: string, price: number, unit_id: string }> = []
@@ -1087,6 +1152,10 @@ Output ONLY valid JSON, no prose, in exactly this shape:
   ]
 }`
 
+      const boundaryHintStr = (pressCount > 1 && utteranceBoundaries.length > 0)
+        ? `\n- Soft Utterance Boundaries (${pressCount} rapid presses coalesced into this recording): ${utteranceBoundaries.map((b: any, idx: number) => `Press #${idx + 1}: ${b.pressOffsetMs}ms to ${b.releaseOffsetMs}ms`).join(', ')}. Prefer placing sale line splits near these boundary offsets, but cross them if grammar/quantity requires it.`
+        : ''
+
       const userPrompt = `Shop catalog: ${catalogContextStr}
 
 DUAL STT TRANSCRIPTIONS RECEIVED (these are the actual audio-derived signal —
@@ -1095,7 +1164,7 @@ a scoring pass measuring how well it resolves to real shopkeeper vocabulary, so 
 the strongest acoustic evidence available — see rule 10.
 - Grok STT Transcript${chosenRaw === rawGrokTranscript && rawGrokTranscript ? ' [ADOPTED]' : ''}: "${rawGrokTranscript || '(none)'}"
 - Sarvam AI STT Transcript${chosenRaw === rawSarvamTranscript && rawSarvamTranscript ? ' [ADOPTED]' : ''}: "${rawSarvamTranscript || '(none)'}"
-- Preprocessed Transcript (rule-based phonetic segmenter, may be wrong — see rule 7): "${transcript || '(none)'}"
+- Preprocessed Transcript (rule-based phonetic segmenter, may be wrong — see rule 7): "${transcript || '(none)'}"${boundaryHintStr}
 
 Parse this order.`
 
@@ -1304,12 +1373,33 @@ Parse this order.`
       }
       const aiName = (rawItem.item_name || "").trim()
       const findCatalog = (name: string) => {
-        const lowered = name.toLowerCase()
+        const lowered = name.toLowerCase().trim()
         const bySubstring = dbCatalogItems.find(dbItem => {
           const dbN = dbItem.name.toLowerCase().trim()
           return dbN === lowered || lowered.includes(dbN) || dbN.includes(lowered)
         })
-        return bySubstring ?? catalogByKey.get(phoneticKey(name))
+        if (bySubstring) return bySubstring
+
+        const k = phoneticKey(name)
+        if (!k) return undefined
+
+        const candidates = dbCatalogItems.filter(dbItem => phoneticKey(dbItem.name) === k)
+        if (candidates.length === 0) return undefined
+
+        let bestItem: typeof dbCatalogItems[0] | undefined = undefined
+        let bestDist = Infinity
+        for (const item of candidates) {
+          const dist = normalizedLiteralDistance(name, item.name)
+          if (dist < bestDist) {
+            bestDist = dist
+            bestItem = item
+          }
+        }
+
+        if (bestItem && bestDist <= 0.15) {
+          return bestItem
+        }
+        return undefined
       }
 
       // When the segmenter has a near-exact match on the ADOPTED transcript and the AI
@@ -1383,7 +1473,7 @@ Parse this order.`
         confidence = 0.60
       }
 
-      let implausibility = implausibilityReason(unit, qty, total, chosenRaw, priceAtSale)
+      let implausibility = implausibilityReason(unit, qty, total, chosenRaw, priceAtSale, isStockCapture ? 'STOCK' : 'SALE')
 
       if (sttDisagreementReason) {
         implausibility = implausibility ? `${implausibility} | ${sttDisagreementReason}` : sttDisagreementReason
@@ -1413,6 +1503,14 @@ Parse this order.`
       if ((metadata.holdDurationMs || 0) >= 29000) {
         const longHoldReason = `recording held ${metadata.holdDurationMs}ms, at/beyond the 30s rolling buffer -- leading audio may have been truncated`
         implausibility = implausibility ? `${implausibility} | ${longHoldReason}` : longHoldReason
+      }
+
+      // Burst Coalescing Cross-Check: Quantity-mention count vs segmented-line count
+      const spokenNumbersCount = extractSpokenNumbers(chosenRaw).length
+      const totalParsedLines = parsedRawItems ? parsedRawItems.length : 1
+      if (pressCount > 1 && spokenNumbersCount > 0 && Math.abs(spokenNumbersCount - totalParsedLines) > 0) {
+        const burstMismatchReason = `quantity-mention count (${spokenNumbersCount}) disagrees with segmented line count (${totalParsedLines}) on burst recording (${pressCount} presses)`
+        implausibility = implausibility ? `${implausibility} | ${burstMismatchReason}` : burstMismatchReason
       }
 
       // P0-3: Make rawLooksUnrecognizable block auto-confirm
@@ -1547,6 +1645,36 @@ Parse this order.`
       }
     }
 
+    // ASSISTANT jobs carry no reliable captureIntent from the client (it's a generic
+    // mic press, not a specific action) -- classify here too so a recording processed
+    // while the app is CLOSED doesn't silently fall back to booking everything as a
+    // plain sale. Mirrors domain/router/IntentRouter.kt; see Docs/remaining_work_plan.md §1.1.
+    const assistantClassification = isAssistant
+      ? classifyIntent(transcript || rawGrokTranscript || rawSarvamTranscript || '', finalParsedItems)
+      : null
+    // Only intents whose booking logic already exists below (plain sale/credit/stock/
+    // waste via committedSaleEntries, and rate updates via validRateUpdateEntries) are
+    // safe to auto-book server-side. RETURN/PAYMENT_RECEIVED/VOID_LAST/EXPIRY_WRITEOFF/
+    // ACTION_COMMAND need customer resolution or ledger-reversal logic that only exists
+    // client-side (VoiceCommandHandlers) -- mis-booking those as a sale would be worse
+    // than leaving them for review, so they route to unmatched_queue instead (below).
+    const assistantEffectiveIntent = assistantClassification?.intent ?? null
+    const shouldBookSale = !isAssistant ||
+      assistantEffectiveIntent === 'SALE' || assistantEffectiveIntent === 'CREDIT_SALE' ||
+      assistantEffectiveIntent === 'STOCK_IN' || assistantEffectiveIntent === 'WASTE'
+    const shouldBookRateUpdate = !isAssistant || assistantEffectiveIntent === 'PRICE_UPDATE'
+    const effIsStockCapture = isAssistant
+      ? (assistantEffectiveIntent === 'STOCK_IN' || assistantEffectiveIntent === 'WASTE')
+      : isStockCapture
+    const effIsWaste = isAssistant ? assistantEffectiveIntent === 'WASTE' : isWaste
+    const effIsCreditSale = isAssistant ? assistantEffectiveIntent === 'CREDIT_SALE' : isCreditSale
+    // Everything else the classifier can name but this function can't safely act on --
+    // still worth a queue row so the recording isn't silently lost when the app never
+    // reopens to run the client-side handler.
+    const assistantNeedsReview = isAssistant && assistantClassification !== null &&
+      !shouldBookSale && !shouldBookRateUpdate &&
+      assistantEffectiveIntent !== 'READ_QUERY'
+
     // Every item keeps the index it holds in finalParsedItems as its `lineNo` -- stable
     // across sale/rate-update/committed/pending splits below, so a `transactions` row
     // and an `unmatched_queue` row for the SAME utterance never collide on line number
@@ -1591,8 +1719,19 @@ Parse this order.`
       item.item_name !== "Unrecognized Item" &&
       item.implausibility_reason === null
 
-    const committedSaleEntries = saleEntries.filter(e => isCommittable(e.item))
-    const pendingSaleEntries = saleEntries.filter(e => !isCommittable(e.item))
+    // A stock-in/waste line commits on quantity alone. Price is optional — the
+    // shopkeeper is recording what arrived, not what it cost, and holding the stock
+    // hostage to a price sends every unpriced delivery into the sales review queue.
+    const isStockCommittable = (item: any) =>
+      item.confidence >= 0.80 &&
+      item.quantity > 0 &&
+      item.item_name &&
+      item.item_name.trim().length > 0 &&
+      item.item_name !== "Unrecognized Item" &&
+      item.implausibility_reason === null
+
+    const committedSaleEntries = saleEntries.filter(e => effIsStockCapture ? isStockCommittable(e.item) : isCommittable(e.item))
+    const pendingSaleEntries = saleEntries.filter(e => effIsStockCapture ? !isStockCommittable(e.item) : !isCommittable(e.item))
     const isAutoConfirmed = saleEntries.length > 0 && committedSaleEntries.length === saleEntries.length
     const finalStatus = isAutoConfirmed
       ? "AUTO_CONFIRMED"
@@ -1610,7 +1749,19 @@ Parse this order.`
         holdDurationMs: metadata.holdDurationMs || 0,
         audioStartMs: metadata.audioStartMs || 0,
         audioEndMs: metadata.audioEndMs || 0,
+        captureIntent,
+        isAssistant,
       },
+      step_2b_intent_classification: isAssistant ? {
+        intent: assistantClassification?.intent ?? null,
+        confidence: assistantClassification?.confidence ?? null,
+        scores: assistantClassification?.scores ?? {},
+        runnerUp: assistantClassification?.runnerUp ?? null,
+        needsArbitration: assistantClassification?.needsArbitration ?? false,
+        effectiveCaptureIntent: assistantEffectiveIntent ? captureIntentFor(assistantEffectiveIntent) : null,
+        bookedServerSide: shouldBookSale || shouldBookRateUpdate,
+        routedToReview: assistantNeedsReview,
+      } : null,
       step_2_stt_proxy_response: {
         rawTranscript: chosenRaw,
         normalizedTranscript: normalizeTranscript(chosenRaw, fullCatalogList),
@@ -1748,7 +1899,23 @@ Parse this order.`
     // here). One row per line, keyed (job_id, line_no) -- a job can now produce more
     // than one transaction row, which the old job_id-only unique index made
     // impossible (the upsert failed with 42P10 and was never checked; see ISSUE-029).
-    if (committedSaleEntries.length > 0) {
+    if (shouldBookSale && effIsStockCapture && committedSaleEntries.length > 0) {
+      const stockInserts = committedSaleEntries.map(({ item }) => ({
+        shop_id: resolvedShopId,
+        item_id: item.item_id,
+        item_name: item.item_name,
+        quantity: effIsWaste ? -Math.abs(item.quantity) : Math.abs(item.quantity),
+        cost_price: item.price_at_sale > 0 ? item.price_at_sale : 0,
+        cost_missing: !(item.price_at_sale > 0),
+        timestamp: new Date().toISOString(),
+      }))
+      const { error: stockErr } = await supabase.from('stock_in').insert(stockInserts)
+      if (stockErr) {
+        console.error(`Failed to insert ${stockInserts.length} stock_in row(s) for job ${jobId} (intent ${captureIntent}):`, stockErr.message)
+      } else {
+        console.log(`Inserted ${stockInserts.length} stock_in row(s) for job ${jobId} (intent ${captureIntent})`)
+      }
+    } else if (shouldBookSale && !effIsStockCapture && committedSaleEntries.length > 0) {
       const txInserts = committedSaleEntries.map(({ item, lineNo }) => ({
         job_id: jobId,
         shop_id: resolvedShopId,
@@ -1759,22 +1926,49 @@ Parse this order.`
         quantity: item.quantity,
         price_at_sale: item.price_at_sale,
         total: item.total,
-        payment_mode: 'CASH',
+        // ISSUE-039: mirrors the client -- captureIntent decides payment mode. This branch
+        // used to hardcode CASH, so a job finished server-first (app closed) while the
+        // client was still uploading would double-book the sale as cash even if the
+        // client-side write later got it right.
+        payment_mode: effIsCreditSale ? 'CREDIT' : 'CASH',
         source: 'VOICE',
         timestamp: new Date().toISOString(),
         line_no: lineNo,
         line_count: lineCount,
       }))
-      const { error: txErr } = await supabase.from('transactions').upsert(txInserts, { onConflict: 'job_id,line_no' })
+      const { data: insertedTx, error: txErr } = await supabase
+        .from('transactions')
+        .upsert(txInserts, { onConflict: 'job_id,line_no' })
+        .select('id, total')
       if (txErr) {
         console.error(`Failed to insert ${txInserts.length} transaction(s) for job ${jobId}:`, txErr.message)
       } else {
         console.log(`Inserted ${txInserts.length} committed transaction(s) for job ${jobId} (${lineCount} total lines)`)
+
+        // Book the credit immediately, customer_id left NULL -- resolution (which
+        // customer) must never hold the sale hostage. The app's Udhaar picker / assistant
+        // resolves customer_id onto these rows afterwards.
+        if (effIsCreditSale && insertedTx && insertedTx.length > 0) {
+          const creditInserts = insertedTx.map((tx: any) => ({
+            shop_id: resolvedShopId,
+            customer_name: 'अज्ञात',
+            customer_id: null,
+            amount: tx.total,
+            status: 'PENDING',
+            linked_transaction_id: tx.id,
+          }))
+          const { error: creditErr } = await supabase.from('credits').insert(creditInserts)
+          if (creditErr) {
+            console.error(`Failed to insert ${creditInserts.length} credit(s) for job ${jobId}:`, creditErr.message)
+          } else {
+            console.log(`Inserted ${creditInserts.length} credit(s) for job ${jobId}`)
+          }
+        }
       }
     }
 
     // RATE_UPDATE: update the catalog's standing price directly, no transaction created.
-    if (validRateUpdateEntries.length > 0) {
+    if (shouldBookRateUpdate && validRateUpdateEntries.length > 0) {
       for (const { item } of validRateUpdateEntries) {
         const { error: rateUpdateError } = await supabase
           .from('catalog_items')
@@ -1793,7 +1987,7 @@ Parse this order.`
     // weak line surfaced as a single generic "review this" row carrying only the raw
     // transcript; the shopkeeper had to re-listen and guess which item needed fixing.
     const pendingEntries = [...pendingSaleEntries, ...pendingRateUpdateEntries]
-    if (pendingEntries.length > 0) {
+    if ((shouldBookSale || shouldBookRateUpdate) && pendingEntries.length > 0) {
       const pendingInserts = pendingEntries.map(({ item, lineNo }) => ({
         job_id: jobId,
         shop_id: resolvedShopId,
@@ -1816,7 +2010,33 @@ Parse this order.`
       } else {
         console.log(`Routed ${pendingInserts.length} pending line(s) of job ${jobId} to unmatched_queue (shop_id: ${resolvedShopId})`)
       }
-    } else if (finalParsedItems.length === 0) {
+    } else if (assistantNeedsReview) {
+      // Classified as RETURN/PAYMENT_RECEIVED/VOID_LAST/EXPIRY_WRITEOFF/ACTION_COMMAND/
+      // UNKNOWN -- these need customer resolution or ledger-reversal logic that only
+      // exists client-side. Queue it rather than mis-booking as a sale or losing it
+      // entirely when the app never reopens. See Docs/remaining_work_plan.md §1.1.
+      const firstReviewItem = finalParsedItems[0] || null
+      const { error: uqErr } = await supabase.from('unmatched_queue').upsert([{
+        job_id: jobId,
+        shop_id: resolvedShopId,
+        audio_ref: audioCloudUrl,
+        raw_transcript: transcript || rawGrokTranscript || rawSarvamTranscript || "Voice Recording (Pending Review)",
+        status: 'PENDING',
+        timestamp: new Date().toISOString(),
+        line_no: 0,
+        item_name: firstReviewItem?.item_name ?? null,
+        quantity: firstReviewItem?.quantity ?? null,
+        unit: firstReviewItem?.unit ?? null,
+        price_at_sale: firstReviewItem?.price_at_sale ?? null,
+        total: firstReviewItem?.total ?? null,
+        implausibility_reason: `ASSISTANT intent=${assistantEffectiveIntent} (confidence ${(assistantClassification?.confidence ?? 0).toFixed(2)}) -- needs app review, server-side handling not implemented for this intent`,
+      }], { onConflict: 'job_id,line_no' })
+      if (uqErr) {
+        console.error(`Failed to write assistant-review unmatched_queue row for job ${jobId} (intent ${assistantEffectiveIntent}):`, uqErr.message)
+      } else {
+        console.log(`Routed assistant job ${jobId} (classified ${assistantEffectiveIntent}, confidence ${assistantClassification?.confidence}) to unmatched_queue for review`)
+      }
+    } else if (!isAssistant && finalParsedItems.length === 0) {
       // Nothing parsed at all -- still keep a permanent record so the recording isn't
       // silently lost from every table.
       const { error: uqErr } = await supabase.from('unmatched_queue').upsert([{

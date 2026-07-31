@@ -15,17 +15,23 @@ class RollingAudioBuffer(private val context: Context) {
 
     private val sampleRate = 16000
     private val bytesPerSecond = sampleRate * 2 // 16-bit Mono = 32,000 bytes/sec
-    private val bufferDurationSeconds = 30
-    private val bufferCapacity = bytesPerSecond * bufferDurationSeconds // 960,000 bytes (~960 KB RAM)
+    private val bufferDurationSeconds = 120
+    private val bufferCapacity = bytesPerSecond * bufferDurationSeconds // 3,840,000 bytes (~3.84 MB RAM)
 
     private val ringBuffer = ByteArray(bufferCapacity)
     private var writeHead = 0
     private var isRecordingRunning = AtomicBoolean(false)
     private var recordingThread: Thread? = null
+    private val isSuppressed = AtomicBoolean(false)
     @Volatile private var recordingStartedAtMs: Long = 0L
     @Volatile private var totalBytesWritten: Long = 0L
 
+    /** While true the ring buffer keeps advancing but stores silence, so TTS playback
+     *  never lands in a window the next PTT press extracts. */
+    fun setSuppressed(suppressed: Boolean) { isSuppressed.set(suppressed) }
+
     fun getRecordingStartedAtMs(): Long = recordingStartedAtMs
+    fun getBufferDurationSeconds(): Int = bufferDurationSeconds
 
     fun startRollingBuffer() {
         if (isRecordingRunning.get()) return
@@ -77,6 +83,9 @@ class RollingAudioBuffer(private val context: Context) {
                 while (isRecordingRunning.get()) {
                     val bytesRead = audioRecord.read(chunk, 0, chunk.size)
                     if (bytesRead > 0) {
+                        if (isSuppressed.get()) {
+                            java.util.Arrays.fill(chunk, 0, bytesRead, 0.toByte())
+                        }
                         synchronized(ringBuffer) {
                             for (i in 0 until bytesRead) {
                                 ringBuffer[writeHead] = chunk[i]
@@ -130,8 +139,8 @@ class RollingAudioBuffer(private val context: Context) {
                 }
 
                 // Absolute byte offsets since recordingStartedAtMs
-                val startByteOffset = Math.max(0L, (effectiveStartMs - recStarted) * bytesPerSecond / 1000L)
-                val endByteOffset = Math.max(startByteOffset, (endMs - recStarted) * bytesPerSecond / 1000L)
+                val startByteOffset = Math.max(0L, (effectiveStartMs - recStarted) * bytesPerSecond.toLong() / 1000L)
+                val endByteOffset = Math.max(startByteOffset, (endMs - recStarted) * bytesPerSecond.toLong() / 1000L)
                 val requestedBytes = (endByteOffset - startByteOffset).toInt()
 
                 val minStartAllowed = Math.max(0L, totalWritten - bufferCapacity)
@@ -162,6 +171,17 @@ class RollingAudioBuffer(private val context: Context) {
         } catch (e: Exception) {
             Log.e("RollingAudioBuffer", "Failed to extract audio window safely", e)
             null
+        }
+    }
+
+    companion object {
+        @Volatile
+        private var instance: RollingAudioBuffer? = null
+
+        fun getSharedInstance(context: Context): RollingAudioBuffer {
+            return instance ?: synchronized(this) {
+                instance ?: RollingAudioBuffer(context.applicationContext).also { instance = it }
+            }
         }
     }
 }

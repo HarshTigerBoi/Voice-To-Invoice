@@ -1,6 +1,7 @@
 package com.voicetoinvoice.app.data.local.entity
 
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 import java.util.UUID
 
@@ -13,7 +14,12 @@ enum class SttJobStatus {
     PARTIALLY_CONFIRMED, RATE_UPDATED
 }
 
-@Entity(tableName = "stt_jobs")
+@Entity(
+    tableName = "stt_jobs",
+    // `status` + `recordedAtMs` drive the queue drain and the commit-ordering check, both of
+    // which run on every recording.
+    indices = [Index(value = ["status", "recordedAtMs"]), Index("recordedAtMs"), Index("status")]
+)
 data class SttJobRecord(
     @PrimaryKey
     val id: String = UUID.randomUUID().toString(),
@@ -45,5 +51,12 @@ data class SttJobRecord(
     // above stay a line-0 summary for backward compatibility, this is the source of
     // truth for lines 1..N. See ISSUE-029.
     val parsedItemsJson: String = "",
-    val lineCount: Int = 0
+    val lineCount: Int = 0,
+    val utteranceBoundariesJson: String = "[]",
+    val pressCount: Int = 1,
+    val captureIntent: CaptureIntent = CaptureIntent.SALE,
+    /** What the assistant spoke back for this job. Kept out of parsedItemName so an
+     *  answered question never renders as a booked ₹0 sale in the logs (see §1.6). */
+    val assistantAnswer: String = ""
 )
+

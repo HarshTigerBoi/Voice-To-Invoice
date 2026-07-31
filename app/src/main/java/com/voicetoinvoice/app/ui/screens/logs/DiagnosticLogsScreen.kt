@@ -164,15 +164,19 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
         SimpleDateFormat("dd MMM, hh:mm:ss a", Locale.getDefault()).format(Date(log.recordedAtMs))
     }
 
-    val (statusLabel, statusColor) = when (log.status) {
-        SttJobStatus.AUTO_CONFIRMED -> "AUTO-CONFIRMED" to Color(0xFF2E7D32)
-        SttJobStatus.CONFIRMED -> "CONFIRMED" to Color(0xFF2E7D32)
-        SttJobStatus.PARSED -> if (log.isSanityFlagged) "REVIEW NEEDED" to Color(0xFFEF6C00) else "PARSED" to Color(0xFF0288D1)
-        SttJobStatus.PARTIALLY_CONFIRMED -> "PARTIALLY CONFIRMED" to Color(0xFFEF6C00)
-        SttJobStatus.RATE_UPDATED -> "RATE UPDATED" to Color(0xFF2E7D32)
-        SttJobStatus.FAILED -> "FAILED" to Color(0xFFC62828)
-        SttJobStatus.TRANSCRIBING -> "PROCESSING" to Color(0xFF1565C0)
-        SttJobStatus.QUEUED -> "QUEUED" to Color(0xFF616161)
+    val (statusLabel, statusColor) = if (log.captureIntent == com.voicetoinvoice.app.data.local.entity.CaptureIntent.ASSISTANT) {
+        "ASSISTANT" to Color(0xFF7B1FA2)
+    } else {
+        when (log.status) {
+            SttJobStatus.AUTO_CONFIRMED -> "AUTO-CONFIRMED" to Color(0xFF2E7D32)
+            SttJobStatus.CONFIRMED -> "CONFIRMED" to Color(0xFF2E7D32)
+            SttJobStatus.PARSED -> if (log.isSanityFlagged) "REVIEW NEEDED" to Color(0xFFEF6C00) else "PARSED" to Color(0xFF0288D1)
+            SttJobStatus.PARTIALLY_CONFIRMED -> "PARTIALLY CONFIRMED" to Color(0xFFEF6C00)
+            SttJobStatus.RATE_UPDATED -> "RATE UPDATED" to Color(0xFF2E7D32)
+            SttJobStatus.FAILED -> "FAILED" to Color(0xFFC62828)
+            SttJobStatus.TRANSCRIBING -> "PROCESSING" to Color(0xFF1565C0)
+            SttJobStatus.QUEUED -> "QUEUED" to Color(0xFF616161)
+        }
     }
 
     val audioFileExists = remember(log.audioFilePath) {
@@ -186,7 +190,7 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            // Header Row: Timestamp, Hold Duration, Status Badge
+            // Header Row: Timestamp, Hold Duration, Intent Chip, Status Badge
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -205,7 +209,7 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(6.dp))
                     Text(
                         text = "(${log.holdDurationMs} ms hold)",
                         style = MaterialTheme.typography.labelSmall,
@@ -213,17 +217,32 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
                     )
                 }
 
-                Surface(
-                    color = statusColor.copy(alpha = 0.15f),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text(
-                        text = statusLabel,
-                        color = statusColor,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val intentChip = log.captureIntent.hindiLabel
+                    Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(
+                            text = intentChip,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(6.dp))
+                    Surface(
+                        color = statusColor.copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text(
+                            text = statusLabel,
+                            color = statusColor,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
                 }
             }
 
@@ -239,23 +258,34 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
 
             Spacer(Modifier.height(6.dp))
 
-            // Matched Item Summary Row
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "Item: ${log.parsedItemName.ifBlank { "Unrecognized" }}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Medium
-                )
-                Text(
-                    text = "${log.parsedQty} ${log.parsedUnit} • ₹${log.parsedTotal.toInt()}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
+            // Matched Item / Assistant Answer Summary Row
+            if (log.captureIntent == com.voicetoinvoice.app.data.local.entity.CaptureIntent.ASSISTANT) {
+                if (log.assistantAnswer.isNotBlank()) {
+                    Text(
+                        text = "🤖 जवाब: ${log.assistantAnswer}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Item: ${log.parsedItemName.ifBlank { "Unrecognized" }}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Text(
+                        text = "${log.parsedQty} ${log.parsedUnit} • ₹${log.parsedTotal.toInt()}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
             }
 
             if (log.errorMessage.isNotBlank()) {
@@ -372,22 +402,42 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
 
                     Spacer(Modifier.height(10.dp))
 
-                    // Quick Action Buttons (Copy JSON)
+                    // Quick Action Buttons (Copy JSON & Share JSON)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.End
                     ) {
                         OutlinedButton(
                             onClick = {
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                val clip = ClipData.newPlainText("Voice Trace JSON", log.diagnosticTraceJson)
-                                clipboard.setPrimaryClip(clip)
-                                Toast.makeText(context, "Copied JSON trace to clipboard!", Toast.LENGTH_SHORT).show()
+                                if (log.diagnosticTraceJson.isBlank()) {
+                                    Toast.makeText(context, "इस job का trace उपलब्ध नहीं है", Toast.LENGTH_SHORT).show()
+                                    return@OutlinedButton
+                                }
+                                try {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    val clip = ClipData.newPlainText("Voice Trace JSON", log.diagnosticTraceJson)
+                                    clipboard.setPrimaryClip(clip)
+                                    Toast.makeText(context, "Copied ${log.diagnosticTraceJson.length} chars to clipboard", Toast.LENGTH_SHORT).show()
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Clipboard failed (${e.javaClass.simpleName}) — use Share JSON", Toast.LENGTH_LONG).show()
+                                }
                             }
                         ) {
                             Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
                             Text("Copy JSON", style = MaterialTheme.typography.labelMedium)
+                        }
+
+                        Spacer(Modifier.width(8.dp))
+
+                        OutlinedButton(
+                            onClick = {
+                                shareTraceJson(context, log.id, log.diagnosticTraceJson)
+                            }
+                        ) {
+                            Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Share JSON", style = MaterialTheme.typography.labelMedium)
                         }
                     }
                 }
@@ -533,5 +583,26 @@ private fun exportAllLogsToFile(context: Context, logs: List<SttJobRecord>) {
     } catch (e: Exception) {
         e.printStackTrace()
         Toast.makeText(context, "Failed to export diagnostic bundle: ${e.message}", Toast.LENGTH_LONG).show()
+    }
+}
+
+private fun shareTraceJson(context: Context, jobId: String, json: String) {
+    try {
+        if (json.isBlank()) {
+            Toast.makeText(context, "इस job का trace उपलब्ध नहीं है", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val dir = File(context.cacheDir, "traces").apply { mkdirs() }
+        val file = File(dir, "trace_${jobId}.json")
+        file.writeText(json)
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "application/json"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(intent, "Share Voice Trace JSON"))
+    } catch (e: Exception) {
+        Toast.makeText(context, "Failed to share trace: ${e.message}", Toast.LENGTH_SHORT).show()
     }
 }
