@@ -17,7 +17,11 @@ supabase/.temp
 local.properties
 node_modules/
 .tmp.driveupload/
-.claude/
+# Local Claude settings/permissions stay untracked, but the shared slash commands
+# (/ship) are part of the repo. Must be `.claude/*` not `.claude/` -- git cannot
+# re-include a child of an excluded directory.
+.claude/*
+!.claude/commands/
 Web app/*/node_modules/
 Web app/_extracted/
 
