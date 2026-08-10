@@ -505,6 +505,19 @@ export interface RawItemSegment {
   numeralRejoinLowMargin?: boolean
 }
 
+export interface NumeralRejoin {
+  leftToken: string
+  rightToken: string
+  mergedSurface: string
+  value: number
+  matchNorm: number
+  valueMargin: number
+  /** True when a different numeric value sat within MERGE_MIN_VALUE_MARGIN of the winner
+   *  ("तेईस"=23 and "तीस"=30 collapse to the same phonetic key). The merge still applies --
+   *  a plausible number beats stranded debris -- but the quantity must NOT auto-confirm. */
+  lowMargin: boolean
+}
+
 export interface SegmentResult {
   segments: RawItemSegment[]
   carryoverQty?: number | null
@@ -826,18 +839,7 @@ function splitExpansions(
   return out
 }
 
-export interface NumeralRejoin {
-  leftToken: string
-  rightToken: string
-  mergedSurface: string
-  value: number
-  matchNorm: number
-  valueMargin: number
-  /** True when a different numeric value sat within MERGE_MIN_VALUE_MARGIN of the winner
-   *  ("तेईस"=23 and "तीस"=30 collapse to the same phonetic key). The merge still applies --
-   *  a plausible number beats stranded debris -- but the quantity must NOT auto-confirm. */
-  lowMargin: boolean
-}
+
 
 export function rejoinFragmentedNumerals(
   tokens: string[],
@@ -1043,7 +1045,7 @@ export function segmentTranscript(
   catalogNames: string[] = [],
   pendingCarryoverQty: number | null = null,
   aliases: Map<string, string> = new Map()
-): { segments: RawItemSegment[]; carryoverQty: number | null } {
+): SegmentResult {
   const cleanText = (transcript || '')
     .replace(/।/g, ' ')
     .replace(/[.,?!\-\\()]/g, ' ')

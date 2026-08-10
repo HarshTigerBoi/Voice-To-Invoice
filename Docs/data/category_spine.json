@@ -1,0 +1,13 @@
+{
+  "vertical": "kirana",
+  "categories": [
+    "atta_flour", "rice", "dal_pulses", "sugar_jaggery", "salt", "cooking_oil", "ghee_butter",
+    "milk", "curd_paneer", "spices_whole", "spices_powder", "tea_coffee", "biscuits_cookies",
+    "namkeen_snacks", "noodles_pasta", "bread_bakery", "chocolate_candy", "cold_drinks_juice",
+    "water_bottled", "detergent_soap", "dishwash", "toiletries_soap", "shampoo_haircare",
+    "toothpaste_oral", "sanitary_baby", "matches_candles", "mosquito_repellent", "pickle_papad",
+    "honey_jam_spreads", "dry_fruits_nuts", "besan_sooji", "vermicelli_sevaiya", "ketchup_sauces",
+    "instant_food", "ice_cream_frozen", "eggs", "vegetables_fresh", "fruits_fresh",
+    "stationery_basic", "batteries_bulbs", "agarbatti_pooja", "paan_tobacco", "cattle_feed"
+  ]
+}
