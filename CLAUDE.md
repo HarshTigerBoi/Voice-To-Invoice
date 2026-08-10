@@ -44,6 +44,15 @@ Instrumented tests (require a connected device/emulator):
 
 There is no lint/detekt/ktlint config in this repo — just AGP's default `./gradlew lint` if needed.
 
+## Building from the cloud / installing without the laptop
+
+`.github/workflows/build-apk.yml` builds `assembleDebug` on GitHub's hosted runners and attaches
+the APK to a GitHub Release (tag `apk-<run_number>`) — triggered by every push to `master`, or
+on-demand via `gh workflow run build-apk.yml` / the Actions tab (manual dispatch only works once
+the workflow file exists on the default branch). Open the release on the phone and tap the APK to
+install — no adb, no USB, no wireless pairing. Debug builds use the debug keystore already in the
+build config, so no signing secret is needed in CI.
+
 ### Supabase Edge Functions
 
 Functions live in `supabase/functions/*/index.ts` (Deno). Deploy with the Supabase CLI:
