@@ -10,6 +10,13 @@ genuine ambiguity where proceeding either way would produce wrong work.
 
 Work through these stages in order.
 
+## 0. Which machine is this session running on?
+
+Everything below assumes the laptop: PowerShell, `tools/vti-implement.ps1`, `agy.exe`, wireless
+adb to the physical phone. None of that exists in a cloud session (opened from claude.ai/code or
+the mobile app, no access to the local Windows filesystem or a phone over adb). If this is a
+cloud session, use the cloud path instead — see steps 3 and 4 below for both.
+
 ## 1. Diagnose against the live system first
 
 Per CLAUDE.md's diagnosis discipline, the FIRST action is live data, not source reading. Query
@@ -34,7 +41,9 @@ paths, function names, constant values, migration numbers, step order. State exp
 mirrored logic changes on one side or both (`domain/parser/` ↔
 `supabase/functions/process-voice-job/index.ts`).
 
-## 3. Implement it — hand off to the Antigravity CLI
+## 3. Implement it
+
+**On the laptop** — hand off to the Antigravity CLI:
 
 ```
 .\tools\vti-implement.ps1 Docs\<feature>_plan.md
@@ -59,7 +68,13 @@ turned out to be wrong, fix it and update the plan file so it stays an accurate 
 (The `antigravity-ide chat` subcommand is a different, broken thing — it discards prompts
 silently. Never use it. See `tools/vti-handoff.ps1`.)
 
+**In a cloud session** — there's no Antigravity to hand off to. Implement the plan yourself
+directly, per CLAUDE.md's cloud-session exception. Same standard as above: match the plan's file
+paths, names, and constants; if you deviate, say so and update the plan file.
+
 ## 4. Ship it
+
+**On the laptop:**
 
 ```
 .\tools\vti-ship.ps1
@@ -71,6 +86,19 @@ hotspot subnet changes, and `tcpip` mode resetting after a phone reboot.
 
 If it reports no device over wireless or USB, the phone has rebooted and needs the cable once —
 say so plainly and stop there rather than reporting success.
+
+**In a cloud session** — there's no adb path to the phone, so commit and push instead:
+
+```
+git add -A && git commit -m "..." && git push
+```
+
+pushing to any branch triggers `.github/workflows/build-apk.yml`, which builds the debug APK and
+attaches it to a GitHub Release (tag `apk-<run_number>`). Watch it with
+`gh run watch --exit-status` (poll `gh run list --workflow=build-apk.yml` for the run ID if it
+didn't just print one), then confirm the release actually has the APK asset — `gh release view
+apk-<n> --json assets` — before calling it done. Tell the user the release URL; they install it
+by opening that link on the phone and tapping the APK.
 
 ## 5. Verify by effect, not by build
 
