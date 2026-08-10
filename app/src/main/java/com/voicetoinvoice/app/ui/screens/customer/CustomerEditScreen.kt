@@ -18,8 +18,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalContext
+import com.voicetoinvoice.app.data.local.AppDatabase
 import com.voicetoinvoice.app.data.local.entity.CustomerRecord
 import com.voicetoinvoice.app.domain.parser.PhoneticKey
+import com.voicetoinvoice.app.ui.components.PhotoCaptureButton
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -27,13 +33,18 @@ fun CustomerEditScreen(
     customerToEdit: CustomerRecord? = null,
     existingCustomers: List<CustomerRecord> = emptyList(),
     nextFreeCode: Int = 1,
-    onSave: (name: String, keyword: String?, phone: String?) -> Unit,
+    onSave: (name: String, keyword: String?, phone: String?, photoPath: String?) -> Unit,
     onBackClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val db = remember { AppDatabase.getInstance(context) }
+    val scope = rememberCoroutineScope()
+
     var name by remember { mutableStateOf(customerToEdit?.name ?: "") }
     var keyword by remember { mutableStateOf(customerToEdit?.keyword ?: "") }
     var phone by remember { mutableStateOf(customerToEdit?.phone ?: "") }
+    var photoPath by remember { mutableStateOf(customerToEdit?.photoPath) }
 
     val code = customerToEdit?.code ?: nextFreeCode
 
@@ -96,6 +107,24 @@ fun CustomerEditScreen(
                     )
                 }
             }
+
+            // Customer photo capture button (Opt-in)
+            PhotoCaptureButton(
+                currentPath = photoPath,
+                filePrefix = "customer",
+                onCaptured = { path ->
+                    photoPath = path
+                    if (customerToEdit != null) {
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                db.customerDao().update(customerToEdit.copy(photoPath = path, synced = false))
+                            }
+                        }
+                    }
+                },
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+                size = 80.dp
+            )
 
             // Duplicate warning if similar customer exists (Principle: make duplicate visible on creation)
             if (similarExisting.isNotEmpty()) {
@@ -160,7 +189,7 @@ fun CustomerEditScreen(
             Button(
                 onClick = {
                     if (name.isNotBlank()) {
-                        onSave(name.trim(), keyword.trim().ifBlank { null }, phone.trim().ifBlank { null })
+                        onSave(name.trim(), keyword.trim().ifBlank { null }, phone.trim().ifBlank { null }, photoPath)
                     }
                 },
                 enabled = name.isNotBlank(),

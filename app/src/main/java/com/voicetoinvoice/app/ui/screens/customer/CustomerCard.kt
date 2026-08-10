@@ -19,6 +19,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.voicetoinvoice.app.data.local.entity.CustomerRecord
 
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.runtime.remember
+import coil.compose.AsyncImage
+import java.io.File
+
 @Composable
 fun CustomerCard(
     customer: CustomerRecord,
@@ -40,6 +45,10 @@ fun CustomerCard(
                 .padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            val photoFile = remember(customer.photoPath) {
+                customer.photoPath?.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.exists() }
+            }
+
             // Photo or Initial Avatar Circle
             Box(
                 modifier = Modifier
@@ -48,12 +57,23 @@ fun CustomerCard(
                     .background(MaterialTheme.colorScheme.primaryContainer),
                 contentAlignment = Alignment.Center
             ) {
-                Text(
-                    text = customer.name.take(1).uppercase(),
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
+                if (photoFile != null) {
+                    AsyncImage(
+                        model = photoFile,
+                        contentDescription = customer.name,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                    )
+                } else {
+                    Text(
+                        text = customer.name.take(1).uppercase(),
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.width(16.dp))

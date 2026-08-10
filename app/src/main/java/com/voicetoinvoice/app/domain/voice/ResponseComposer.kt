@@ -34,6 +34,12 @@ object ResponseComposer {
         return "आज कुल $txnCount बिक्री हुई है, कुल ₹$amountInt का व्यापार हुआ"
     }
 
+    fun formatItemSales(itemName: String, qty: Double, revenue: Double): String {
+        if (qty <= 0.0) return "आज $itemName नहीं बिका"
+        val qtyString = if (qty % 1.0 == 0.0) qty.toInt().toString() else qty.toString()
+        return "आज $itemName $qtyString बिका, ₹${revenue.toInt()} का"
+    }
+
     fun formatUnrecognized(): String {
         return "समझ नहीं आया, कृपया फिर से बोलिए"
     }

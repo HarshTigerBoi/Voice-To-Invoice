@@ -14,6 +14,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.graphics.Color
+import com.voicetoinvoice.app.ui.theme.LedgerColors
 import com.voicetoinvoice.app.audio.AudioRecorder
 import com.voicetoinvoice.app.audio.OnDeviceSpeechRecognizer
 import com.voicetoinvoice.app.audio.PttBurstCoalescer
@@ -140,7 +141,7 @@ fun StockInScreen(
                     intent = CaptureIntent.WASTE,
                     label = "खराब",
                     size = 100.dp,
-                    containerColor = Color(0xFFC62828),
+                    containerColor = LedgerColors.MoneyOut,
                     db = db,
                     rollingAudioBuffer = rollingAudioBuffer,
                     audioRecorder = audioRecorder,

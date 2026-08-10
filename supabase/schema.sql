@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS public.catalog_items (
     unit_id TEXT NOT NULL REFERENCES public.item_units(id),
     price DOUBLE PRECISION NOT NULL,
     active BOOLEAN DEFAULT true,
+    image_url TEXT DEFAULT NULL,
+    canonical_key TEXT DEFAULT NULL,
+    base_unit TEXT DEFAULT NULL,
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -478,11 +481,14 @@ CREATE OR REPLACE FUNCTION record_unmatched_item_observation(
     p_item_name TEXT,
     p_unit_id TEXT,
     p_job_id TEXT,
-    p_threshold INT DEFAULT 3
+    p_threshold INT DEFAULT 3,
+    p_canonical_key TEXT DEFAULT NULL,
+    p_base_unit TEXT DEFAULT NULL
 ) RETURNS TABLE(is_in_catalog BOOLEAN, catalog_item_id UUID, newly_promoted BOOLEAN) AS $$
 DECLARE
     existing RECORD;
     v_unit_id TEXT;
+    v_base_unit TEXT;
     v_new_obs INT;
     v_job_ids TEXT[];
     v_new_item_id UUID;
@@ -493,6 +499,12 @@ BEGIN
     v_unit_id := COALESCE(
         (SELECT id FROM public.item_units WHERE id = p_unit_id),
         'PACKET'
+    );
+
+    v_base_unit := COALESCE(
+        p_base_unit,
+        (SELECT base_unit FROM public.item_units WHERE id = v_unit_id),
+        v_unit_id
     );
 
     PERFORM pg_advisory_xact_lock(hashtext(p_shop_id::TEXT || '|' || p_phonetic_key));
@@ -538,19 +550,37 @@ BEGIN
     v_job_ids := array_append(existing.contributing_job_ids, p_job_id);
 
     IF v_new_obs >= p_threshold THEN
-        -- Adopt an existing catalog row if the shop already stocks this item under a
-        -- near-identical spelling, rather than creating a near-duplicate beside it.
-        SELECT id INTO v_new_item_id
-            FROM public.catalog_items
-            WHERE shop_id = p_shop_id
-              AND active = true
-              AND normalized_name_distance(name, p_item_name) <= catalog_learning_name_agreement_max()
-            ORDER BY normalized_name_distance(name, p_item_name) ASC
-            LIMIT 1;
+        -- Adopt an existing row for the SAME ITEM before creating a near-duplicate. The
+        -- canonical key comes from the lexicon (lexicon.ts / ItemLexicon.kt) because PL/pgSQL
+        -- cannot compute it: the literal distance guard below is blind across scripts
+        -- (normalized_name_distance('अदरक','Adrak') ~ 1.0), which is what let one item become
+        -- two rows. ISSUE-107 / ISSUE-109.
+        IF p_canonical_key IS NOT NULL AND p_canonical_key <> '' THEN
+            SELECT id INTO v_new_item_id
+                FROM public.catalog_items
+                WHERE shop_id = p_shop_id
+                  AND active = true
+                  AND canonical_key = p_canonical_key
+                  AND (p_base_unit IS NULL OR base_unit = p_base_unit)
+                ORDER BY price DESC
+                LIMIT 1;
+        END IF;
 
         IF v_new_item_id IS NULL THEN
-            INSERT INTO public.catalog_items (shop_id, name, unit_id, price, active)
-            VALUES (p_shop_id, p_item_name, v_unit_id, 0, true)
+            -- existing literal-distance guard, unchanged
+            SELECT id INTO v_new_item_id
+                FROM public.catalog_items
+                WHERE shop_id = p_shop_id
+                  AND active = true
+                  AND normalized_name_distance(name, p_item_name) <= catalog_learning_name_agreement_max()
+                ORDER BY normalized_name_distance(name, p_item_name) ASC
+                LIMIT 1;
+        END IF;
+
+        IF v_new_item_id IS NULL THEN
+            INSERT INTO public.catalog_items (shop_id, name, unit_id, price, active, canonical_key, base_unit)
+            VALUES (p_shop_id, p_item_name, v_unit_id, 0, true,
+                    NULLIF(p_canonical_key, ''), v_base_unit)
             RETURNING id INTO v_new_item_id;
         END IF;
 

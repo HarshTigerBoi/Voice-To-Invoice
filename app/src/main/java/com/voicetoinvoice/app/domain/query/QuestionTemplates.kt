@@ -170,7 +170,23 @@ class QuestionTemplates(private val ledgerQueries: LedgerQueries) {
             return "आज का मुनाफ़ा ₹${profit.grossProfit.toInt()}$coverageNote"
         }
 
-        // 3. Today's total sales
+        // 3. Item-scoped sales: "आज कितने आलू बिके".
+        //    MUST precede the REVENUE branch: REVENUE_WORDS contains "बिका", which phone-matches
+        //    "बिके", so this question was previously swallowed and answered with whole-shop revenue
+        //    (job 472d4af1, 2026-08-04) -- a confidently wrong number. ISSUE-118.
+        //    Only fires when a NAMED item actually resolves; otherwise falls through untouched, so
+        //    a plain "आज कितना बिका" still reaches the revenue branch below.
+        if (matches(ngrams, REVENUE_WORDS) || matches(ngrams, GENERIC_QUESTION_WORDS)) {
+            val candidate = extractCandidateName(clean)
+            if (candidate.isNotBlank()) {
+                val hit = ledgerQueries.getItemSalesInPeriod(candidate, todayMidnight, nowMs)
+                if (hit != null) {
+                    return ResponseComposer.formatItemSales(hit.first, hit.second, hit.third)
+                }
+            }
+        }
+
+        // 4. Today's total sales
         if (matches(ngrams, REVENUE_WORDS)) {
             val (total, count) = if (LedgerSnapshot.isFresh()) {
                 LedgerSnapshot.todayTotal to LedgerSnapshot.todayCount
@@ -180,14 +196,14 @@ class QuestionTemplates(private val ledgerQueries: LedgerQueries) {
             return ResponseComposer.formatDailySales(total, count)
         }
 
-        // 4. Total receivables (checked before per-customer Udhaar so "कुल उधार कितना है"
+        // 5. Total receivables (checked before per-customer Udhaar so "कुल उधार कितना है"
         //    doesn't get misread as a customer-name lookup for "कुल").
         if (matches(ngrams, RECEIVABLES_TOTAL_WORDS)) {
             val total = ledgerQueries.getTotalReceivables()
             return if (total > 0.0) "कुल ₹${total.toInt()} का उधार बाकी है" else "कोई उधार बाकी नहीं है"
         }
 
-        // 5. Per-customer balance inquiry
+        // 6. Per-customer balance inquiry
         if (matches(ngrams, UDHAAR_WORDS)) {
             val candidate = extractCandidateName(clean)
             if (candidate.isNotBlank()) {
@@ -201,13 +217,13 @@ class QuestionTemplates(private val ledgerQueries: LedgerQueries) {
             }
         }
 
-        // 6. Waste this period
+        // 7. Waste this period
         if (matches(ngrams, WASTE_WORDS)) {
             val waste = ledgerQueries.getWasteValue(todayMidnight, nowMs)
             return if (waste > 0.0) "आज ₹${waste.toInt()} का माल खराब हुआ" else "आज कोई माल खराब नहीं हुआ"
         }
 
-        // 7. Stock inquiry
+        // 8. Stock inquiry
         if (matches(ngrams, STOCK_WORDS)) {
             val candidate = extractCandidateName(clean)
             if (candidate.isNotBlank()) {
@@ -221,7 +237,7 @@ class QuestionTemplates(private val ledgerQueries: LedgerQueries) {
             }
         }
 
-        // 8. A clearly interrogative utterance that named no specific topic/entity is, in
+        // 9. A clearly interrogative utterance that named no specific topic/entity is, in
         //    practice, almost always "how's business today" -- answer that instead of a flat
         //    "I didn't understand".
         if (matches(ngrams, GENERIC_QUESTION_WORDS)) {

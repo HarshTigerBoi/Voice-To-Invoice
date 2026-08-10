@@ -1,6 +1,8 @@
 package com.voicetoinvoice.app.domain.matcher
 
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
+import com.voicetoinvoice.app.domain.lexicon.ItemLexicon
+import com.voicetoinvoice.app.domain.parser.OrderingSegmenter
 
 data class MatchResult(
     val item: CatalogItem,
@@ -28,56 +30,40 @@ class FuzzyCatalogMatcher {
 
         fun isBlacklistedItemName(name: String): Boolean {
             val lower = name.lowercase().trim()
+            if (lower.isEmpty()) return true
             return BLACKLISTED_ITEM_NAMES.contains(lower) ||
                     lower.startsWith("kilometer") || lower.startsWith("किलोमीटर") ||
-                    lower == "kilo" || lower == "kg" || lower == "item"
+                    lower == "kilo" || lower == "kg" || lower == "item" ||
+                    isQuantityPhrase(lower)
+        }
+
+        /**
+         * True when the "item name" is really a leftover quantity — a bare number word, or a
+         * phrase that opens with one ("अठारह के लोग", "सत्रह की").
+         *
+         * The unit words above were denylisted one at a time as each STT misfire surfaced, and
+         * number words were never covered: the live catalog had accumulated "पंद्रह" (15),
+         * "सत्रह की" (17), "सत्ताईस" (27) and "अठारह के लोग" (18) as ₹0 items, each shown to the
+         * shopkeeper as a real product in the quick-stepper. `AppDatabase.onOpen` purges a
+         * hardcoded handful of these ('सत्तर', 'पचास') after the fact, which only ever removes
+         * the specific misfires someone already reported.
+         *
+         * Reuses [OrderingSegmenter.HINDI_NUMBER_MAP] rather than restating the numerals, so a
+         * numeral the parser learns to recognise is automatically one the catalog will refuse.
+         * Digit-only names are rejected the same way. A real product name that merely *contains*
+         * a number ("Amul Gold 500") is untouched — only the leading token is tested.
+         */
+        fun isQuantityPhrase(lowerName: String): Boolean {
+            val firstToken = lowerName.split(Regex("\\s+")).firstOrNull()?.trim() ?: return false
+            if (firstToken.isEmpty()) return false
+            if (firstToken.all { it.isDigit() || it == '.' }) return true
+            if (OrderingSegmenter.HINDI_NUMBER_MAP.containsKey(firstToken)) return true
+            return OrderingSegmenter.DISCOURSE_PARTICLES.contains(firstToken)
         }
     }
 
-    // Comprehensive Indic Produce & FMCG Brand Alias Dictionary
-    private val indicAliasMap: Map<String, String> = mapOf(
-        // Vegetables & Produce
-        "प्याज" to "Pyaz", "प्याज़" to "Pyaz", "pyaz" to "Pyaz", "pyaaz" to "Pyaz", "onion" to "Pyaz", "onions" to "Pyaz",
-        "टमाटर" to "Tamatar", "tmatar" to "Tamatar", "tamatar" to "Tamatar", "tomato" to "Tamatar", "tomatoes" to "Tamatar",
-        "आलू" to "Aaloo", "अलू" to "Aaloo", "alu" to "Aaloo", "aaloo" to "Aaloo", "aalu" to "Aaloo", "potato" to "Aaloo", "potatoes" to "Aaloo",
-        "अदरक" to "Adrak", "adrak" to "Adrak", "ginger" to "Adrak",
-        "भिंडी" to "Bhindi", "bhindi" to "Bhindi", "bindi" to "Bhindi", "okra" to "Bhindi", "ladyfinger" to "Bhindi",
-        "धनिया" to "Dhaniya", "dhaniya" to "Dhaniya", "coriander" to "Dhaniya",
-        "मिर्च" to "Mirch", "हरी मिर्च" to "Mirch", "mirch" to "Mirch", "chilli" to "Mirch", "chili" to "Mirch",
-        "गोभी" to "Gobhi", "gobhi" to "Gobhi", "cauliflower" to "Gobhi", "cabbage" to "Gobhi",
-        "बैंगन" to "Baingan", "baingan" to "Baingan", "brinjal" to "Baingan", "eggplant" to "Baingan",
-        "गाजर" to "Gajar", "gajar" to "Gajar", "carrot" to "Gajar",
-        "मटर" to "Matar", "matar" to "Matar", "peas" to "Matar",
-        "खीरा" to "Kheera", "kheera" to "Kheera", "cucumber" to "Kheera",
-        "पालक" to "Palak", "palak" to "Palak", "spinach" to "Palak",
-        "लहसुन" to "Lahsun", "lahsun" to "Lahsun", "garlic" to "Lahsun",
-        "ब्रोकली" to "Broccoli", "broccoli" to "Broccoli",
-        "ड्रैगन फ्रूट" to "Dragon Fruit", "dragon fruit" to "Dragon Fruit", "dragonfruit" to "Dragon Fruit",
-
-        // Dairy & Bakery
-        "अमूल गोल्ड" to "Amul Gold Milk", "गोल्ड दूध" to "Amul Gold Milk", "गोल्ड" to "Amul Gold Milk", "gold milk" to "Amul Gold Milk", "amul gold" to "Amul Gold Milk", "gold" to "Amul Gold Milk",
-        "अमूल ताज़ा" to "Amul Taaza Milk", "ताज़ा" to "Amul Taaza Milk", "taaza milk" to "Amul Taaza Milk", "amul taaza" to "Amul Taaza Milk", "taaza" to "Amul Taaza Milk",
-        "सरस" to "Saras Milk", "सरस दूध" to "Saras Milk", "saras milk" to "Saras Milk", "saras" to "Saras Milk",
-        "दही" to "Curd (Dahi)", "curd" to "Curd (Dahi)", "dahi" to "Curd (Dahi)",
-        "छाछ" to "Chaas (Buttermilk)", "मट्ठा" to "Chaas (Buttermilk)", "chaas" to "Chaas (Buttermilk)", "buttermilk" to "Chaas (Buttermilk)",
-        "पनीर" to "Paneer", "paneer" to "Paneer",
-        "घी" to "Desi Ghee", "ghee" to "Desi Ghee", "desi ghee" to "Desi Ghee", "gi" to "Desi Ghee",
-        "मक्खन" to "Butter", "बटर" to "Butter", "butter" to "Butter", "amul butter" to "Butter",
-        "अंडे" to "Eggs", "अंडा" to "Eggs", "anda" to "Eggs", "egg" to "Eggs", "eggs" to "Eggs",
-
-        // Biscuits & FMCG
-        "गुड डे" to "Good Day Biscuit", "good day" to "Good Day Biscuit", "good day biscuit" to "Good Day Biscuit",
-        "गुड नाइट" to "Good Knight Mosquito Coil", "गुड नाइट कॉइल" to "Good Knight Mosquito Coil", "good knight" to "Good Knight Mosquito Coil", "good knight coil" to "Good Knight Mosquito Coil",
-        "इप्पी" to "Yippee Noodles", "इप्पी नूडल्स" to "Yippee Noodles", "yippee" to "Yippee Noodles", "yippee noodles" to "Yippee Noodles",
-        "मैगी" to "Maggi", "मैगी नूडल्स" to "Maggi", "maggi" to "Maggi",
-        "सर्फ" to "Surf Excel", "सर्फ एक्सेल" to "Surf Excel", "surf" to "Surf Excel", "surf excel" to "Surf Excel",
-        "फॉर्च्यून" to "Fortune Refined Oil", "फॉर्च्यून तेल" to "Fortune Refined Oil", "fortune oil" to "Fortune Refined Oil",
-        "आशीर्वाद" to "Atta (Aashirvaad)", "आशीर्वाद आटा" to "Atta (Aashirvaad)", "aashirvaad" to "Atta (Aashirvaad)", "aashirvaad atta" to "Atta (Aashirvaad)",
-        "बर्बन" to "Bourbon Biscuit", "bourbon" to "Bourbon Biscuit",
-        "पारले जी" to "Parle-G Biscuit", "parle-g" to "Parle-G Biscuit", "parleg" to "Parle-G Biscuit",
-        "पॉन्ड्स" to "Ponds Cream", "पॉन्ड्स क्रीम" to "Ponds Cream", "ponds" to "Ponds Cream", "ponds cream" to "Ponds Cream",
-        "चीनी" to "Sugar (Madhur)", "शक्कर" to "Sugar (Madhur)", "sugar" to "Sugar (Madhur)", "madhur sugar" to "Sugar (Madhur)"
-    )
+    // Comprehensive Indic Produce & FMCG Brand Alias Dictionary derived from ItemLexicon
+    private val indicAliasMap: Map<String, String> get() = ItemLexicon.surfaceMapForMatcher()
 
     fun findBestMatch(transcript: String, catalog: List<CatalogItem>): MatchResult? {
         val validCatalog = catalog.filter { !isBlacklistedItemName(it.name) }

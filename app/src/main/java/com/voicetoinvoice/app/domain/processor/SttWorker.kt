@@ -1,8 +1,12 @@
 package com.voicetoinvoice.app.domain.processor
 
 import android.content.Context
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
+import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import com.voicetoinvoice.app.data.local.AppDatabase
 import com.voicetoinvoice.app.data.local.entity.CaptureIntent
@@ -17,6 +21,7 @@ import com.voicetoinvoice.app.network.CloudSyncManager
 import com.voicetoinvoice.app.network.SupabaseConfig
 import com.voicetoinvoice.app.util.LocalStorageCleaner
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -50,11 +55,36 @@ class SttWorker(
      */
     private val shopId: String = com.voicetoinvoice.app.data.ShopContext.initialize(context)
 
+    /** Promotes this worker to a real foreground-service-backed job so the OS/MIUI's
+     *  background-execution killer (confirmed directly via GreezeManager in
+     *  scratch/logcat_repro.txt cancelling a job ~10s in) can't cut it off mid-network-call
+     *  the way it did before -- see Docs/sttworker_execution_window_cancellation_fix_plan.md
+     *  Step 2. Reuses AppForegroundService's existing notification channel. */
+    override suspend fun getForegroundInfo(): ForegroundInfo {
+        val channelId = com.voicetoinvoice.app.service.AppForegroundService.CHANNEL_ID
+        val notification = NotificationCompat.Builder(applicationContext, channelId)
+            .setContentTitle("आवाज़ प्रोसेस हो रही है...")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(2001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            ForegroundInfo(2001, notification)
+        }
+    }
+
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val jobId = inputData.getString(KEY_JOB_ID) ?: return@withContext Result.failure()
         val audioPath = inputData.getString(KEY_AUDIO_PATH) ?: return@withContext Result.failure()
 
         Log.i(TAG, "Starting Expedited SttWorker for job $jobId ($audioPath)")
+
+        try {
+            setForeground(getForegroundInfo())
+        } catch (e: Exception) {
+            Log.w(TAG, "setForeground failed for job $jobId, continuing without FGS promotion: ${e.message}")
+        }
 
         val jobRecord = db.sttJobDao().getJobById(jobId)
             ?: return@withContext Result.failure()
@@ -108,24 +138,25 @@ class SttWorker(
             }
         }
 
+        var preResponseResult: PolledResult? = null
+
         try {
             db.sttJobDao().updateJob(jobRecord.copy(status = SttJobStatus.TRANSCRIBING))
 
-            val boundedJob = kotlinx.coroutines.withTimeoutOrNull(1800L) {
-                var current = db.sttJobDao().getJobById(jobId)
-                val start = System.currentTimeMillis()
-                while (current != null && current.onDeviceStatus.isBlank() && System.currentTimeMillis() - start < 1800L) {
-                    kotlinx.coroutines.delay(100L)
-                    current = db.sttJobDao().getJobById(jobId)
-                }
-                current
-            } ?: jobRecord
+            // No on-device STT is run for any intent in the current never-stop-buffer
+            // architecture.  The original 1800ms wait for onDeviceStatus was vestigial
+            // from the old on-device STT flow and always timed out, adding 1.8s of
+            // silent latency to every ASSISTANT job.  Use jobRecord directly.
+            val boundedJob = jobRecord
+
+            val rawShopId = com.voicetoinvoice.app.data.ShopContext.requireShopId()
+            clientTrace.put("shop_id_raw_len", rawShopId.length)
 
             val uploadStartMs = System.currentTimeMillis()
             val responseString = uploadAudioToEdgeFunction(
                 audioFile = audioFile,
                 jobId = jobId,
-                shopId = SupabaseConfig.getNullSafeShopId(com.voicetoinvoice.app.data.ShopContext.requireShopId()),
+                shopId = SupabaseConfig.getNullSafeShopId(rawShopId),
                 metadataJson = metadataJson,
                 catalogNames = catalogNames,
                 onDeviceTranscript = boundedJob.onDeviceTranscript,
@@ -166,6 +197,13 @@ class SttWorker(
                         }
                     } catch (_: Exception) {}
                 }
+
+                preResponseResult = PolledResult(
+                    status = statusStr,
+                    rawTranscript = rawTranscript,
+                    traceJson = traceJson,
+                    parsedItems = parsedItems
+                )
 
                 // Commands COMMIT in the order they were spoken, even though this job's own
                 // network round-trip may have finished before or after a sibling recording's --
@@ -254,16 +292,79 @@ class SttWorker(
             clientTrace.put("exception_class", e.javaClass.simpleName)
             clientTrace.put("exception_message", e.message ?: "")
             try {
-                db.sttJobDao().updateJob(
-                    jobRecord.copy(
-                        status = SttJobStatus.TRANSCRIBING,
-                        diagnosticTraceJson = mergeClientTrace(clientTrace, null)
-                    )
-                )
+                withContext(NonCancellable + Dispatchers.IO) {
+                    // If we successfully read the server's response before local cancellation/exception struck,
+                    // recover from the pre-parsed result instantly without a blocking network call.
+                    val serverResult = preResponseResult?.takeIf { it.status != "QUEUED" }
+                    if (serverResult != null) {
+                        clientTrace.put("outcome", "recovered_from_server_after_cancellation")
+                        val audioCloudUrl = "${SupabaseConfig.SUPABASE_URL}/storage/v1/object/public/voice-recordings/$jobId.wav"
+                        // ASSISTANT jobs route through handleAssistantJob()'s own intent
+                        // classification (IntentRouter) to pick the effective commit intent
+                        // and to speak a reply -- neither is safe to reconstruct generically
+                        // here, so an ASSISTANT recovery is persisted as reviewable rather than
+                        // auto-committed. Every other intent commits exactly like the normal
+                        // (non-cancelled) path a few lines above in this same function.
+                        val committedCount = if (jobRecord.captureIntent == CaptureIntent.ASSISTANT) {
+                            0
+                        } else {
+                            com.voicetoinvoice.app.domain.processor.CommitSequencer.runInOrder(
+                                db, jobRecord.recordedAtMs, clientTrace
+                            ) {
+                                commitParsedLines(
+                                    jobRecord = jobRecord,
+                                    effectiveIntent = jobRecord.captureIntent,
+                                    parsedItems = serverResult.parsedItems,
+                                    catalog = catalog,
+                                    rawTranscript = serverResult.rawTranscript,
+                                    audioPath = audioPath,
+                                    audioCloudUrl = audioCloudUrl,
+                                    jobId = jobId
+                                )
+                            }
+                        }
+                        val firstItem = if (serverResult.parsedItems.length() > 0) serverResult.parsedItems.getJSONObject(0) else null
+                        val updatedStatus = when {
+                            jobRecord.captureIntent == CaptureIntent.ASSISTANT -> SttJobStatus.PARSED
+                            serverResult.status == "AUTO_CONFIRMED" -> SttJobStatus.AUTO_CONFIRMED
+                            serverResult.status == "PARTIALLY_CONFIRMED" -> SttJobStatus.PARTIALLY_CONFIRMED
+                            serverResult.status == "RATE_UPDATED" -> SttJobStatus.RATE_UPDATED
+                            else -> SttJobStatus.PARSED
+                        }
+                        clientTrace.put("recovered_committed_count", committedCount)
+                        db.sttJobDao().updateJob(
+                            jobRecord.copy(
+                                status = updatedStatus,
+                                rawTranscript = serverResult.rawTranscript,
+                                parsedItemName = firstItem?.optString("item_name") ?: "Unrecognized Item",
+                                parsedQty = firstItem?.optDouble("quantity") ?: 1.0,
+                                parsedUnit = firstItem?.optString("unit") ?: "PACKET",
+                                parsedTotal = firstItem?.optDouble("total") ?: 0.0,
+                                isSanityFlagged = updatedStatus != SttJobStatus.AUTO_CONFIRMED && updatedStatus != SttJobStatus.RATE_UPDATED,
+                                diagnosticTraceJson = mergeClientTrace(clientTrace, serverResult.traceJson),
+                                parsedItemsJson = serverResult.parsedItems.toString(),
+                                lineCount = serverResult.parsedItems.length(),
+                                synced = true
+                            )
+                        )
+                    } else {
+                        db.sttJobDao().updateJob(
+                            jobRecord.copy(
+                                status = SttJobStatus.FAILED,
+                                errorMessage = e.message ?: "Worker execution failed",
+                                isSanityFlagged = true,
+                                diagnosticTraceJson = mergeClientTrace(clientTrace, null)
+                            )
+                        )
+                    }
+                }
             } catch (persistErr: Exception) {
                 Log.e(TAG, "Failed to persist client trace after exception", persistErr)
             }
-            return@withContext Result.retry()
+            if (e is kotlinx.coroutines.CancellationException) {
+                throw e
+            }
+            return@withContext Result.failure()
         }
     }
 
@@ -455,7 +556,7 @@ class SttWorker(
                         id = "$jobId#$i",
                         shopId = SupabaseConfig.getNullSafeShopId(com.voicetoinvoice.app.data.ShopContext.requireShopId()),
                         audioRef = audioCloudUrl,
-                        rawTranscript = rawTranscript,
+                        rawTranscript = rawTranscript.ifBlank { "Voice Recording (Pending Review)" },
                         status = com.voicetoinvoice.app.data.local.entity.UnmatchedStatus.PENDING,
                         timestamp = System.currentTimeMillis()
                     )
@@ -470,7 +571,7 @@ class SttWorker(
                 id = "$jobId#0",
                 shopId = SupabaseConfig.getNullSafeShopId(com.voicetoinvoice.app.data.ShopContext.requireShopId()),
                 audioRef = audioCloudUrl,
-                rawTranscript = rawTranscript,
+                rawTranscript = rawTranscript.ifBlank { "Voice Recording (Pending Review)" },
                 status = com.voicetoinvoice.app.data.local.entity.UnmatchedStatus.PENDING,
                 timestamp = System.currentTimeMillis()
             )
@@ -499,6 +600,7 @@ class SttWorker(
         val cleanTranscript = rawTranscript.trim()
 
         var finalStatus: SttJobStatus = SttJobStatus.AUTO_CONFIRMED
+        var assistantTier = "none"
 
         if (cleanTranscript.isBlank()) {
             answer = com.voicetoinvoice.app.domain.voice.ResponseComposer.formatUnrecognized()
@@ -509,6 +611,7 @@ class SttWorker(
                 com.voicetoinvoice.app.domain.router.AssistantIntent.READ_QUERY -> {
                     val ledgerQueries = com.voicetoinvoice.app.domain.query.LedgerQueries(db)
                     answer = com.voicetoinvoice.app.domain.query.QuestionTemplates(ledgerQueries).answerQuestion(cleanTranscript)
+                    assistantTier = "template"
                     finalStatus = SttJobStatus.AUTO_CONFIRMED
                 }
                 com.voicetoinvoice.app.domain.router.AssistantIntent.SALE,
@@ -632,8 +735,8 @@ class SttWorker(
             // on-device fast path didn't resolve it). The default `speak()` call tries
             // Grok TTS first -- measured 1.3-2.4s in production edge logs -- purely for a
             // higher-quality voice. For the assistant specifically, responsiveness is the
-            // whole point (the shopkeeper is mid-task and waiting), so it takes the same
-            // instant on-device path AssistantFastPath already uses rather than paying that
+            // whole point (the shopkeeper is mid-task and waiting), so it takes the
+            // instant on-device speech synthesis path rather than paying that
             // round trip on every single voice command.
             speechOutput.speak(answer, preferOffline = true)
         } catch (e: Exception) {
@@ -642,6 +745,7 @@ class SttWorker(
 
         val firstItem = if (parsedItems.length() > 0) parsedItems.optJSONObject(0) else null
         clientTrace.put("outcome", "assistant_answered")
+        clientTrace.put("assistant_tier", assistantTier)
         clientTrace.put("assistant_answer", answer)
 
         db.sttJobDao().updateJob(
@@ -671,6 +775,8 @@ class SttWorker(
         val traceJson: String,
         val parsedItems: JSONArray
     )
+
+
 
     /** process-voice-job answers 202/QUEUED immediately and finishes the real
      *  transcribe+parse in the background (EdgeRuntime.waitUntil) -- the initial HTTP
@@ -803,7 +909,7 @@ class SttWorker(
 
             writeString("$twoHyphens$boundary$lineEnd")
             writeString("Content-Disposition: form-data; name=\"shopId\"$lineEnd$lineEnd")
-            writeString("$shopId$lineEnd")
+            writeString("${shopId ?: ""}$lineEnd")
 
             if (onDeviceTranscript.isNotBlank()) {
                 writeString("$twoHyphens$boundary$lineEnd")

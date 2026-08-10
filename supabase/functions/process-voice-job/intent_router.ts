@@ -14,7 +14,7 @@
  * English) matching works by construction rather than by duplicating vocabulary per script.
  */
 
-import { phoneticKey, normalizedDistance } from './phonetic.ts'
+import { phoneticKey, normalizedDistance, HINDI_NUMBER_MAP, UNIT_SET } from './phonetic.ts'
 
 export type AssistantIntent =
   | 'SALE'
@@ -199,18 +199,69 @@ const RETURN_STRONG_KEYS = ['वापस', 'wapas', 'return', 'लौटा', '
 
 const MONEY_PATTERN = /(₹|rs\.?|rupee|रुपये|रुपए)?\s*\d+(\.\d+)?/i
 
-/** Unigram + bigram + trigram phone keys. Multi-word triggers need the n-grams. */
+/**
+ * Phone keys of every numeral and unit surface.
+ *
+ * ISSUE-120: "चार" (four) keys to CAL, which is EXACTLY the key of the ACTION_COMMAND
+ * trigger "call" -- normalized distance 0.0000, quality 1.000. That scored ACTION_COMMAND
+ * 1.0 against SALE's 0.9 baseline and sent three plain cash sales to review instead of
+ * booking them (traces 54e7fe50, 8430fe59, 467ea9d5, all opening "चार किलो"). The bigram
+ * "चारकिलो" collides with "call karo" at 0.125 independently.
+ *
+ * Threshold tuning cannot fix a 0.0000 distance, so quantity-only spans are excluded from
+ * trigger matching outright.
+ */
+const QUANTITY_KEYS: Set<string> = new Set(
+  [...Object.keys(HINDI_NUMBER_MAP), ...UNIT_SET]
+    .map(w => phoneticKey(w))
+    .filter(k => k.length > 0)
+)
+
+/**
+ * Literal lowercased surfaces of every trigger word.
+ *
+ * The first version of this fix asserted "no trigger phrase is a number or a unit, so
+ * filtering is safe by construction." That was WRONG and the fixture caught it: the
+ * PRICE_UPDATE trigger `भाव`/`bhav` (rate) and the quantity word `पाव` (quarter) BOTH key to
+ * `PAV`, so filtering by key alone deleted the `bhav` trigger and `"aaloo ka bhav 30"`
+ * degraded from PRICE_UPDATE to SALE — turning a rate change into a fake one-unit sale.
+ *
+ * The asymmetry that resolves it: the trigger lexicon is the authority on what a trigger
+ * word is. `bhav` is literally in the trigger list and is NOT literally a numeral surface,
+ * so it is kept. `चार` is literally a numeral surface and is NOT literally a trigger word,
+ * so it is still filtered and the original ISSUE-120 collision stays fixed.
+ */
+const TRIGGER_SURFACES: Set<string> = new Set(
+  TRIGGERS.flatMap(t => t.phrases)
+    .flatMap(p => p.toLowerCase().split(/\s+/))
+    .filter(w => w.length > 0)
+)
+
+/** True when a word is a bare number, a number word, or a unit — and is not itself a trigger word. */
+function isQuantityToken(word: string): boolean {
+  const lower = word.toLowerCase().trim()
+  if (lower.length === 0) return true
+  // A literal trigger word is never a quantity, whatever it happens to key to.
+  if (TRIGGER_SURFACES.has(lower)) return false
+  if (!Number.isNaN(Number(lower))) return true
+  const key = phoneticKey(lower)
+  return key.length > 0 && QUANTITY_KEYS.has(key)
+}
+
 function buildNgramKeys(transcript: string): string[] {
   const words = transcript.split(/\s+/).filter(w => w.length > 0)
+  const isQty = words.map(isQuantityToken)
   const keys = new Set<string>()
   for (let i = 0; i < words.length; i++) {
-    const uni = phoneticKey(words[i])
-    if (uni) keys.add(uni)
-    if (i + 1 < words.length) {
+    if (!isQty[i]) {
+      const uni = phoneticKey(words[i])
+      if (uni) keys.add(uni)
+    }
+    if (i + 1 < words.length && !(isQty[i] && isQty[i + 1])) {
       const bi = phoneticKey(words[i] + words[i + 1])
       if (bi) keys.add(bi)
     }
-    if (i + 2 < words.length) {
+    if (i + 2 < words.length && !(isQty[i] && isQty[i + 1] && isQty[i + 2])) {
       const tri = phoneticKey(words[i] + words[i + 1] + words[i + 2])
       if (tri) keys.add(tri)
     }

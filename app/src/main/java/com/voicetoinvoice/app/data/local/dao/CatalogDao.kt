@@ -2,6 +2,7 @@ package com.voicetoinvoice.app.data.local.dao
 
 import androidx.room.*
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
+import com.voicetoinvoice.app.domain.lexicon.ItemLexicon
 import kotlinx.coroutines.flow.Flow
 
 data class StockLevel(val itemId: String, val onHand: Double)
@@ -17,14 +18,41 @@ interface CatalogDao {
     @Query("SELECT * FROM catalog_items WHERE id = :id LIMIT 1")
     suspend fun getById(id: String): CatalogItem?
 
+    @Query("SELECT * FROM catalog_items WHERE active = 1 AND canonicalKey = :canonicalKey AND (baseUnit = :baseUnit OR :baseUnit = '') LIMIT 1")
+    suspend fun getActiveByCanonicalKey(canonicalKey: String, baseUnit: String = ""): CatalogItem?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertOrUpdate(item: CatalogItem)
+    suspend fun insertOrUpdateRaw(item: CatalogItem)
+
+    @Transaction
+    suspend fun insertOrUpdate(item: CatalogItem) {
+        val key = if (item.canonicalKey.isNotBlank()) item.canonicalKey else ItemLexicon.canonicalOf(item.name)
+        val baseUnit = if (item.baseUnit.isNotBlank()) item.baseUnit else ItemLexicon.baseUnitOf(item.unitId)
+        val existing = getActiveByCanonicalKey(key, baseUnit)
+        val finalItem = if (existing != null && existing.id != item.id) {
+            existing.copy(
+                name = item.name,
+                unitId = item.unitId,
+                price = item.price,
+                updatedAt = item.updatedAt,
+                synced = item.synced,
+                canonicalKey = key,
+                baseUnit = baseUnit
+            )
+        } else {
+            item.copy(canonicalKey = key, baseUnit = baseUnit)
+        }
+        insertOrUpdateRaw(finalItem)
+    }
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(items: List<CatalogItem>)
 
     @Query("UPDATE catalog_items SET price = :newPrice, updatedAt = :timestamp, synced = 0 WHERE id = :id")
     suspend fun updatePrice(id: String, newPrice: Double, timestamp: Long = System.currentTimeMillis())
+
+    @Query("UPDATE catalog_items SET imagePath = :path, updatedAt = :timestamp WHERE id = :id")
+    suspend fun updateImagePath(id: String, path: String?, timestamp: Long = System.currentTimeMillis())
 
     /** Every row, active or not — the merge in `SyncEngine.pullCatalogFromCloud` needs to see
      *  deactivated rows too, or it would re-insert an item the shopkeeper deliberately hid. */
@@ -104,4 +132,78 @@ interface CatalogDao {
 
     @Query("SELECT * FROM catalog_items WHERE active = 1 AND trackExpiry = 1")
     suspend fun getExpiryTrackedItems(): List<CatalogItem>
+
+    @Query("DELETE FROM catalog_items WHERE id IN (:ids)")
+    suspend fun deleteByIds(ids: List<String>)
+
+    @Query("UPDATE catalog_items SET stockQty = :stockQty, active = 1 WHERE id = :id")
+    suspend fun updateStockQtyAndActive(id: String, stockQty: Double)
+
+    @Transaction
+    suspend fun dedupeCatalogItems(
+        transactionDao: TransactionDao,
+        stockLedgerDao: StockLedgerDao,
+        stockInDao: StockInDao,
+        stockBatchDao: StockBatchDao,
+        unmatchedQueueDao: UnmatchedQueueDao
+    ) {
+        val allItems = getAllCatalogList().filter { it.active }
+        android.util.Log.e("CATALOG_DEDUP", "Starting deduplication. Total active items in DB: ${allItems.size}")
+        if (allItems.isEmpty()) return
+
+        val groups = allItems.groupBy {
+            Pair(
+                if (it.canonicalKey.isNotBlank()) it.canonicalKey else ItemLexicon.canonicalOf(it.name),
+                if (it.baseUnit.isNotBlank()) it.baseUnit else ItemLexicon.baseUnitOf(it.unitId)
+            )
+        }
+        var deactivatedCount = 0
+
+        for ((key, group) in groups) {
+            if (group.size <= 1) continue
+
+            val survivor = group.maxByOrNull { item ->
+                var score = 0
+                if (item.active) score += 1000
+                if (item.stockQty > 0) score += (item.stockQty * 10).toInt()
+                score
+            } ?: group.first()
+
+            val losers = group.filter { it.id != survivor.id }
+            val conflict = losers.any { it.unitId != survivor.unitId || it.price != survivor.price }
+            if (conflict) {
+                android.util.Log.w("CATALOG_DEDUP", "CANONICAL_MERGE_CONFLICT canonical=$key ids=${group.map { it.id }}")
+                continue
+            }
+
+            val survivorId = survivor.id
+            val mergedStockQty = group.sumOf { it.stockQty }
+
+            updateStockQtyAndActive(survivorId, mergedStockQty)
+
+            for (loser in losers) {
+                val dupId = loser.id
+                try { transactionDao.relinkItemId(dupId, survivorId) } catch (_: Exception) {}
+                try { stockLedgerDao.relinkItemId(dupId, survivorId) } catch (_: Exception) {}
+                try { stockInDao.relinkItemId(dupId, survivorId) } catch (_: Exception) {}
+                try { stockBatchDao.relinkItemId(dupId, survivorId) } catch (_: Exception) {}
+                try { unmatchedQueueDao.relinkItemId(dupId, survivorId) } catch (_: Exception) {}
+                deactivate(dupId)
+                deactivatedCount++
+            }
+        }
+
+        android.util.Log.e("CATALOG_DEDUP", "Deduplication finished. Deactivated $deactivatedCount duplicate items.")
+    }
+
+    @Transaction
+    suspend fun deduplicateCatalog(
+        transactionDao: TransactionDao,
+        stockLedgerDao: StockLedgerDao,
+        stockInDao: StockInDao,
+        stockBatchDao: StockBatchDao,
+        unmatchedQueueDao: UnmatchedQueueDao
+    ) {
+        dedupeCatalogItems(transactionDao, stockLedgerDao, stockInDao, stockBatchDao, unmatchedQueueDao)
+    }
 }

@@ -49,4 +49,7 @@ interface StockBatchDao {
 
     @Query("UPDATE stock_batches SET synced = 1 WHERE id IN (:ids)")
     suspend fun markSynced(ids: List<String>)
+
+    @Query("UPDATE stock_batches SET itemId = :newId WHERE itemId = :oldId")
+    suspend fun relinkItemId(oldId: String, newId: String)
 }

@@ -3,6 +3,7 @@ package com.voicetoinvoice.app.data.sync
 import android.util.Log
 import com.voicetoinvoice.app.data.local.dao.*
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
+import com.voicetoinvoice.app.domain.lexicon.ItemLexicon
 import com.voicetoinvoice.app.data.local.entity.CreditRecord
 import com.voicetoinvoice.app.data.local.entity.StockInRecord
 import com.voicetoinvoice.app.data.local.entity.SupplierRecord
@@ -86,7 +87,7 @@ class SyncEngine(
 
         val local = catalogDao.getAllCatalogList()
         val localById = local.associateBy { it.id }
-        val localIdsByName = local.groupBy { it.name.trim().lowercase() }
+        val localIdsByName = local.groupBy { ItemLexicon.canonicalOf(it.name) }.toMutableMap()
 
         var applied = 0
         for (remoteItem in remote) {
@@ -95,10 +96,12 @@ class SyncEngine(
             if (existing == null) {
                 // Guard against inserting a duplicate of an item the phone already knows
                 // under a locally-generated id.
-                val nameCollision = localIdsByName[remoteItem.name.trim().lowercase()]
+                val normName = ItemLexicon.canonicalOf(remoteItem.name)
+                val nameCollision = localIdsByName[normName]
                 if (!nameCollision.isNullOrEmpty()) continue
 
                 catalogDao.insertOrUpdate(remoteItem)
+                localIdsByName[normName] = listOf(remoteItem)
                 applied++
                 Log.i(TAG, "⬇️ Learned new catalog item from cloud: '${remoteItem.name}' (₹${remoteItem.price})")
                 continue
@@ -108,7 +111,8 @@ class SyncEngine(
             if (remoteItem.updatedAt <= existing.updatedAt) continue
             if (remoteItem.price == existing.price &&
                 remoteItem.unitId == existing.unitId &&
-                remoteItem.active == existing.active
+                remoteItem.active == existing.active &&
+                remoteItem.imageUrl == existing.imageUrl
             ) continue
 
             catalogDao.insertOrUpdate(
@@ -117,6 +121,7 @@ class SyncEngine(
                     unitId = remoteItem.unitId,
                     price = remoteItem.price,
                     active = remoteItem.active,
+                    imageUrl = remoteItem.imageUrl,
                     updatedAt = remoteItem.updatedAt,
                     synced = true
                 )

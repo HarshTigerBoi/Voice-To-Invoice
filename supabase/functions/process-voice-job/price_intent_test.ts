@@ -67,3 +67,16 @@ test('extractSpokenNumbers extracts compound numbers >= 10 from transcript', () 
   assert.deepStrictEqual(extractSpokenNumbers('गोल्ड पचास रुपये'), [50])
   assert.deepStrictEqual(extractSpokenNumbers('एक हजार दो सौ रुपये'), [1200])
 })
+
+test('implausibilityReason FLAGS totals exceeding MAX_PLAUSIBLE_SALE_VALUE ceiling', () => {
+  const saleReason = implausibilityReason('KG', 10, 50001, '', 5000.1, 'SALE')
+  assert.notStrictEqual(saleReason, null)
+  assert.ok(saleReason?.includes('exceeds the ₹50000 auto-confirm ceiling'))
+
+  const stockReason = implausibilityReason('KG', 100, 500001, '', 5000.01, 'STOCK')
+  assert.notStrictEqual(stockReason, null)
+  assert.ok(stockReason?.includes('exceeds the ₹500000 auto-confirm ceiling'))
+
+  const validSale = implausibilityReason('KG', 10, 45000, '', 4500, 'SALE')
+  assert.strictEqual(validSale, null)
+})

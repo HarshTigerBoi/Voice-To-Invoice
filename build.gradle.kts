@@ -20,9 +20,8 @@ plugins {
  * these files, so nothing external holds a handle on them. Set VTI_BUILD_DIR to override.
  */
 val relocatedBuildRoot: String = System.getenv("VTI_BUILD_DIR")
-    ?: System.getenv("LOCALAPPDATA")?.let { "$it/VoiceToInvoiceBuild" }
-    ?: layout.buildDirectory.get().asFile.absolutePath
+    ?: "C:/VTI_build"
 
 allprojects {
-    layout.buildDirectory.set(file("$relocatedBuildRoot/${project.path.replace(':', '_').trim('_').ifEmpty { "root" }}"))
+    layout.buildDirectory.set(file("C:/VTI_build/${project.name}"))
 }

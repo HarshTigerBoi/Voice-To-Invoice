@@ -14,6 +14,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -22,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import com.voicetoinvoice.app.ui.theme.LedgerColors
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -47,16 +49,55 @@ fun DiagnosticLogsScreen(
     val scope = rememberCoroutineScope()
     val db = remember { AppDatabase.getInstance(context) }
 
-    val traceLogs by db.sttJobDao().getAllJobsTraceLogsFlow().collectAsState(initial = emptyList())
+    val localLogs by db.sttJobDao().getAllJobsTraceLogsFlow().collectAsState(initial = emptyList())
     var showClearDialog by remember { mutableStateOf(false) }
+
+    // Server-side jobs, pulled for display only (see CloudSyncManager.fetchJobLogsFromCloud).
+    // Sync is push-only, so without this the screen shows only what THIS handset recorded --
+    // which looked like "logging is broken" while 250+ jobs sat on the server.
+    var cloudLogs by remember { mutableStateOf<List<SttJobRecord>>(emptyList()) }
+    var cloudState by remember { mutableStateOf("loading") }
+    var refreshTick by remember { mutableStateOf(0) }
+    LaunchedEffect(refreshTick) {
+        cloudState = "loading"
+        val fetched = com.voicetoinvoice.app.network.CloudSyncManager()
+            .fetchJobLogsFromCloud(com.voicetoinvoice.app.data.ShopContext.shopIdOrNull())
+        cloudLogs = fetched ?: emptyList()
+        cloudState = if (fetched == null) "error" else "ok"
+    }
+
+    // Local rows win on id: they carry the on-device audio path, so playback keeps working.
+    val localIds = remember(localLogs) { localLogs.map { it.id }.toSet() }
+    val traceLogs = remember(localLogs, cloudLogs) {
+        // `distinctBy` is load-bearing, not tidiness: the LazyColumn below keys on `it.id`, and
+        // a repeated key makes Compose throw rather than merely render oddly. `stt_job_logs` has
+        // no unique constraint on job_id (verified 2026-08-06: 123 rows / 123 distinct for this
+        // shop -- clean today, not guaranteed tomorrow), so one retry that double-logs a job
+        // would take the whole screen down.
+        (localLogs + cloudLogs.filterNot { it.id in localIds })
+            .distinctBy { it.id }
+            .sortedByDescending { it.recordedAtMs }
+    }
+    val cloudOnlyIds = remember(traceLogs, localIds) {
+        traceLogs.map { it.id }.filterNot { it in localIds }.toSet()
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Voice & System Processing Logs") },
+                title = {
+                    Column {
+                        Text("Voice & System Processing Logs")
+                        Text(
+                            "build ${com.voicetoinvoice.app.BuildConfig.BUILD_STAMP} · ${com.voicetoinvoice.app.BuildConfig.GIT_SHA}",
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
@@ -113,8 +154,11 @@ fun DiagnosticLogsScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 items(traceLogs, key = { it.id }) { log ->
-                    DiagnosticLogItemCard(log = log)
+                    DiagnosticLogItemCard(log = log, isCloudOnly = log.id in cloudOnlyIds)
                 }
+                // Same reservation as HomeScreen: the assistant FAB is a BottomEnd overlay on
+                // every screen, and without this it sits on top of the last card's badges.
+                item { Spacer(Modifier.height(96.dp)) }
             }
         }
     }
@@ -147,7 +191,7 @@ fun DiagnosticLogsScreen(
 }
 
 @Composable
-fun DiagnosticLogItemCard(log: SttJobRecord) {
+fun DiagnosticLogItemCard(log: SttJobRecord, isCloudOnly: Boolean = false) {
     val context = LocalContext.current
     var isExpanded by remember { mutableStateOf(false) }
     var isPlayingAudio by remember { mutableStateOf(false) }
@@ -164,18 +208,69 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
         SimpleDateFormat("dd MMM, hh:mm:ss a", Locale.getDefault()).format(Date(log.recordedAtMs))
     }
 
+    /**
+     * Which interpretation path produced this job, read straight from the trace the server
+     * wrote (`step_4_fast_path` / `step_4_interpretation_source`).
+     *
+     * ⚡ FAST means the deterministic segmenter resolved every line exactly and the Grok chat
+     * call was skipped -- measured at ~3.5s end-to-end against ~8.9s when the AI runs. Seeing
+     * at a glance which recordings took the slow path is the whole point: the trace also
+     * carries `skipReason`, shown in the expanded view, naming the gate that rejected it.
+     */
+    val pathBadge: Pair<String, Color>? = remember(log.diagnosticTraceJson) {
+        runCatching {
+            if (log.diagnosticTraceJson.isBlank()) return@runCatching null
+            val root = JSONObject(log.diagnosticTraceJson)
+            val serverTrace = root.optJSONObject("server") ?: root
+            val fp = serverTrace.optJSONObject("step_4_fast_path")
+            val src = serverTrace.optString("step_4_interpretation_source", "")
+            val aiModel = serverTrace.optString("step_4_ai_model", "").takeIf { it.isNotBlank() && it != "null" && it != "fast_path" }
+            when {
+                fp?.optBoolean("used") == true -> "⚡ FAST" to Color(0xFF00796B)
+                src == "memory" -> "🧠 MEMO" to Color(0xFF5E35B1)
+                src == "segmenter_fallback" -> "📐 RULES" to LedgerColors.Neutral
+                (src == "grok_ai" || src == "forced_ai_fallback") && aiModel != null -> "🤖 $aiModel" to Color(0xFF8D6E63)
+                src == "grok_ai" || src == "forced_ai_fallback" -> "🤖 AI" to Color(0xFF8D6E63)
+                else -> null
+            }
+        }.getOrNull()
+    }
+
+    /** Server-side warnings/errors recorded for this job (step_0_server_diagnostics). */
+    val serverIssues: List<String> = remember(log.diagnosticTraceJson) {
+        runCatching {
+            if (log.diagnosticTraceJson.isBlank()) return@runCatching emptyList()
+            val root = JSONObject(log.diagnosticTraceJson)
+            val serverTrace = root.optJSONObject("server") ?: root
+            val arr = serverTrace.optJSONArray("step_0_server_diagnostics")
+                ?: return@runCatching emptyList()
+            (0 until arr.length()).mapNotNull { i ->
+                arr.optJSONObject(i)?.let { "[${it.optString("level")}] ${it.optString("stage")}: ${it.optString("message")}" }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    val fastPathSkipReason: String? = remember(log.diagnosticTraceJson) {
+        runCatching {
+            val root = JSONObject(log.diagnosticTraceJson)
+            val serverTrace = root.optJSONObject("server") ?: root
+            serverTrace.optJSONObject("step_4_fast_path")
+                ?.optString("skipReason")?.takeIf { it.isNotBlank() && it != "null" }
+        }.getOrNull()
+    }
+
     val (statusLabel, statusColor) = if (log.captureIntent == com.voicetoinvoice.app.data.local.entity.CaptureIntent.ASSISTANT) {
         "ASSISTANT" to Color(0xFF7B1FA2)
     } else {
         when (log.status) {
-            SttJobStatus.AUTO_CONFIRMED -> "AUTO-CONFIRMED" to Color(0xFF2E7D32)
-            SttJobStatus.CONFIRMED -> "CONFIRMED" to Color(0xFF2E7D32)
-            SttJobStatus.PARSED -> if (log.isSanityFlagged) "REVIEW NEEDED" to Color(0xFFEF6C00) else "PARSED" to Color(0xFF0288D1)
+            SttJobStatus.AUTO_CONFIRMED -> "AUTO-CONFIRMED" to LedgerColors.MoneyIn
+            SttJobStatus.CONFIRMED -> "CONFIRMED" to LedgerColors.MoneyIn
+            SttJobStatus.PARSED -> if (log.isSanityFlagged) "REVIEW NEEDED" to Color(0xFFEF6C00) else "PARSED" to LedgerColors.Upi
             SttJobStatus.PARTIALLY_CONFIRMED -> "PARTIALLY CONFIRMED" to Color(0xFFEF6C00)
-            SttJobStatus.RATE_UPDATED -> "RATE UPDATED" to Color(0xFF2E7D32)
-            SttJobStatus.FAILED -> "FAILED" to Color(0xFFC62828)
+            SttJobStatus.RATE_UPDATED -> "RATE UPDATED" to LedgerColors.MoneyIn
+            SttJobStatus.FAILED -> "FAILED" to LedgerColors.MoneyOut
             SttJobStatus.TRANSCRIBING -> "PROCESSING" to Color(0xFF1565C0)
-            SttJobStatus.QUEUED -> "QUEUED" to Color(0xFF616161)
+            SttJobStatus.QUEUED -> "QUEUED" to LedgerColors.Neutral
         }
     }
 
@@ -246,11 +341,48 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
                 }
             }
 
+            // Engine / origin badges get their OWN row: the header already carries the intent
+            // chip and the status badge, and cramming four chips onto one non-wrapping Row
+            // clipped them off the right edge on a 1080px screen.
+            if (pathBadge != null || isCloudOnly) {
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    pathBadge?.let { (label, colour) ->
+                        Surface(color = colour, shape = RoundedCornerShape(8.dp)) {
+                            Text(
+                                text = label,
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                        Spacer(Modifier.width(4.dp))
+                    }
+                    if (isCloudOnly) {
+                        Surface(color = Color(0xFF455A64), shape = RoundedCornerShape(8.dp)) {
+                            Text(
+                                text = "☁ SERVER",
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
             Spacer(Modifier.height(10.dp))
 
             // Main Spoken Raw Transcript Text
             Text(
-                text = if (log.rawTranscript.isNotBlank()) "\"${log.rawTranscript}\"" else "No transcript recorded",
+                text = when {
+                    log.rawTranscript.isNotBlank() -> "\"${log.rawTranscript}\""
+                    log.errorMessage.isNotBlank() -> "⚠️ ${log.errorMessage}"
+                    log.status == SttJobStatus.FAILED -> "⚠️ Recording failed / Unrecognized"
+                    else -> "No transcript recorded"
+                },
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface
@@ -350,6 +482,13 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
                         Spacer(Modifier.width(4.dp))
                         Text("Audio", style = MaterialTheme.typography.labelSmall)
                     }
+                } else if (log.captureIntent == com.voicetoinvoice.app.data.local.entity.CaptureIntent.ASSISTANT) {
+                    Text(
+                        text = "☁️ Audio processed via cloud (local copy unavailable)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                        fontWeight = FontWeight.Medium
+                    )
                 } else {
                     Text(
                         text = "Audio file unavailable",
@@ -360,10 +499,49 @@ fun DiagnosticLogItemCard(log: SttJobRecord) {
             }
 
             // Expandable Technical Trace Log Section
+            // Server-side failures are shown COLLAPSED, not hidden behind a tap: the whole
+            // reason these exist is that the catalog-fetch 400 stayed invisible for weeks.
+            if (serverIssues.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Surface(
+                    color = LedgerColors.MoneyOut.copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(8.dp)) {
+                        Text(
+                            text = "⚠ Server issue${if (serverIssues.size > 1) "s" else ""}",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = LedgerColors.MoneyOut
+                        )
+                        serverIssues.forEach {
+                            Text(
+                                text = it,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = LedgerColors.MoneyOut
+                            )
+                        }
+                    }
+                }
+            }
+
             AnimatedVisibility(visible = isExpanded) {
                 Column(modifier = Modifier.padding(top = 12.dp)) {
                     HorizontalDivider()
                     Spacer(Modifier.height(8.dp))
+
+                    // Names the exact gate that sent this recording down the slow AI path.
+                    fastPathSkipReason?.let {
+                        Text(
+                            text = "AI call made — fast path skipped: $it",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(8.dp))
+                    }
 
                     Text(
                         text = "End-to-End Processing Technical Trace",

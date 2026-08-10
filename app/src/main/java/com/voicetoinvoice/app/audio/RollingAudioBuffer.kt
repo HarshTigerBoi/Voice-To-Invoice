@@ -27,6 +27,27 @@ class RollingAudioBuffer(private val context: Context) {
     @Volatile private var recordingStartedAtMs: Long = 0L
     @Volatile private var totalBytesWritten: Long = 0L
     @Volatile private var lastWriteAtMs: Long = 0L
+    @Volatile private var stoppedAtMs: Long = 0L
+
+    /**
+     * One contiguous run of captured PCM. The wall-clock -> byte-offset mapping is valid
+     * ONLY inside a segment; between two segments the microphone was off and the ring still
+     * holds older audio at those positions. Every previous "wrong time audio" bug came from
+     * a single global anchor extrapolating straight through such a hole.
+     */
+    private class CaptureSegment(val startWallMs: Long, val startByteOffset: Long) {
+        @Volatile var endWallMs: Long = startWallMs
+        @Volatile var endByteOffset: Long = startByteOffset
+    }
+
+    /** Guarded by `ringBuffer`. Newest last. */
+    private val segments = ArrayList<CaptureSegment>()
+    /** Guarded by `ringBuffer`. Non-null only while the capture thread is writing. */
+    private var currentSegment: CaptureSegment? = null
+    /** Incremented by startRollingBuffer() only -- a cold start invalidates all timestamps. */
+    @Volatile private var captureEpoch: Int = 0
+
+    fun getCaptureEpoch(): Int = captureEpoch
 
     /** While true the ring buffer keeps advancing but stores silence, so TTS playback
      *  never lands in a window the next PTT press extracts. */
@@ -37,6 +58,36 @@ class RollingAudioBuffer(private val context: Context) {
 
     fun getRecordingStartedAtMs(): Long = recordingStartedAtMs
     fun getBufferDurationSeconds(): Int = bufferDurationSeconds
+
+    private fun appendChunk(chunk: ByteArray, bytesRead: Int) {
+        val now = System.currentTimeMillis()
+        val chunkDurationMs = bytesRead * 1000L / bytesPerSecond
+        synchronized(ringBuffer) {
+            var seg = currentSegment
+            if (seg == null) {
+                // The chunk we are about to store was captured over the PRECEDING
+                // chunkDurationMs, so the segment starts before `now`.
+                seg = CaptureSegment(now - chunkDurationMs, totalBytesWritten)
+                segments.add(seg)
+                currentSegment = seg
+            }
+            for (i in 0 until bytesRead) {
+                ringBuffer[writeHead] = chunk[i]
+                writeHead = (writeHead + 1) % bufferCapacity
+            }
+            totalBytesWritten += bytesRead
+            seg.endWallMs = now
+            seg.endByteOffset = totalBytesWritten
+            lastWriteAtMs = now
+            // Drop segments whose bytes have all been overwritten in the ring.
+            val oldest = totalBytesWritten - bufferCapacity
+            while (segments.size > 1 && segments[0].endByteOffset <= oldest) segments.removeAt(0)
+        }
+    }
+
+    private fun closeCurrentSegment() {
+        synchronized(ringBuffer) { currentSegment = null }
+    }
 
     fun startRollingBuffer() {
         if (isRecordingRunning.get()) return
@@ -53,10 +104,14 @@ class RollingAudioBuffer(private val context: Context) {
 
         isRecordingRunning.set(true)
         recordingStartedAtMs = System.currentTimeMillis()
+        stoppedAtMs = 0L
         synchronized(ringBuffer) {
             totalBytesWritten = 0L
             writeHead = 0
             lastWriteAtMs = 0L
+            segments.clear()
+            currentSegment = null
+            captureEpoch++
             java.util.Arrays.fill(ringBuffer, 0.toByte())
         }
         isSuppressed.set(false)
@@ -97,14 +152,7 @@ class RollingAudioBuffer(private val context: Context) {
                                 java.util.Arrays.fill(chunk, 0, bytesRead, 0.toByte())
                             }
                         }
-                        synchronized(ringBuffer) {
-                            for (i in 0 until bytesRead) {
-                                ringBuffer[writeHead] = chunk[i]
-                                writeHead = (writeHead + 1) % bufferCapacity
-                            }
-                            totalBytesWritten += bytesRead
-                            lastWriteAtMs = System.currentTimeMillis()
-                        }
+                        appendChunk(chunk, bytesRead)
                     }
                 }
             } catch (e: Exception) {
@@ -116,6 +164,7 @@ class RollingAudioBuffer(private val context: Context) {
                 } catch (e: Exception) {
                     Log.e("RollingAudioBuffer", "Error releasing AudioRecord", e)
                 }
+                closeCurrentSegment()
                 isRecordingRunning.set(false)
             }
         }
@@ -124,87 +173,173 @@ class RollingAudioBuffer(private val context: Context) {
 
     /**
      * Blocks until the capture thread has really exited and AudioRecord.release() has run.
-     * Without the join, this returned while AudioRecord still held the microphone, so a
-     * SpeechRecognizer started immediately afterwards failed to open it -- BUG-B, the cause of
-     * "the assistant records nothing". The timeout is a safety valve: a wedged capture thread
-     * must not freeze the UI thread.
      */
     fun stopRollingBuffer() {
         isRecordingRunning.set(false)
+        val now = System.currentTimeMillis()
+        stoppedAtMs = now
         val thread = recordingThread
         recordingThread = null
         try {
-            thread?.join(500L)
+            thread?.join(1500L)
             if (thread?.isAlive == true) {
-                Log.w("RollingAudioBuffer", "Capture thread did not exit within 500ms; mic may still be held")
+                Log.w("RollingAudioBuffer", "Capture thread did not exit within 1500ms; mic may still be held")
             }
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
+        } finally {
+            closeCurrentSegment()
         }
     }
 
     /**
-     * Extracts exact audio window between startMs and endMs from circular ring buffer,
-     * writing a valid WAV file. Absolute-time addressing prevents scheduled drift and
-     * floorStartMs prevents silent backward expansion into preceding recordings.
+     * Called on every ON_START lifecycle event. Cold-starts the buffer on first launch;
+     * on subsequent foregrounds (buffer was stopped by ON_STOP), resumes without destroying
+     * the timing coordinate system. Returns true if cold-started, false if resumed or did nothing.
      */
-    fun extractAudioWindow(startMs: Long, endMs: Long, outputFile: File, floorStartMs: Long = startMs): File? {
+    fun smartStart(): Boolean {
+        if (isRecordingRunning.get()) return false
+        val gapMs = if (stoppedAtMs > 0L) System.currentTimeMillis() - stoppedAtMs else Long.MAX_VALUE
+        return if (totalBytesWritten == 0L || gapMs > RESUME_MAX_GAP_MS) {
+            startRollingBuffer()
+            true
+        } else {
+            resumeRollingBuffer()
+            false
+        }
+    }
+
+    /**
+     * Resumes recording after a stopRollingBuffer() call without resetting the timing
+     * coordinate system.
+     */
+    fun resumeRollingBuffer() {
+        if (isRecordingRunning.get()) return
+
+        val micGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!micGranted) {
+            Log.w("RollingAudioBuffer", "RECORD_AUDIO permission not granted -- cannot resume.")
+            return
+        }
+
+        isRecordingRunning.set(true)
+
+        recordingThread = Thread {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+            val channelConfig = AudioFormat.CHANNEL_IN_MONO
+            val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+            val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+
+            var audioRecord: AudioRecord? = null
+            try {
+                audioRecord = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    sampleRate,
+                    channelConfig,
+                    audioFormat,
+                    Math.max(minBufferSize, 4096)
+                )
+                if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
+                    Log.e("RollingAudioBuffer", "AudioRecord not initialized on resume — falling back to cold start")
+                    isRecordingRunning.set(false)
+                    // Post to main thread so we don't call startRollingBuffer() from inside its own thread
+                    android.os.Handler(android.os.Looper.getMainLooper()).post { startRollingBuffer() }
+                    return@Thread
+                }
+                audioRecord.startRecording()
+                val chunk = ByteArray(2048)
+                while (isRecordingRunning.get()) {
+                    val bytesRead = audioRecord.read(chunk, 0, chunk.size)
+                    if (bytesRead > 0) {
+                        if (isSuppressed.get()) {
+                            if (suppressedAtMs > 0L && System.currentTimeMillis() - suppressedAtMs > MAX_SUPPRESSION_MS) {
+                                setSuppressed(false)
+                            } else {
+                                java.util.Arrays.fill(chunk, 0, bytesRead, 0.toByte())
+                            }
+                        }
+                        appendChunk(chunk, bytesRead)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("RollingAudioBuffer", "Error in resumed audio recording loop", e)
+            } finally {
+                try {
+                    audioRecord?.stop()
+                    audioRecord?.release()
+                } catch (e: Exception) {
+                    Log.e("RollingAudioBuffer", "Error releasing AudioRecord on resume", e)
+                }
+                closeCurrentSegment()
+                isRecordingRunning.set(false)
+            }
+        }
+        recordingThread?.start()
+    }
+
+    sealed class ExtractionResult {
+        data class Success(val file: File, val clampedToSegmentStart: Boolean, val bytes: Int) : ExtractionResult()
+        data class Failure(val reason: String) : ExtractionResult()
+    }
+
+    fun extractAudioWindowDetailed(startMs: Long, endMs: Long, outputFile: File): ExtractionResult {
         return try {
-            val recStarted = recordingStartedAtMs
-            if (recStarted <= 0L) {
-                Log.w("RollingAudioBuffer", "Buffer recording has not started yet.")
-                return null
-            }
-
-            val effectiveStartMs = Math.max(startMs, floorStartMs)
-            if (endMs <= effectiveStartMs) {
-                Log.w("RollingAudioBuffer", "endMs ($endMs) <= effectiveStartMs ($effectiveStartMs)")
-                return null
-            }
-
             synchronized(ringBuffer) {
-                val totalWritten = totalBytesWritten
-                if (totalWritten <= 0) {
-                    Log.w("RollingAudioBuffer", "No valid PCM audio written to buffer yet.")
-                    return null
+                if (totalBytesWritten <= 0L) return ExtractionResult.Failure("buffer_never_wrote")
+                // Newest segment that overlaps the requested window. Audio for a just-released
+                // press is always in the newest segment; anything older is a stale request.
+                val seg = segments.lastOrNull { it.startWallMs < endMs && it.endWallMs > startMs }
+                    ?: return ExtractionResult.Failure("no_segment_overlaps_window")
+
+                when (val r = resolveSegmentWindowBytes(
+                    startMs, endMs,
+                    seg.startWallMs, seg.startByteOffset,
+                    seg.endWallMs, seg.endByteOffset,
+                    totalBytesWritten, bufferCapacity, bytesPerSecond
+                )) {
+                    is WindowResolution.Failed -> ExtractionResult.Failure(r.reason)
+                    is WindowResolution.Ok -> {
+                        val n = (r.endByte - r.startByte).toInt()
+                        val out = ByteArray(n)
+                        val startRingIndex = (r.startByte % bufferCapacity).toInt()
+                        for (i in 0 until n) out[i] = ringBuffer[(startRingIndex + i) % bufferCapacity]
+                        AudioWavWriter.writePcmToWav(out, outputFile, sampleRate = sampleRate)
+                        ExtractionResult.Success(outputFile, r.clampedToSegmentStart, n)
+                    }
                 }
-
-                val anchor = if (lastWriteAtMs > 0L) lastWriteAtMs else System.currentTimeMillis()
-                val byteRange = resolveWindowBytes(
-                    startMs = effectiveStartMs,
-                    endMs = endMs,
-                    anchorMs = anchor,
-                    totalWritten = totalWritten,
-                    bufferCapacity = bufferCapacity,
-                    bytesPerSecond = bytesPerSecond
-                ) ?: run {
-                    Log.w("RollingAudioBuffer", "Window resolution returned null for [$effectiveStartMs, $endMs]")
-                    return null
-                }
-
-                val actualBytesToExtract = byteRange.last - byteRange.first + 1
-                val extractedBytes = ByteArray(actualBytesToExtract)
-                val startRingIndex = (byteRange.first.toLong() % bufferCapacity).toInt()
-
-                for (i in 0 until actualBytesToExtract) {
-                    extractedBytes[i] = ringBuffer[(startRingIndex + i) % bufferCapacity]
-                }
-
-                AudioWavWriter.writePcmToWav(extractedBytes, outputFile, sampleRate = sampleRate)
-                outputFile
             }
         } catch (e: Exception) {
-            Log.e("RollingAudioBuffer", "Failed to extract audio window safely", e)
-            null
+            Log.e("RollingAudioBuffer", "extractAudioWindowDetailed failed", e)
+            ExtractionResult.Failure("exception_${e.javaClass.simpleName}")
         }
+    }
+
+    fun extractAudioWindow(startMs: Long, endMs: Long, outputFile: File): File? =
+        (extractAudioWindowDetailed(startMs, endMs, outputFile) as? ExtractionResult.Success)?.file
+
+    sealed class WindowResolution {
+        data class Ok(
+            val startByte: Long,
+            val endByte: Long,
+            val clampedToSegmentStart: Boolean
+        ) : WindowResolution()
+        data class Failed(val reason: String) : WindowResolution()
     }
 
     companion object {
         const val MIN_WINDOW_BYTES = 9600
         const val MAX_SUPPRESSION_MS = 20_000L
+        const val RESUME_MAX_GAP_MS = 10_000L
 
         @Volatile
         private var instance: RollingAudioBuffer? = null
+
+        fun setSharedInstance(buffer: RollingAudioBuffer) {
+            instance = buffer
+        }
 
         fun getSharedInstance(context: Context): RollingAudioBuffer {
             return instance ?: synchronized(this) {
@@ -213,34 +348,39 @@ class RollingAudioBuffer(private val context: Context) {
         }
 
         /**
-         * Pure form of the window->byte-range mapping, factored out so it is unit-testable without a
-         * microphone. `anchorMs` is the wall-clock time corresponding to byte offset `totalWritten`.
-         * Returns null when the requested window is unrecoverable (already overwritten, or shorter
-         * than [MIN_WINDOW_BYTES] after clamping).
+         * Maps [startMs, endMs] onto absolute byte offsets INSIDE one capture segment.
+         * `segEndByteOffset` is the byte offset that corresponds to wall-clock `segEndWallMs`.
+         * Never extrapolates outside the segment: audio that was not captured cannot be returned.
          */
-        fun resolveWindowBytes(
-            startMs: Long, endMs: Long, anchorMs: Long,
+        fun resolveSegmentWindowBytes(
+            startMs: Long, endMs: Long,
+            segStartWallMs: Long, segStartByteOffset: Long,
+            segEndWallMs: Long, segEndByteOffset: Long,
             totalWritten: Long, bufferCapacity: Int, bytesPerSecond: Int
-        ): IntRange? {
-            if (totalWritten <= 0L || endMs <= startMs) return null
+        ): WindowResolution {
+            if (endMs <= startMs) return WindowResolution.Failed("end_before_start")
+            if (segEndByteOffset <= segStartByteOffset) return WindowResolution.Failed("empty_segment")
+            if (endMs <= segStartWallMs) return WindowResolution.Failed("window_before_segment")
+            if (startMs >= segEndWallMs) return WindowResolution.Failed("window_after_segment")
 
-            fun byteOffsetFor(tsMs: Long): Long =
-                totalWritten - (anchorMs - tsMs) * bytesPerSecond.toLong() / 1000L
+            val clampedToSegmentStart = startMs < segStartWallMs
+            val effStart = Math.max(startMs, segStartWallMs)
+            val effEnd = Math.min(endMs, segEndWallMs)
 
-            val startByteOffset = Math.max(0L, byteOffsetFor(startMs))
-            val endByteOffset = Math.max(startByteOffset, byteOffsetFor(endMs))
-            val minStartAllowed = Math.max(0L, totalWritten - bufferCapacity)
+            fun byteFor(t: Long): Long =
+                segEndByteOffset - (segEndWallMs - t) * bytesPerSecond.toLong() / 1000L
 
-            if (startByteOffset < minStartAllowed) return null
+            var startByte = byteFor(effStart).coerceIn(segStartByteOffset, segEndByteOffset)
+            val endByte = byteFor(effEnd).coerceIn(startByte, segEndByteOffset)
 
-            val actualEndOffset = Math.min(endByteOffset, totalWritten)
-            val actualBytesToExtract = (actualEndOffset - startByteOffset).toInt()
+            val oldestAvailable = Math.max(0L, totalWritten - bufferCapacity)
+            if (endByte <= oldestAvailable) return WindowResolution.Failed("window_overwritten")
+            if (startByte < oldestAvailable) startByte = oldestAvailable
 
-            if (actualBytesToExtract < MIN_WINDOW_BYTES) return null
-
-            val startIdx = startByteOffset.toInt()
-            val endIdx = startIdx + actualBytesToExtract - 1
-            return startIdx..endIdx
+            if (endByte - startByte < MIN_WINDOW_BYTES) {
+                return WindowResolution.Failed("window_too_small_${endByte - startByte}")
+            }
+            return WindowResolution.Ok(startByte, endByte, clampedToSegmentStart)
         }
     }
 }

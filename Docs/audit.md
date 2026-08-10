@@ -15,9 +15,9 @@
 | **Phonetic Inferred Confidence** | **`0.70`** (matched) **`0.90`** (server-confirmed match) | `BackgroundSttProcessor.kt` (L183) | Client-side fallback path, not the edge function — assigns `0.90f` when a catalog item matches, `0.70f` otherwise. |
 | **Edge Function Client Timeout** | **`30s` (connect) / `60s` (read)** | `SttWorker.kt` (L93-94) | Prevents local HTTP timeout fallback rows. |
 | **Background Polling Window** | **`20 seconds`** (every 750ms), tightened from 30s/2s in ISSUE-046. Server-side inline budget (`process-voice-job/index.ts`): **`20 seconds`** (`INLINE_BUDGET_MS`) before falling back to the old 202+background behavior. | `SttWorker.kt` (`pollForCompletion`), `process-voice-job/index.ts` (`INLINE_BUDGET_MS`) | Drains `stt_job_logs` queue following an HTTP 202 ack -- now the rare exception, not the norm: as of ISSUE-046 the edge function awaits its own pipeline (measured 2-4s) and returns the real result inline on HTTP 200, so this client poll only fires when a job genuinely runs long. |
-| **Phonetic Match Thresholds** | whole-token `<= 0.25`, split part `<= 0.30`, split penalty `0.10`/part, min split evidence `2` phones | `OrderingSegmenter.kt` (`GrammarLatticeDecoder`) & `phonetic.ts` (mirrored constants) | Normalized phonetic distance **per phone**, not raw edit distance. Tuned in ISSUE-020: at the initial `0.34`/`0.35` the decoder accepted `एकलो`→ग्यारह(11) at 0.300 and `ग्लोसोना`→लहसुन at 0.286, swallowing fused tokens as the wrong word. Client and server values must stay in sync — `PhoneticSegmentationTest.kt` is the regression suite for both. |
-| **STT / Chat Model Ids** | Ordered **fallback chains**, not single pins. Chat: `XAI_CHAT_MODEL` env → `grok-4.5` → `grok-4.3` → `grok-4`. Sarvam STT: `SARVAM_STT_MODEL` env → `saaras:v3` → `saarika:v2.5` → `saarika:v2`, with `SARVAM_STT_MODE` (default `verbatim`) sent only for `saaras:v3`. | `process-voice-job/index.ts` (top of file); `term-interpret/index.ts` and `stt-proxy/index.ts` carry their own env-configurable defaults | Rewritten in ISSUE-021. The previous single pins (`grok-2-latest`, `saarika:v2`) had **both** been retired by the provider, so step 4 and the Sarvam leg returned hard errors on every job, silently. The chain advances only on a genuine "wrong model id" error (400/404/422 mentioning deprecation/not-found), never on a timeout or 5xx. `sarvamStt.model` in the trace reports the id that actually served the call, so a silent fallback is visible. **`grok-4.5` / `saaras:v3` were taken from vendor docs, not from a verified live call.** |
-| **Confidence Model** | `confidenceFromMatchNorm`: normalized phonetic distance `0.00` → **0.95**, `0.25` (= `MATCH_NORM_REJECT`) → **0.50**, unmatched → **0.60**. Auto-confirm gate unchanged at **`0.80`**, so in practice only matches within ~`0.075` normalized distance auto-confirm. | `process-voice-job/index.ts` (top of file); `RawItemSegment.itemMatchNorm` in `OrderingSegmenter.kt` / `phonetic.ts` | Added in ISSUE-022. Previously `isCatalogMatched ? 0.95 : 0.60` — a boolean that discarded the distance the matcher had just computed, so a token on the reject line (`0.250`) scored the same as an exact hit and auto-confirmed. `MATCH_NORM_REJECT` **must** equal `WHOLE_TOKEN_MAX_NORM` in the segmenters. Constants are reasoned, not corpus-tuned — expect to adjust against real review-queue volume. |
+| **Phonetic Match Thresholds** | whole-token `<= 0.25`, split part `<= 0.30`, split penalty `0.10`/part, min split evidence `2` phones, `MIN_MARGIN_PHONE_EDITS = 1.0` (replaces dead `TAU_MARGIN = 0.08`), `DISCOURSE_PARTICLES` stoplist | `OrderingSegmenter.kt` (`GrammarLatticeDecoder`) & `phonetic.ts` (mirrored constants) | Normalized phonetic distance **per phone**, not raw edit distance. Updated in ISSUE-103 to scale ambiguity margins by key length (`MIN_MARGIN_PHONE_EDITS = 1.0`) and drop Hindi discourse particles (`हाँ`, `के`, `की`, etc.) during segmentation. |
+| **STT / Chat Model Ids** | Ordered **fallback chains**, not single pins. Chat: `XAI_CHAT_MODEL` env → `grok-4.20-0309-non-reasoning` → `grok-4.5` → `grok-4.3` → `grok-4`. Sarvam STT: `SARVAM_STT_MODEL` env → `saaras:v3` → `saarika:v2.5` → `saarika:v2`, with `SARVAM_STT_MODE` (default `verbatim`) sent only for `saaras:v3`. | `process-voice-job/index.ts` (top of file); `term-interpret/index.ts` and `stt-proxy/index.ts` carry their own env-configurable defaults | Rewritten in ISSUE-021; updated in ISSUE-117. Step 4 structured extraction uses fast non-reasoning model `grok-4.20-0309-non-reasoning` at chain head (gated against reasoning_effort parameter). Chain advances on 400/404/422 deprecation or parameter rejection errors. `sarvamStt.model` in the trace reports the id that actually served the call. |
+| **Confidence Model** | `confidenceFromMatchNorm`: normalized phonetic distance `0.00` → **0.95**, `0.25` (= `MATCH_NORM_REJECT`) → **0.50**, unmatched → **0.60**, scaled by `infoFactor = literalExact ? 1.0 : Math.min(1, keyLength / 4)` (`RELIABLE_KEY_PHONES = 4`). Auto-confirm gate unchanged at **`0.80`**. | `process-voice-job/index.ts` (top of file); `RawItemSegment.itemMatchNorm` in `OrderingSegmenter.kt` / `phonetic.ts` | Added in ISSUE-022; updated in ISSUE-103. `confidenceFromMatchNorm` now scales quality by key information content (`keyLength / 4`), capping non-literal 2-phone matches at 0.725 (review queue) while preserving 0.95 auto-confirm for literal exact surface matches (`literalExact`). |
 | **Sale Plausibility** | SALE mode: GRAM/ML `<10` or `>5000`; KG/LITRE `>200`; PIECE/PACKET/DOZEN `>500`; quantity `<=0`; total `< ₹5` (`MIN_PLAUSIBLE_SALE_VALUE`). STOCK mode: KG/LITRE `>5000`; PIECE/PACKET `>10000`; GRAM/ML `>100000`; no minimum total floor. | `SalePlausibility.kt` & `implausibilityReason()` in `process-voice-job/price_intent.ts` (mirrored) | Added in ISSUE-022; expanded for `STOCK` intent mode in ISSUE-042. **Never blocks a sale or stock delivery** — only withholds auto-confirm and routes to review with a reason string in the trace. Wired into both server and client commit gates. |
 | **Default Item Vocabulary** | **192 entries**, both scripts, Kotlin and TypeScript lists verified identical | `OrderingSegmenter.DEFAULT_ITEM_VOCAB` & `phonetic.ts` `DEFAULT_ITEM_VOCAB` | Grown from 35 in ISSUE-022: `अमचूर` was absent everywhere, so the matcher could only map it to the nearest known word ("Jeera"). A word absent from this list cannot be recognized, only mis-resolved. Breadth raises collision risk, which is exactly why the distance-aware confidence model above must ship with it. |
 | **Distance-Word Guard** | `DISTANCE_UNIT_TOKENS` (kilometer/meter/centimeter/mile/foot + Devanagari), whole-token read priced at `2.5`; terminal `endCost` = ITEM `0.0`, NUM/UNIT `0.6` | `OrderingSegmenter.kt` & `phonetic.ts` (mirrored) | Added in ISSUE-021. These tokens were previously **inside `UNIT_SET`**, where an exact match suppressed split expansions and swallowed the item entirely. They must never be re-added to `UNIT_SET`. Segments recovered from such a token are `isSanityFlagged` and must not auto-confirm. |
@@ -28,18 +28,44 @@
 | **Per-item commit gate** | Each line independently gated (was `saleItems.every(...)` — one weak item zeroed the whole batch) | `process-voice-job/index.ts` (`isCommittable`, `committedSaleEntries`/`pendingSaleEntries`) | Added in ISSUE-029. `finalStatus`: `AUTO_CONFIRMED` (all lines committed) → `PARTIALLY_CONFIRMED` (some) → `RATE_UPDATED` (only fully-resolved rate updates) → `PARSED`. |
 | **Per-segment price intent** | `classifySegmentPriceIntent()` scoped to ONE `RawItemSegment`, not the whole transcript | `price_intent.ts`; `RawItemSegment.spokenPrice`/`hasLeadingQty`/`rupeeWordPresent` in `phonetic.ts` | Added in ISSUE-029, replacing a single `detectPriceIntent(chosenRaw)` call whose one answer used to apply to every item in a multi-item utterance. `detectPriceIntent` is retained only as a diagnostic-only `wholeUtterancePriceIntentLegacy` trace field. |
 | **Segmenter-vs-AI item name resolution** | `resolveItemName()`: segmenter overrides the AI's name when `itemMatchNorm <= 0.08` (`SEGMENTER_OVERRIDE_MAX_NORM`) **and** `normalizedDistance` between the two names exceeds `0.15` (`NAME_AGREEMENT_MAX_NORM`) | `item_resolution.ts` | Added in ISSUE-030. **Must use `normalizedDistance`, never exact `phoneticKey` string equality** — cross-script spellings of the same word (e.g. `बैंगन`/`Baingan`) sit at ~0.083 due to how `devanagariToLatin` encodes the ऐ diphthong, which is comfortably below the 0.15 agreement threshold; a genuine mis-hearing (`अमचूर`/`Angoor`) sits at 0.250, comfortably above it. Not gated on catalog match — the override must fire even when the AI's wrong name happens to be a real stocked item. |
-| **Learned Parse Memory promotion/demotion** | Promote at `observations >= 2` distinct `job_id`s, **all** corroborated by the segmenter, `corrections = 0`. Demote (reset to `observations=0`) on canary mismatch / voided transaction / catalog change; `permanently_blocked` after 2 demotions. Canary sample rate `LEARNED_PARSE_CANARY_RATE` env, default **`0.25`**. `DEFAULT_LEARNED_PARSE_SHOP_ID = '00000000-0000-0000-0000-000000000001'` (sentinel shop; see ISSUE-032 — production `shop_id` is always NULL). | `supabase/migrations/20260728010000_learned_parses_and_void.sql` (`record_learned_parse_observation`/`reset_learned_parse`); `process-voice-job/index.ts` (memory lookup block) | Added in ISSUE-031. Deliberately faster warm-up than the originally-proposed 3-observations/2-distinct-days design, per an explicit user request to prioritize learning speed — the corroboration + canary mechanisms are what make the shorter warm-up safe, not a relaxation of accuracy standards. `learned_parses.canonical_items` must never include `price_at_sale`/`total`/`confidence` — only `item_name`/`quantity`/`unit`/`price_intent` are ever cached. |
+| **Learned Parse Memory promotion/demotion** | Promote at `observations >= 2` distinct `job_id`s, **all** corroborated by the segmenter, `corrections = 0`. Demote (reset to `observations=0`) on canary mismatch / voided transaction / catalog change; `permanently_blocked` after 2 demotions. Canary sample rate `LEARNED_PARSE_CANARY_RATE` env, default **`0.25`**. `DEFAULT_LEARNED_PARSE_SHOP_ID = '00000000-0000-0000-0000-000000000001'` (sentinel shop; see ISSUE-032). **Superseded in part by ISSUE-114 (2026-08-09):** production `shop_id` is no longer always NULL — `ensure_shop` provisioning populates it (`2f992a33-…`), so the sentinel is legacy only and all 32 sentinel rows were merged away by migration `20260809010000`. `catalog_fingerprint` is now a **scoped** hash of only the catalog entries a memo names (`computeScopedCatalogFingerprint`), is **nullable**, and `NULL` means "legacy row, revalidate on next use". | `supabase/migrations/20260728010000_learned_parses_and_void.sql` (`record_learned_parse_observation`/`reset_learned_parse`); `process-voice-job/index.ts` (memory lookup block) | Added in ISSUE-031. Deliberately faster warm-up than the originally-proposed 3-observations/2-distinct-days design, per an explicit user request to prioritize learning speed — the corroboration + canary mechanisms are what make the shorter warm-up safe, not a relaxation of accuracy standards. `learned_parses.canonical_items` must never include `price_at_sale`/`total`/`confidence` — only `item_name`/`quantity`/`unit`/`price_intent` are ever cached. |
 | **Catalog-Learning-From-History threshold** | `CATALOG_LEARNING_THRESHOLD = 3` distinct `job_id`s before an unmatched item auto-enters `catalog_items` at price `0`. Item identity = phonetic-key bucket **AND** normalized literal Levenshtein `<= 0.15` (`catalog_learning_name_agreement_max()`). | `process-voice-job/index.ts` (top of file); `record_unmatched_item_observation()` in `supabase/migrations/20260728020000_...sql` + `20260728030000_...sql` / `schema.sql` §10 | Added in ISSUE-033, identity check corrected in ISSUE-034. Threshold is higher than Learned Parse Memory's 2 because this writes a standing, user-visible catalog row rather than a cache entry. **`phoneticKey` alone must NEVER be used as the identity key here** — it is deliberately lossy and collides genuinely different items at distance 0.000 (`Kela`/`Kheera` → `KILA`), which would file a banana as a cucumber; the literal-name second stage is what prevents that. The 0.15 is a *literal* distance and is not the same metric as `item_resolution.ts`'s identically-valued `NAME_AGREEMENT_MAX_NORM` (phonetic) — do not merge them. |
 | **Catalog pull/merge (server→client)** | `SyncEngine.pullCatalogFromCloud()`, run **last** in `syncAllUnsynced()`. Never overwrites a local `synced = false` row; otherwise last-write-wins on `updatedAt`; inserts unknown ids; skips server rows whose name already exists locally; never deletes locally. | `SyncEngine.kt`, `CloudSyncManager.fetchCatalogFromCloud()` | Added in ISSUE-035. The **only** server→client read path in the app — everything else is push-only. Exists because two server paths originate catalog data the phone cannot otherwise see: ISSUE-033's auto-add and ISSUE-026's server-side `RATE_UPDATE` price write. `fetchCatalogFromCloud` returns `null` (not an empty list) on failure specifically so a dropped connection can never be mistaken for an empty catalog. |
 | **EntityResolver Thresholds** | `THRESHOLD = 0.80`, `MARGIN = 0.15` | `EntityResolver.kt` | Added in ISSUE-037. `EntityResolver` scores candidates across phonetic name (0.50), keyword (0.30), exact code/phone (0.80), recency (0.05), and frequency (0.05). Returns `AUTO_ASSIGN` if `top1 >= 0.80 && (top1 - top2) >= 0.15`, else `ASK`. Pool non-empty guarantee enforced. |
-| **Room Database Version** | **`version = 23`** | `AppDatabase.kt` (`MIGRATION_22_23`) | Updated in ISSUE-060. Added `alert_dismissals` table (`AlertDismissal` entity, `AlertDismissalDao`). |
-| **RollingAudioBuffer Invariants & Suppression Watchdog** | `MIN_WINDOW_BYTES` = **9600** (~300ms), `MAX_SUPPRESSION_MS` = **20,000ms** (20s watchdog), `bufferCapacity` = **3,840,000 bytes** (120s @ 16kHz 16-bit mono), `stopRollingBuffer` join timeout = **500ms** | `RollingAudioBuffer.kt` | Added in ISSUE-061 / ISSUE-063. Enforces ring buffer addressing invariant `writeHead == totalBytesWritten % bufferCapacity`, auto-clears TTS suppression leaks after 20s, and blocks up to 500ms on thread join for mic release. |
+| **Room Database Version** | **`version = 28`** | `AppDatabase.kt` (`MIGRATION_27_28`) | Updated on August 10, 2026 for Item & Customer Photo Identity (`imagePath` column on `catalog_items`). |
+| **RollingAudioBuffer Invariants, Segment Ledger & Coalescing** | `MIN_WINDOW_BYTES` = **9600** (~300ms), `MIN_USABLE_WINDOW_MS` = **400ms**, `maxGroupAgeMs` = **5000ms**, `MAX_SUPPRESSION_MS` = **20,000ms** (20s watchdog), `bufferCapacity` = **3,840,000 bytes** (120s @ 16kHz 16-bit mono), `stopRollingBuffer` join timeout = **1500ms**, `smartStart()` returns `Boolean`. `resumeByteOffset` removed in favor of `CaptureSegment` ledger. | `RollingAudioBuffer.kt`, `PttBurstCoalescer.kt`, `PttMicButton.kt` | Updated in ISSUE-085..ISSUE-088. Replaced single global anchor with `CaptureSegment` ledger, added typed `ExtractionResult` failure reasons, process-lifetime `PttCaptureScope`, and epoch resets. |
+| **STT Race Minimum Score** | **`FAST_STT_MIN_SCORE = 5`** | `process-voice-job/index.ts` | Added in ISSUE-100. Minimum transcript score for the STT race to consider answering on one provider alone without awaiting the second. **Live data 2026-08-09: the shortcut fired on only 17/260 jobs** because the observed winning score is typically 4 (`declineReason: "winner_score_4_below_5"`). Not changed — lowering it trades accuracy for latency and needs its own evidence. |
+| **AI Chat Timeout** | **`AI_CHAT_TIMEOUT_MS = 12000`** (env-tunable), was `45000` | `process-voice-job/index.ts` | Changed in ISSUE-112. 45s was a tail no shopkeeper can wait through: job `76892c70-6d5f-4d87-b105-6bf7bdb08a07` spent **27.2 s in a SUCCESSFUL grok-4.5 chat call** (`sttResolvedAtMs` 1,288 → `parseResolvedAtMs` 28,497) with re-decode off, so this is the chat call's own tail, not an STT artifact. Past 12s the existing `segmenter_fallback` path is strictly better than making the user wait — it still books to the review queue. |
+| **Fast Path Spoken-Price Admission** | Fast path now admits **`BULK_SALE_TOTAL` only**: `segments.length === 1` AND `hasLeadingQty` AND `rupeeWordPresent` AND `spokenPrice > 0` AND `quantity > 0` AND `detectPriceIntent(chosenRaw).priceIntent === 'BULK_SALE_TOTAL'` AND `hasAmbiguousPriceNumber === false` | `process-voice-job/index.ts` (`buildFastPathFrom`) | Added in ISSUE-111, replacing the blanket `if (seg.spokenPrice != null \|\| seg.rupeeWordPresent) return no('spoken_price_present')`. `RATE_UPDATE` remains excluded (it mutates catalog prices, and the `hasLeadingQty` gate already bars it); `AMBIGUOUS_UNTRUSTED` remains excluded (no rupee word). Multi-segment stays excluded deliberately — cross-line price bleed is what system-prompt rule 8 exists to prevent. |
+| **Fast Path Key Max Distance** | **`FAST_PATH_KEY_MAX_NORM = 0.10`** | `process-voice-job/index.ts` (`buildFastPathFrom`) | Added in ISSUE-099. Tight phonetic distance fallback threshold to bridge Devanagari/Roman schwa discrepancies (e.g. *अदरक* `ATALAK` vs *Adrak* `ATLAK`) when exact key equality fails. Narrows the instance; class survives. |
+| **Parse Inspector Sample Rate** | **`PARSE_INSPECTOR_RATE = 1.0`** | `process-voice-job/index.ts` | Added in ISSUE-101. Shadow verification sample rate for AI-skipped jobs against Grok chat model (runs non-blocking in background). |
+| **AI Evidence Ratio Floor** | **`MIN_AI_EVIDENCE_RATIO = 0.75`** | `item_resolution.ts` & `process-voice-job/index.ts` | Added in ISSUE-104. Minimum ratio of heard surface phones to proposed AI item name phones. Blocks AI catalog binding when deterministic resolution is UNKNOWN and heard phones are insufficient to justify the AI item name (e.g. "आ" -> Aaloo). |
+| **Max Unidentifiable Residue Phones** | **`MAX_UNIDENTIFIABLE_RESIDUE_PHONES = 2`** | `item_resolution.ts` & `process-voice-job/index.ts` | Added in ISSUE-105. Maximum phones in stripped transcript residue (after quantity, unit, price, and non-catalog discourse particles are removed) at or below which zero-segment AI item proposals are treated as uncorroborated. |
+| **Numeral Rejoin Thresholds** | **`MERGE_MAX_NORM = 0.22`**, **`MERGE_MIN_VALUE_MARGIN = 0.10`**, **`NUMERAL_KEYTERM_BUDGET = 25`** | `phonetic.ts` (`rejoinFragmentedNumerals`), `OrderingSegmenter.kt`, `process-voice-job/index.ts` | Added in ISSUE-106. Rejoins two-token STT fragmentations of Hindi compound numerals 21-99 ("ते तीस" -> 33) in phonetic key space. Rejoins with value margin < 0.10 are flagged for review and barred from auto-confirm. |
 
 ---
 
 ## 2. Living Issues Log (Dated History)
 
 ### 🔴 OPEN ISSUES
+
+#### [ISSUE-124] [2026-08-10] The Entire Instrumented Test Source Set Has Been Un-compilable — `androidx.test:rules` Is Missing From `build.gradle.kts`
+- **Symptom**: `./gradlew.bat :app:compileDebugAndroidTestKotlin` fails:
+  ```
+  e: app/src/androidTest/java/com/voicetoinvoice/app/audio/RollingBufferRestartTest.kt:9:22
+       Unresolved reference 'rule'.
+  e: …RollingBufferRestartTest.kt:22:32  Unresolved reference 'GrantPermissionRule'.
+  ```
+  Because Kotlin compiles the source set as a unit, **one unresolved import blocks every instrumented test in the project**, not just this file.
+- **Root Cause**: `RollingBufferRestartTest.kt` imports `androidx.test.rule.GrantPermissionRule`, which ships in the **`androidx.test:rules`** artifact. `app/build.gradle.kts`'s `androidTestImplementation` block declares `composeBom`, `compose.ui.test.junit4`, `room-testing`, `kotlinx.coroutines.test`, `androidx.test.core`, `androidx.test.ext.junit`, `androidx.test.runner` and `androidx.test.espresso.core` — **and no `rules` artifact**. `androidx.test:runner` does not transitively provide `GrantPermissionRule`.
+- **How it surfaced**: found while trying to compile the new ISSUE-118 regression tests. `RollingBufferRestartTest.kt` is **not** modified by any work in this session (`git status --porcelain app/src/androidTest/` lists only `QuestionTemplatesTest.kt` as modified and `QuestionTemplatesItemSalesTest.kt` as new), so this predates 2026-08-10 — it was simply never noticed, because nothing in the recorded history ever ran `connectedAndroidTest`.
+- **Impact**: **every instrumented test in this repo is currently unrunnable**, including all Room in-memory DB tests — which `app/build.gradle.kts:125-128` designates as the *only* place Room DB behaviour is tested. So the project's Room layer has no executable test coverage at all right now, and the ISSUE-118 regression suite cannot run even with a device attached. This joins the already-documented broken `MainScreenTest.kt` (see "Known quirks" in `CLAUDE.md`) as a second, more damaging instance of the same rot.
+- **Recommended fix** (one line, deliberately NOT applied here — it is a dependency decision outside every scoped plan in flight, and adding it would still only buy *compilation*, since running instrumented tests needs a device this session does not have):
+  ```kotlin
+  androidTestImplementation("androidx.test:rules:1.5.0")   // or add `rules` to libs.versions.toml
+  ```
+  After adding it, re-run `./gradlew.bat :app:compileDebugAndroidTestKotlin` to confirm the source set compiles, then `./gradlew.bat connectedAndroidTest` with the phone attached to actually execute the ISSUE-118 assertions.
+- **Status**: OPEN — diagnosed, fix identified, **not applied**.
 
 #### [ISSUE-004] [2026-07-24] Acoustic Consonant Blending on Unlisted Items
 - **Symptom**: Spoken orders like `"तीन किलो बैंगन"` transcribed as `"Tinggal benggan"`. When consonant shifts are extreme (e.g. `क` $\leftrightarrow$ `ग`, `ब` $\leftrightarrow$ `प`), both STT engines output phonetically noisy text.
@@ -51,13 +77,43 @@
   4. [2026-07-26, see ISSUE-020] Root cause of this class substantially addressed: matching moved off orthographic edit distance onto a script-agnostic **phonetic key space** with vowel-weighted distance, and the splitter now runs inside a grammar-aware Viterbi lattice. The "Tinggal benggan" example in this issue's symptom is the same failure as ISSUE-020's `"tinggal sebab"` — both are STT rendering Hindi phonetics in another language's spelling, which the old Devanagari-only vocabulary could not match at any edit distance.
 - **Status**: OPEN — narrowed, not closed. ISSUE-020 removes the structural blindness (cross-script matching and fused-token splitting now work), but the phonetic collapse set is hand-tuned against observed traces rather than derived from a confusion matrix, and no live post-deploy verification has happened yet. Keep monitoring production transcripts; close this only once a batch of real recordings confirms the phonetic lattice holds up.
 
-#### [ISSUE-018] ✅ CLOSED 2026-07-30 by ISSUE-050 — Test-Only Broadcast Receiver Exported Unconditionally in `UpiNotificationListenerService` — Allows Any App to Inject Fake Transactions or Fake UPI Reconciliation
-- **Symptom**: `UpiNotificationListenerService.onCreate()` registers a `BroadcastReceiver` for two custom actions — `com.voicetoinvoice.app.SEED_TEST_TX` and `com.voicetoinvoice.app.TEST_UPI` — apparently added to let a developer drive the UPI-reconciliation flow via `adb shell am broadcast` without a real Paytm/PhonePe/GPay notification. The receiver is registered with `RECEIVER_EXPORTED` on API 33+ (and is implicitly exported pre-33), and is **not** gated behind any debug/build-type check (`app/build.gradle.kts` has `buildFeatures.buildConfig = false`, so a `BuildConfig.DEBUG` guard isn't even wired up).
-- **Root Cause**: Debug/manual-test scaffolding was left wired into the always-running production code path instead of being removed or gated behind a debug-only build flag.
-- **Impact**: Any other app installed on the shopkeeper's phone (or an attacker with `adb` access) can, without any permission check:
-  1. Broadcast `SEED_TEST_TX` with an `amount` extra to insert a fake `"Test Pyaz"` CASH sale directly into the real `transactions` ledger (which then syncs to Supabase).
-  2. Broadcast `TEST_UPI` with `title`/`text` extras containing a rupee amount and a keyword like "paytm"/"phonepe"/"gpay" to falsely mark a real pending/Udhaar sale as `paymentMode = UPI` (i.e. spoof a payment that never happened).
-- **Status**: OPEN — flagged during a general app review, not yet fixed pending a decision on whether the shopkeeper/dev still needs this for manual testing. Recommended fix: delete the test receiver entirely (it has no legitimate place in a shipped ledger app), or at minimum register it with a signature-level `broadcastPermission` so only this app can trigger it.
+- **[2026-08-10] Confusion-matrix pass run. Outcome: NO code change, and the issue's stated premise is now known to be wrong.**
+
+  A dual-engine disagreement analysis was run over all 240 jobs carrying both a Grok and a Sarvam transcript, on the theory (from `Docs/visual_ledger_and_assistant_plan.md` §14) that where two independent acoustic models disagree, the disagreement *is* a phone-confusion pair worth adding to the collapse set. **That theory did not survive contact with the data.**
+
+  **Measured, 240 pairs where both engines returned text:**
+
+  | | count | share |
+  |---|---|---|
+  | engines agreed | 49 | 20% |
+  | engines disagreed | 191 | 80% |
+  | …of those, **Sarvam's text was adopted** | 148 | 77% of disagreements |
+  | …of those, Grok's text was adopted | 25 | 13% of disagreements |
+  | **Grok returned NO Devanagari at all while Sarvam did** | 61 | **25% of all jobs** |
+
+  **This contradicts the Symptom line above.** ISSUE-004 states "**both** STT engines output phonetically noisy text." That is not what production shows. Sarvam is adopted over Grok on disagreements by roughly **6:1**, and on a quarter of all jobs Grok leaves Hindi entirely — real observed outputs include `"dosa kelalaian tu"` (Malay) for `दो सौ किलो आलू`, `"das que lo hago"` (Spanish) for `दस किलो आलू`, `"Să tragă o daniea"` (Romanian) for `सत्रह किलो धनिया`, and `"Charcoal"` for `चार किलो आलू`. Those are **whole-utterance decoder failures, not phone-level confusions** — they cannot be repaired by any collapse rule, and averaging them into a confusion matrix would poison it with noise. A second large share of "disagreements" are pure formatting (`"2 किलो"` vs `"दो किलो"`, `"50 किलो"` vs `"पचास किलो"`), which are not confusions at all.
+
+  **Residual genuine near-misses**, after excluding the two categories above and measuring each against the live `phoneticKey` (normalized distance, accept threshold 0.25):
+
+  | pair | keys | dist | already collapsed? |
+  |---|---|---|---|
+  | `भिंडी` / `बिंडी` | `PINTI` / `PINTI` | 0.0000 | yes (bh→b) |
+  | `धनिया` / `दनिया` | `TANIA` / `TANIA` | 0.0000 | yes (dh→d) |
+  | `तेहतीस` / `देतीस` | `TIATIS` / `TITIS` | 0.0833 | yes (t↔d) |
+  | `अदरक` / `अद्रक` | `ATALAK` / `ATLAK` | 0.0833 | yes |
+  | `बादाम` / `अदाम` | `PATAN` / `ATAN` | 0.2000 | yes |
+  | `टिंडा` / `इंडा` | `TINTA` / `INTA` | 0.2000 | yes |
+  | `छाछ` / `छांच` | `CAC` / `CANC` | 0.2500 | yes (at the boundary) |
+  | **`सेब` / `सेव`** (apple) | `SIP` / `SIV` | **0.3333** | **NO — missed** |
+  | `छाछ` / `छात` | `CAC` / `CAT` | 0.3333 | NO — missed |
+
+  So the existing collapse set already absorbs seven of nine observed near-misses. Only two escape.
+
+  **Deliberately NOT changed, and why.** The `सेब`/`सेव` miss is a real ब↔व (b↔v) confusion and is well attested in Indic speech generally — but it appears **once** in 240 jobs, far below the ≥3-occurrence bar this issue's own remediation plan sets. Collapsing `P`(p/b/f) into `V`(v/w) is an app-wide change to the key space used by *every* item match, and justifying it on a single observation would be exactly the "hand-tuned against observed traces" practice this issue exists to criticise. The `छाछ`/`छात` miss is c↔t, a genuinely different consonant class; collapsing it would merge unrelated words wholesale. **Neither change is justified by current evidence, so neither was made.**
+
+  **What this changes going forward**: the highest-value lever for ISSUE-004 is not the collapse set — it is that one of the two STT engines is unreliable for Hindi and the pipeline is already (correctly) routing around it via `transcriptScores`. Whether Grok STT is worth its latency and cost at a 13% adoption rate is a **separate open question**, not resolved here, and should be raised as its own issue rather than folded into this one.
+
+  **Watch item for the next pass**: re-run the same analysis once ≥3 independent `सेब`/`सेव`-class observations exist. If b↔v clears the bar, the change belongs in `PhoneticKey.kt` **and** `phonetic.ts` together (mirrored), with `PhoneticSegmentationTest.kt` / `phonetic_test.ts` fixtures added on both sides.
 
 #### [ISSUE-032] [2026-07-28] RLS Disabled on 3 Production Tables; `shop_id` Declared `NOT NULL` in `schema.sql` but Is Actually NULL on Every Live Row
 - **Symptom**: Discovered incidentally while building ISSUE-031 (Learned Parse Memory), via the Supabase advisor and a direct query against project `lyowklxsbfznnqridtgr`:
@@ -71,10 +127,709 @@
 - **Symptom**: A stock-in recording at 2026-07-30 14:08:56 IST triggered two `202` responses from `process-voice-job` (one immediate, one from a WorkManager retry at 14:11:03) but `stt_job_logs` contains **no row at all** for that `job_id` — not `QUEUED`, not `ERROR`, nothing. Locally the job shows `REVIEW NEEDED / Unrecognized Item / 1.0 PACKET / ₹0`.
 - **Root Cause**: Not diagnosed. The QUEUED-placeholder `upsert` at `index.ts` (immediately after audio storage upload) had its error silently unchecked prior to ISSUE-046's fix — that fix (now logging `queuedErr` if present) is instrumentation for the *next* occurrence, not a fix for this one. ISSUE-045's client-side `clientTrace` (always persisted locally regardless of server outcome) is the other half of that instrumentation.
 - **Status**: OPEN — instrumented, not diagnosed. Do not close until a repeat occurrence is caught by either the new `queuedErr` console log (check Supabase edge-function logs for `Failed to write QUEUED placeholder`) or the local job's `diagnosticTraceJson.client` block (check for `outcome: "exception"` or an unusually short `upload_ms`). If the case recurs with neither logging anything, the failure is happening somewhere not yet covered (e.g. the storage upload itself, or the request never reaching the function at all) and needs broader instrumentation.
+- **[2026-08-10] Closure criterion — added because "it hasn't happened lately" is not a diagnosis.**
+  - **Status check run 2026-08-10** (11 days after the single observed occurrence): status distribution across all 399 `stt_job_logs` rows is `AUTO_CONFIRMED 154, PARSED 118, FAILED 111, CONFIRMED 8, PARTIALLY_CONFIRMED 3, RATE_UPDATED 2, ERROR 2, CANCELLED 1` — **zero `QUEUED` rows**, and the newest `FAILED` is 2026-08-05. No recurrence, and the ISSUE-046 instrumentation has caught nothing in 11 days.
+  - **This issue stays OPEN.** Absence of recurrence is not a fix — the failure was never explained, and a silent-loss bug that appears once can appear again. Do not close it on the strength of a quiet fortnight.
+  - **Close only when** either (a) **30 consecutive days** pass with the monthly check below returning 0 *and* no new report of a recording vanishing, or (b) a recurrence is caught and actually diagnosed by the `queuedErr` log or a client trace showing `outcome: "exception"`.
+  - **Monthly check** (run this, don't assume):
+    ```sql
+    SELECT count(*) AS stuck_queued
+    FROM stt_job_logs
+    WHERE status = 'QUEUED' AND created_at < now() - interval '1 hour';
+    ```
+    Non-zero = the placeholder wrote but the pipeline never completed — that is this bug recurring, with the row preserved this time. Capture the `job_id` before anything else.
 
 ---
 
 ### 🟢 RESOLVED ISSUES
+
+#### [ISSUE-121] [2026-08-10] WS-K: Expenses & Net Profit
+- **Symptom**: Every profit calculation displayed in the app was gross profit only, silently ignoring expenses such as rent, electricity, salary, transport, supplies, and tea.
+- **Root Cause**: No entity, DAO, or UI existed for tracking expenses, and `ProfitCalculator` had no concept of expenses or net profit.
+- **Resolution**:
+  1. Created `ExpenseRecord` entity (`expenses` table) with soft-delete (`voided`), shopId, category (`RENT`, `ELECTRICITY`, `SALARY`, `TRANSPORT`, `SUPPLIES`, `TEA`, `OTHER`), amount, note, timestamp, source, and synced flag.
+  2. Created `ExpenseDao` with queries for range totals, category totals, unsynced expenses, insertion, and voiding.
+  3. Added Room `MIGRATION_28_29` in `AppDatabase.kt` and updated DB version to 29.
+  4. Updated `ProfitCalculator` and `ProfitResult` to compute `netProfit = grossProfit - expenses` and set `hasExpenseData = expenses > 0.0`. Gross profit's meaning remains unchanged and is explicitly labelled "मुनाफ़ा (कच्चा)", while net profit is a new separately labelled figure "मुनाफ़ा (खर्चा घटाकर)".
+  5. Created icon-first `ExpenseScreen.kt` with category grid (≥ 96.dp tiles with Hindi labels), numeric entry dialog, today's expense list with voiding, and total expense footer.
+  6. Added `EXPENSE` screen to `Screen` enum in `MainActivity.kt` and entry point button in `ReportsScreen.kt`.
+  7. Deliberately deferred: voice expense capture triggers, cloud sync of expenses, and cash book / cash-in-hand.
+- **Defect found on review, after the pass reported "Deviations: None" — and it originated in the PLAN, not the implementation.** The scoped plan specified the soft-delete DAO method as `suspend fun void(id: String)`. Kotlin accepts `void` as an identifier; **Java does not** — and Room's KSP processor emits a Java `ExpenseDao_Impl`. The build failed with:
+  ```
+  ExpenseDao_Impl.java:37: error: ExpenseDao_Impl is not abstract and does not
+      override abstract method void(String,Continuation<? super Unit>) in ExpenseDao
+  ```
+  (the tell is the method with no readable name — `void(String,…)`). Renamed to `voidExpense`, matching the existing `TransactionDao.voidTransaction` convention, and the single call site in `ExpenseScreen.kt:312` was updated. A comment in `ExpenseDao.kt` records why the name cannot be `void`, so it is not "simplified" back later.
+- **Verification Date**: 2026-08-10.
+  - **Verified**: `./gradlew.bat :app:assembleDebug` → **BUILD SUCCESSFUL**, after the rename. The first run **FAILED** with the codegen error above — which is the only reason it was caught, and why a Room DAO must never be signed off on inspection alone: this class of error appears in *generated Java*, not in the Kotlin source, so the file reads perfectly correct.
+  - **Verified by direct read**: `version = 29` (`AppDatabase.kt:37`), `ExpenseRecord::class` in the entities list (:35), `abstract fun expenseDao()` (:59), `MIGRATION_28_29` defined (:801) and registered as the final entry of `.addMigrations(...)` (:935), continuing an unbroken 1→29 chain. **No `fallbackToDestructiveMigration()`** anywhere — checked explicitly, since on a schema bump that call is the difference between adding a table and wiping the shopkeeper's ledger.
+  - **Verified by direct read — the trust-critical rule held**: `ReportsScreen.RevenueProfitCard` renders the pre-existing figure as **"मुनाफ़ा (कच्चा)"** with the value still `data.profit.grossProfit` (:340-341), and adds **"मुनाफ़ा (खर्चा घटाकर)"** as a *separate* row gated on `hasExpenseData` (:348-358). The number the shopkeeper has been reading did not change meaning; a second, differently-labelled number was added beside it.
+  - **NOT verified**: no expense has ever been entered. The `expenses` table has never been written to, `MIGRATION_28_29` has never run against a real v28 database, and net profit has never been rendered on screen (it is invisible until `hasExpenseData` is true, which requires a real expense).
+- **Status**: CODE COMPLETE + COMPILES, **NEVER EXERCISED — no expense recorded, migration never run**
+
+#### [ISSUE-118] [2026-08-10] C-PART-2: Assistant Comprehension for Item-Scoped Sales Queries
+- **Symptom**: Spoken item-scoped sales questions like `"आज कितने आलू बिके"` (trace job `472d4af1-e438-4f1f-a398-67e240d47362`, 2026-08-04) were correctly classified as `READ_QUERY` by `IntentRouter`, but `QuestionTemplates.answerQuestion` answered them wrongly with total shop revenue (`ResponseComposer.formatDailySales(...)`) instead of item-specific sales.
+- **Root Cause**: `QuestionTemplates` had no item-scoped sales branch. `REVENUE_WORDS` contains `"बिका"`, which phonetically matched `"बिके"` in `"आज कितने आलू बिके"`, swallowing the question and returning whole-shop revenue.
+- **Resolution**:
+  1. Added `getItemSalesInPeriod(itemNameQuery, startMs, endMs)` to `LedgerQueries.kt` which reuses `findCatalogItem` for exact/substring/phonetic matching and queries `db.transactionDao().getItemSalesBetween(startMs, endMs)`.
+  2. Added `formatItemSales(itemName, qty, revenue)` to `ResponseComposer.kt`.
+  3. Added branch 3 `Item-scoped sales` in `QuestionTemplates.kt` immediately before the `REVENUE_WORDS` branch to catch item-scoped sales questions when a named item resolves, falling through to generic revenue when un-named. Renumbered remaining branches 4 through 9.
+  4. Added `clientTrace.put("assistant_tier", assistantTier)` instrumentation in `SttWorker.kt`.
+  5. Added `QuestionTemplatesItemSalesTest.kt` regression test suite.
+- **Scope note**: Fixes item-scoped "how much of X sold" questions. Does **not** fix any question shape outside the nine deterministic branches (those still return `formatUnrecognized()`; the AI fallback tier was deliberately not built).
+- **Declared deviation, reviewed and accepted**: the regression tests were placed under `app/src/androidTest/…` rather than `app/src/test/…`. Checked and **correct** — `app/build.gradle.kts:125-128` states plainly that Room in-memory DB tests run as instrumented tests because Robolectric has no android-all jar for compileSdk 36. The plan asked for the wrong directory; the implementer was right to move it and right to declare it.
+- **Consequence of that placement, and it matters**: `androidTest` requires a connected device or emulator. **These regression tests have therefore never been executed.** They compile, and nothing more. Do not read "regression test suite added" as "regression verified" — the assertions in that file are unproven until `./gradlew.bat connectedAndroidTest` runs against a device.
+- **Verification Date**: 2026-08-10.
+  - **Verified**: `./gradlew.bat :app:assembleDebug` → **BUILD SUCCESSFUL**. Main sources compile.
+  - **NOT verified — the new tests do not even compile, and the cause is pre-existing.** `./gradlew.bat :app:compileDebugAndroidTestKotlin` **FAILS**, but *not* on the new file: it fails on `app/src/androidTest/java/com/voicetoinvoice/app/audio/RollingBufferRestartTest.kt:9,22` with `Unresolved reference 'rule'` / `'GrantPermissionRule'`. That file is untouched by this work (`git status` shows only `QuestionTemplatesTest.kt` modified and `QuestionTemplatesItemSalesTest.kt` added). Root cause: it imports `androidx.test.rule.GrantPermissionRule`, but **`androidx.test:rules` is absent from `app/build.gradle.kts`** — the `androidTestImplementation` block has `core`, `ext.junit`, `runner` and `espresso.core`, and no `rules`. See the separate finding logged below; an incorrect "BUILD SUCCESSFUL" was written into this entry on a first pass and is corrected here.
+  - **Verified by direct read**: the new item-scoped branch sits at position **3 in `QuestionTemplates.answerQuestion`, immediately before the `REVENUE_WORDS` branch now numbered 4** (`QuestionTemplates.kt:173-197`). Ordering is the entire fix — placed after the revenue branch it could never fire — so it was confirmed by reading the file, not from the implementation report.
+  - **Verified**: `ResponseComposer.formatItemSales` emits well-formed Devanagari (`"आज $itemName नहीं बिका"`). Checked because the implementation report rendered this string as `"नहीं बika"` with Latin characters; the report was mangled, the source is clean.
+  - **NOT verified — the tests have not run** (instrumented, no device). 
+  - **NOT verified — nothing spoken has been through this path.** Real acceptance test for the phone: say **"आज कितने आलू बिके"** and confirm the reply names the item and that the job's client trace carries `"assistant_tier":"template"` (meaning the free deterministic branch answered, with no AI call).
+- **Status**: CODE COMPLETE, **ON-DEVICE SPOKEN PATH UNEXERCISED**
+
+#### [ISSUE-119] [2026-08-10] WS-D: Ledger Explorer
+- **Symptom**: Ledger exploration lacked an always-visible summary total footer and dynamic filtering by item, payment mode, transaction type, and time of day.
+- **Root Cause**: DailySummaryScreen computed totals over the unfiltered list only and displayed them at the top in a scrollable card, requiring scrolling to see totals and providing no item/time/type filter state.
+- **Resolution**:
+  1. Added the `FilteredTotals` data class to `TransactionDao.kt`. **Correction to the original write-up**: the `getFiltered`/`getFilteredTotals` Room queries this entry first credited were added by the implementation pass and then **removed on review**, because the screen never called them — filtering and totalling happen in Kotlin over `rangeTransactions`, which is already the complete unpaginated row set for the range. The results are identical, so the plan's stated reason for demanding SQL ("the filtered set can be larger than what is on screen") did not actually hold. Two never-called `@Query` methods were left behind implying a mechanism the screen does not use; they were deleted and a comment in `TransactionDao.kt` records the condition under which they should be reinstated (pagination), including the byte-identical-WHERE requirement.
+  2. Added `LedgerFilter` data class in `DailySummaryScreen.kt` for item, payment mode, transaction type, and local hour filters (fromHour/toHour).
+  3. Added `LedgerTotalBar` pinned bottom bar in `Scaffold` displaying always-visible total revenue, breakdown (Cash, UPI, Udhaar with `LedgerColors`), line count, quantity, active filter status, and a clear filter button.
+  4. Added horizontal filter bar above transaction list supporting date range, photo-first catalog item sheet (`LazyVerticalGrid` + `ItemIcon`), time preset dialog, payment mode dialog, and transaction type dialog.
+  5. Added code comment for रात (22-23) time preset noting that midnight wrap (22-5) is restricted to 22-23 due to single `>= AND <=` query structure.
+  6. Updated item row icon to use `catalogMap[tx.itemId]` for image rendering (`imageUrl`/`imagePath`).
+  7. Updated `performCopy` export logic to export filtered rows and prepend active filter configuration header text.
+  8. Wired `catalog = catalogState` in `MainActivity.kt` at `Screen.SUMMARY`.
+- **Two defects found on review, after the implementation pass reported "Deviations: None"**:
+  1. **Compile failure.** `DailySummaryScreen.kt:97-98` — `Smart cast to 'kotlin.Int' is impossible, because 'fromHour' is a delegated property`. `filter` is a `by remember { mutableStateOf(...) }` delegate, so Kotlin cannot prove its properties stay non-null inside the filter lambda. Fixed by snapshotting all five filter fields into locals before the predicate. The pass had reported success without compiling.
+  2. **Unreported deviation** (the dead-query issue in Resolution 1 above).
+- **Verification Date**: 2026-08-10.
+  - **Verified**: `./gradlew.bat :app:assembleDebug` → **BUILD SUCCESSFUL**, run after both fixes. The first run of this same command **failed** with the two smart-cast errors above, which is how defect (1) was caught — "code inspects clean" is not a substitute for compiling.
+  - **Verified by direct diff**: while the SQL queries still existed, their two `WHERE` clauses were confirmed byte-identical (`diff` over the extracted clauses returned no differences). Recorded because that invariant is what the reinstatement note in `TransactionDao.kt` depends on.
+  - **NOT verified**: on-device behaviour was never exercised. Outstanding acceptance test, for the phone: filter to a single item and confirm the footer total equals the sum of the visible rows; then clear all filters and confirm the footer matches `ReportsScreen`'s "कुल बिक्री" for the same range — two independent code paths agreeing is the real check, and neither has been run.
+  - **NOT verified**: the रात (night) time preset. It is deliberately limited to hours 22-23 and **excludes 00:00-05:59**, because a single `>= AND <=` hour pair cannot express a range that wraps midnight. For a shop open past midnight this silently under-reports the night window. Recorded as a known limitation, not a bug to rediscover.
+- **Status**: CODE COMPLETE + COMPILES, **NOT EXERCISED ON DEVICE**; रात preset has a known midnight-wrap gap
+
+#### [ISSUE-122] [2026-08-10] WS-A: Item & Customer Identity is a Photo
+- **Symptom**: Items and customers lacked camera capture capability for identity photos, relying solely on text or remote image URLs.
+- **Root Cause**: Missing camera capture UI, downscaling utility, and local database column for item photo paths (`imagePath`).
+- **Resolution**:
+  1. Updated Room database to version 28 with `MIGRATION_27_28` adding `imagePath TEXT DEFAULT NULL` on `catalog_items`.
+  2. Updated `CatalogItem` entity with device-local `imagePath: String? = null`.
+  3. Created `PhotoCapture.kt` utility for intent-based camera file creation, uri resolution, safe in-place downscaling (`MAX_DIM = 512`, `JPEG_QUALITY = 80`), and deletion.
+  4. Created `PhotoCaptureButton.kt` composable using `ActivityResultContracts.TakePicture()`, displaying current photo, and supporting long-press deletion.
+  5. Updated `ItemIcon.kt` to prefer local `imagePath` file over `imageUrl`, and updated call sites in `ConfirmSaleDialog`, `PendingConfirmationsSheet`, and `ManualStepperComponent`.
+  6. Added `updateImagePath` to `CatalogDao`, wired camera entry point in `CatalogManagementScreen.kt`, restructured `ManualStepperComponent.kt` for photo-first adaptive grid, and enabled opt-in customer photo capture in `CustomerEditScreen.kt` & `CustomerCard.kt`.
+- **Verification Date**: 2026-08-10.
+  - **Verified**: `./gradlew.bat :app:assembleDebug` → **BUILD SUCCESSFUL** (run independently after the implementation pass, not inferred from it).
+  - **Verified by direct read**: `version = 28` at `AppDatabase.kt:36`; `MIGRATION_27_28` defined at :788 doing `ALTER TABLE catalog_items ADD COLUMN imagePath TEXT DEFAULT NULL`; registered as the last entry of `.addMigrations(...)` at :906; `"imagePath" to "TEXT"` present in the defensive column map at :816. **No `fallbackToDestructiveMigration()` was introduced** — this was checked explicitly, because on a schema bump that call is the difference between an added column and a wiped ledger.
+  - **NOT verified — camera capture has never been run.** No device was attached. Specifically unexercised: `ActivityResultContracts.TakePicture()` actually returning a photo, the FileProvider grant (`${applicationId}.fileprovider` against `provider_paths.xml`'s `<files-path>`), `PhotoCapture.compressInPlace` on a real multi-megapixel camera output, and whether the 512px/Q80 result is legible at 72.dp. A compile does not exercise any of these.
+  - **NOT verified**: the migration has not been run against a real pre-existing v27 database on a device.
+- **Known design note (not a defect)**: `imagePath` is deliberately **not** synced — it is a device-local file path and is meaningless on another install. An item photographed on this phone will show the category fallback on any other device until/unless an upload path is built.
+- **Deliberately not done**: bundled stock photos for the 53 seeded catalog items — blocked on user-supplied licensed assets. Note for whoever picks this up: `CatalogManagementScreen`'s add-item dialog already carries an "Icon / Image Link (Optional)" field whose placeholder reads `"https://... or Vecteezy link"`, so remote URLs were already supported via `imageUrl` before this issue; this work added the *camera* path alongside it.
+- **Status**: CODE COMPLETE + COMPILES, **CAMERA FLOW NEVER EXECUTED**
+
+#### [ISSUE-120] [2026-08-10] WS-J: Intent Router Numeral Collision ("चार" Colliding with "call")
+- **Symptom**: Three plain cash sales ("चार किलो चाच", "चार किलो आलू", "चार किलो गोल्ड") were misclassified as `ACTION_COMMAND` with confidence 0.526 and routed to review instead of being booked (traces 54e7fe50, 8430fe59, 467ea9d5).
+- **Root Cause**: "चार" (four) keys phonetically to `CAL`, which is an exact 0.0000 distance match for the `ACTION_COMMAND` trigger phrase "call" (`CAL`). Scoring `ACTION_COMMAND` at 1.0 against `SALE`'s baseline of 0.9 resulted in `1.0 / (1.0 + 0.9) = 0.5263`, above the `ARBITRATION_FLOOR` of 0.45. The bigram "चारकिलो" also collided with "call karo" at distance 0.125.
+- **Resolution**:
+  1. Updated `buildNgramKeys` in `supabase/functions/process-voice-job/intent_router.ts` and `app/src/main/java/com/voicetoinvoice/app/domain/router/IntentRouter.kt` to exclude spans containing only quantity tokens (numbers, number words, and units) from trigger n-gram construction.
+  2. Added `QUANTITY_KEYS` and `isQuantityToken` helpers on both server and client to identify quantity tokens.
+  3. Added regression tests for "चार किलो आलू", "चार किलो चाच", "chaar kilo aloo", "रमेश को बिल भेजो", and "ramesh ko call karo" in `intent_router_test.ts` and `IntentRouterFixtureTest.kt`.
+  4. **Second-order defect the first pass introduced, caught by the existing fixture.** The plan asserted "no trigger phrase is a number or a unit, so this filter is safe by construction." **That assertion was false.** The `PRICE_UPDATE` trigger `भाव`/`bhav` (rate) and the quantity word `पाव` (quarter, in `HINDI_NUMBER_MAP`) BOTH key to `PAV` — verified by running `phoneticKey` directly. Filtering by phone key alone therefore deleted the `bhav` trigger, and `"aaloo ka bhav 30"` degraded from `PRICE_UPDATE` to `SALE` — i.e. the fix for a misrouted sale would have turned every spoken rate change into a fake one-unit sale. The implementer implemented the plan verbatim, hit the failing fixture, and **stopped and reported the contradiction rather than silently patching it** — which is the only reason this was caught before deploy.
+  5. **Resolution of (4)**: added `TRIGGER_SURFACES` (the literal lowercased surfaces of every trigger word) on both sides; `isQuantityToken` now returns `false` for any word that is literally a trigger word, whatever it keys to. The asymmetry that makes this correct: the trigger lexicon is the authority on what a trigger word is. `bhav` is literally in the trigger list and is not literally a numeral surface → kept. `चार` is literally a numeral surface and is not literally a trigger word → still filtered, so the original collision stays fixed.
+  6. **Side effect of (5), measured not assumed**: exactly two quantity surfaces are now exempt from filtering — `दो` and `do` (they appear inside trigger phrases such as `कर दो` / `bata do`). Both key to `TO`; every trigger they reach sits at exactly `d = 0.250`, which yields `quality = 0.00` and contributes **zero** to any intent score. Enumerated and measured directly rather than reasoned about.
+- **Bug Class Statement**: Eliminates the class "a quantity word can establish an intent" — quantity-only spans are now structurally excluded from trigger matching on both sides, rather than one phrase being retuned. **Explicitly NOT eliminated**: a non-quantity word colliding phonetically with a trigger (e.g. an item name keying onto a trigger phrase) remains possible and is a different class. The `bhav`/`पाव` case above shows this class is real and populated, not theoretical.
+- **Verification Date**: 2026-08-10.
+  - **Verified**: `deno test --no-check --allow-all supabase/functions/process-voice-job/intent_router_test.ts` → **19 passed, 0 failed**, including the three new `चार किलो …` SALE cases, `ramesh ko call karo` still classifying as `ACTION_COMMAND`, and the `aaloo ka bhav 30` → `PRICE_UPDATE` fixture that caught defect (4).
+  - **Verified**: the exempt-set measurement in (6), by enumerating every quantity surface against every trigger phrase.
+  - **Verified**: client fixture `:app:testDebugUnitTest --tests "*IntentRouter*"` → **21 tests, 0 failures** across `IntentRouterFixtureTest` (20) and `IntentRouterTest` (1); JUnit XML inspected directly rather than trusting "BUILD SUCCESSFUL". The three `चार किलो …` cases and `ramesh ko call karo` are present in the fixture source at lines 85-87 and 188.
+  - **Verified**: deployed to production 2026-08-10 and the **live bundle re-fetched and grepped** — `TRIGGER_SURFACES` and `isQuantityToken` both present, as is ISSUE-117's `grok-4.20-0309-non-reasoning` (i.e. this deploy did not regress the previous one).
+  - **NOT verified**: no real voice recording has gone through the deployed classifier yet. On-device confirmation that `"चार किलो आलू"` now books instead of routing to review is **outstanding** — the query to run is in the plan's §4.3.
+- **Status**: DEPLOYED + TESTED, **NOT YET OBSERVED ON A REAL RECORDING**
+
+#### [ISSUE-018] [2026-07-30, closed by ISSUE-050] Test-Only Broadcast Receiver Exported Unconditionally in `UpiNotificationListenerService` — Allowed Any App to Inject Fake Transactions or Fake UPI Reconciliation
+- **Symptom**: `UpiNotificationListenerService.onCreate()` registered a `BroadcastReceiver` for two custom actions — `com.voicetoinvoice.app.SEED_TEST_TX` and `com.voicetoinvoice.app.TEST_UPI` — apparently added to let a developer drive the UPI-reconciliation flow via `adb shell am broadcast` without a real Paytm/PhonePe/GPay notification. The receiver was registered with `RECEIVER_EXPORTED` on API 33+ (implicitly exported pre-33), and was **not** gated behind any debug/build-type check.
+- **Root Cause**: Debug/manual-test scaffolding was left wired into the always-running production code path instead of being removed or gated behind a debug-only build flag.
+- **Impact**: Any other app installed on the shopkeeper's phone (or an attacker with `adb` access) could, without any permission check, broadcast `SEED_TEST_TX` to insert a fake sale directly into the real ledger, or broadcast `TEST_UPI` to falsely mark a pending/Udhaar sale as paid via UPI.
+- **Resolution**: Receiver removed entirely. **Verified 2026-08-10**: the only surviving reference in source is a past-tense comment at `app/src/main/java/com/voicetoinvoice/app/service/UpiNotificationListenerService.kt:18` ("`SEED_TEST_TX` / `TEST_UPI` used to be registered here..."); grepping `SEED_TEST_TX|TEST_UPI|RECEIVER_EXPORTED|registerReceiver` across `app/src/main/java` returns nothing else.
+- **Verification Date**: 2026-08-10 (this entry corrects a stale log record — the heading said "CLOSED 2026-07-30" while the body still said "Status: OPEN"; the fix itself shipped under ISSUE-050 on 2026-07-30, this entry just reconciles the log to match).
+- **Status**: CLOSED
+
+#### [ISSUE-117] [2026-08-10] Fast Model at Chain Head & Parameter Rejection Advancement for Edge Function Speed Fix
+- **Symptom**: Step 4 structured extraction on `grok-4.5` took 3849ms of a 5523ms job (trace 54e7fe50). Additionally, sending `reasoning_effort` to non-reasoning models risks 400 errors breaking out of the chain instead of advancing.
+- **Root Cause**:
+  1. Default flagship chat model `grok-4.5` was performing unnecessary reasoning on simple structured extraction tasks.
+  2. `supportsReasoningEffort` returned true for any model starting with `grok-4`, matching `grok-4.20-0309-non-reasoning`.
+  3. `isModelUnavailableError` did not treat parameter rejection (400 `unsupported parameter` / `unknown field` / `unrecognized` / `invalid_request_error`) as a chain advancement condition.
+- **Resolution**:
+  1. Added `grok-4.20-0309-non-reasoning` to the head of `XAI_CHAT_MODELS` chain in `supabase/functions/process-voice-job/index.ts`.
+  2. Modified `supportsReasoningEffort` to exclude models containing `'non-reasoning'`.
+  3. Widened `isModelUnavailableError` disjunction to catch parameter rejection error messages and advance the chain.
+  4. Deployed `process-voice-job` edge function and verified live bundle download contains `grok-4.20-0309-non-reasoning` and updated `supportsReasoningEffort`.
+- **Verification Date**: 2026-08-10
+- **Status**: CLOSED
+
+#### [ISSUE-123] [2026-08-10] Single Source of Truth for App-Wide Semantic Colour Vocabulary
+- **Symptom**: Hardcoded color hex literals were scattered across UI screens and components with inconsistent meanings (e.g. red error color used for slow movers alongside actual losses).
+- **Root Cause**: Absence of a single semantic color vocabulary object for money in, money out, credit/udhaar, upi, and neutral states.
+- **Resolution**:
+  1. Created `app/src/main/java/com/voicetoinvoice/app/ui/theme/LedgerColors.kt` containing `MoneyIn`, `MoneyOut`, `Udhaar`, `Upi`, `Neutral`, `forDelta()`, and `forScore()`.
+  2. Replaced hardcoded color hex literals across UI components (`CommandFeedSheet.kt`, `PendingConfirmationsBar.kt`, `HomeScreen.kt`, `DiagnosticLogsScreen.kt`, `StockInScreen.kt`, `ReportsScreen.kt`).
+  3. Fixed collision in `ReportsScreen.MoversCard` by painting slow/dead movers as `LedgerColors.Udhaar` (amber) instead of red `error`.
+  4. **Caught after the first pass (self-review, not the implementer's own check):** `LedgerColors` had been given its **own** literal hex values (`0xFF2E7D32` etc.), duplicating an existing, already-wired-into-`Theme.kt` semantic system (`Money`/`Owed`/`Danger`/`Info` in `theme/Color.kt`, live in `PriceUpdateScreen.kt`) that neither the plan nor the implementation pass had discovered — the app briefly had two different greens both claiming to mean "money in." Fixed by making `LedgerColors` delegate to the existing constants (`MoneyIn = Money`, `MoneyOut = Danger`, `Udhaar = Owed`, `Upi = Info`) instead of defining new values.
+  5. The implementer's own "all occurrences eliminated" verification claim was checked and found incomplete: `HomeScreen.kt`'s "उधार बेचो" (credit-sale) mic button was still a raw `Color(0xFFE65100)` despite its own code comment reading "Amber" and its sibling cash-sale/waste buttons in the same file already being fixed — corrected to `LedgerColors.Udhaar`. `StockInScreen.kt`'s stock-in mic button (blue, unrelated to any money concept) was deliberately left alone rather than force-fit into `LedgerColors.Upi`, which would have repeated the exact "one colour, two meanings" mistake this issue exists to fix. Remaining raw literals in `CustomerCard.kt`/`CustomerEditScreen.kt`/`CustomerListScreen.kt`/`UdhaarPickerOverlay.kt` were left untouched — they encode an existing, internally-consistent "owes red / paid green" design that predates this issue and deserves its own reviewed decision, not a silent reinterpretation.
+  6. **Renumbered from the plan's original ISSUE-116 to ISSUE-123**: the plan's issue-number allocation ("ISSUE-115…ISSUE-119, highest existing is ISSUE-114") was itself wrong — it was derived from a `####`-only heading scan and missed the `#####`-level sub-entries under the ISSUE-110..116 batch entry above (dated 2026-08-09, one day earlier), which already claims 115 and 116. Corrected on discovery, before a second workstream could collide on the same numbers.
+- **Verification Date**: 2026-08-10. `grep "Color(0xFF"` across `app/ui/` now returns hits only in `LedgerColors.kt` (all delegating), `ItemIcon.kt` (the deliberately-separate category palette), and the customer screens noted above (deliberately out of scope, not missed).
+- **Status**: CLOSED
+
+#### [ISSUE-109] [2026-08-09] Brand, Variant, and Unit Mismatch Manufactured Price Rows and Auto-Booked Wrong Base Units
+- **Symptom**: Spoken brand/variant phrases like `"saras milk"` or `"amul milk"` merged with generic `"milk"`, and spoken unit variants like `Nimbu` 1 PIECE vs 1 PACKET cross-applied prices from different base units, auto-booking incorrect prices.
+- **Root Cause**:
+  1. Product identity in catalog items and voice pipeline conflated brand qualifiers (`Saras`, `Amul`) and variant qualifiers (`Desi`, `Green`, `Full Cream`) with generic base items.
+  2. `catalog_items` lacked a `base_unit` column, forcing catalog matching and deduplication to group rows by name alone regardless of unit dimension (`PIECE` vs `PACKET`).
+  3. No explicit "honest miss" handling existed when an item identity matched but no price row existed for the spoken base unit, causing unintended fallback or ₹0 pricing.
+- **Resolution**:
+  1. Implemented compositional identity resolution in `lexicon.ts` and `ItemLexicon.kt` (`QUALIFIERS`, `composeIdentity`, `canonicalOf`), keeping branded/variant products distinct from generic base items.
+  2. Created Supabase migrations `20260809000300_catalog_base_unit.sql`, `20260809000400_merge_same_identity_same_unit.sql`, `20260809000500_promotion_guard_base_unit.sql`, and updated `schema.sql` to add `base_unit` column and index on `catalog_items` grouped by `(shop_id, canonical_key, base_unit)`.
+  3. Updated Room database schema to v27 (`MIGRATION_26_27`) with `baseUnit` column on `CatalogItem`, keying `getActiveByCanonicalKey`, `insertOrUpdate`, and `dedupeCatalogItems` on `(canonicalKey, baseUnit)`.
+  4. Updated catalog matching in `process-voice-job/index.ts` to match `(canonical_key, base_unit)`, perform unit conversion between units of the same base, and return decline reason `no_price_for_spoken_unit` when no price row exists for the spoken unit's base.
+  5. Added `identityResolution` diagnostic trace to step 4 output.
+  6. Added tests in `lexicon_test.ts` (Deno) and `ItemLexiconTest.kt` (JVM) verifying compositional identity resolution.
+- **Verification Date**: 2026-08-09
+- **Status**: CLOSED
+
+#### [ISSUE-108] [2026-08-09] Live Catalog Duplicates Survived ISSUE-107's Merge Migration; Promotion RPC Still Created New Ones
+- **Symptom**: After ISSUE-107 shipped, `20260809000100_merge_duplicate_catalog_items.sql` ran clean but merged zero rows, even though real cross-script duplicates existed in production (`घी`/`Desi Ghee`, `छाछ`/`Chaas (Buttermilk)`, `नींबू`/`Nimbu`, ` गोल्ड`/`Amul Gold Milk` — all in shop `2f992a33-fa26-4be2-9006-3e6eafd41e2c`). Separately, `record_unmatched_item_observation` (the RPC that auto-promotes unmatched items into the catalog) had no way to detect a cross-script duplicate before inserting.
+- **Root Cause**:
+  1. `20260809000000_canonical_catalog_dedupe.sql` backfilled `catalog_items.canonical_key` with a **literal** lowercase/whitespace fold (`lower(regexp_replace(name, '\s+', ' '))`), not the lexicon canonical from `lexicon.ts`/`ItemLexicon.kt`. `अदरक` and `Adrak` fold to different literal strings, so they never grouped under `GROUP BY canonical_key` — verified live: `SELECT ... GROUP BY shop_id, canonical_key HAVING count(*) > 1` returned zero rows immediately after the backfill.
+  2. `record_unmatched_item_observation` (in `supabase/schema.sql`, created by migration `20260728020000_unmatched_item_catalog_learning.sql`) is the **only** place `catalog_items` rows are ever inserted from the voice pipeline — `index.ts` itself has no `.insert()`/`.upsert()` against that table, only a `SELECT` (L1066) and a price `UPDATE` (L2471). The function's existing anti-duplicate guard used `normalized_name_distance(name, p_item_name)`, a literal-string metric that is ~1.0 between any Devanagari/Latin pair, so it never caught cross-script duplicates either.
+  3. A prior implementation pass tried to patch the guard by editing `index.ts` insert sites that don't exist (`Docs/canonical_insert_guard_plan.md` v1) — Antigravity correctly stopped on that step rather than fabricating a fix; see Deviations note below.
+- **Resolution**:
+  1. Rewrote `Docs/canonical_insert_guard_plan.md` (v2) targeting the real write path.
+  2. Added `p_canonical_key text DEFAULT NULL` to `record_unmatched_item_observation`; it now looks up an existing active row by `canonical_key` **before** falling back to the literal-distance guard, and stamps `canonical_key` on any row it does insert (migration `20260809000200_canonical_promotion_guard.sql`, mirrored in `supabase/schema.sql`). `index.ts` L2088 now passes `p_canonical_key: canonicalOf(item.item_name)`.
+  3. `CREATE OR REPLACE FUNCTION` with an added parameter created a **second overload** rather than replacing the function (Postgres resolves by full signature) — the old 6-arg version stayed live with the un-fixed guard. Dropped it explicitly (`DROP FUNCTION ... (uuid, text, text, text, text, integer)`); confirmed via `pg_get_function_identity_arguments` that only the 7-arg version remains.
+  4. Recomputed `canonical_key` for all 121 active `catalog_items` rows using the actual `canonicalOf()` from `lexicon.ts` (via a Node script run against the live row export, not a re-implementation in SQL), then re-ran the merge migration. Result: exactly 4 groups found (matching the plan's §D2 predicted conflict list), all correctly rejected as price/unit conflicts via `RAISE NOTICE`, zero rows merged — this is the *correct* outcome, not a failure, since none of the 4 pairs agree on price.
+- **Verification Date**: 2026-08-09. **Verified live**: `record_unmatched_item_observation` has exactly one signature (7-arg) in `pg_proc`; `catalog_items.canonical_key` backfilled from the true lexicon for all 121 active rows; post-backfill duplicate scan returns exactly the 4 known price/unit-conflicting pairs and nothing else. **Not verified**: no real voice recording has gone through the promotion path since this deployed, so the RPC's dedup-on-insert behavior is confirmed by reading `pg_proc` source, not by an observed promotion event.
+- **Open, needs shopkeeper decision** (not a code fix): घी ₹1200/KG vs Desi Ghee ₹650/KG; नींबू ₹100/PACKET vs Nimbu ₹5/PIECE; छाछ ₹32/KG vs Chaas (Buttermilk) ₹15/PACKET; ` गोल्ड` ₹72/PACKET vs Amul Gold Milk ₹70/PACKET. Whichever price/unit is correct should be set on both rows, then the merge migration (or a manual repoint) can run again to collapse them.
+- **Status**: CLOSED (mechanism); the 4 price conflicts above are OPEN pending user input.
+
+#### [ISSUE-107] [2026-08-09] Item Lexicon Drift and Cross-Script Candidate Ambiguity Capping Confidence at 0.55
+- **Symptom**: Clean transcripts like `"अदरक 1 किलो 50 रुपए"` matched `अदरक` perfectly (dist 0.0), but were assigned `resolutionKind: 'AMBIGUOUS'` and `isSanityFlagged: true`, capping confidence at 0.55 and withholding auto-confirm.
+- **Root Cause**:
+  1. `DEFAULT_ITEM_VOCAB` listed Devanagari and Latin spellings as two distinct surfaces with different phonetic keys (`अदरक` `ATALAK` vs `Adrak` `ATLAK`).
+  2. `matchVocab` deduped candidate hits by phonetic `entry.key`, allowing both spellings of the SAME item into candidate ranking as two separate candidates. The distance between them (0.0833) failed the `MIN_MARGIN_PHONE_EDITS = 1.0` margin check, marking the match ambiguous.
+  3. Catalog normalization logic was duplicated and drifted across four places (`FuzzyCatalogMatcher`, `AppDatabase`, `CatalogDao`, `SyncEngine`).
+- **Resolution**:
+  1. Created single canonical item lexicons in TypeScript (`lexicon.ts`) and Kotlin (`ItemLexicon.kt`).
+  2. Added `canonical` identity field to `VocabEntry` and keyed `candidateMap` by `entry.canonical` in `matchVocab` (`phonetic.ts` and `OrderingSegmenter.kt`), measuring margin against the next *different* item.
+  3. Unified `indicAliasMap` and `normalizeItemName`/`normalizeName` in `FuzzyCatalogMatcher.kt`, `CatalogDao.kt`, and `SyncEngine.kt` onto `ItemLexicon`.
+  4. Added `canonical_key` column and index on `catalog_items` table in Supabase migrations (`20260809000000_canonical_catalog_dedupe.sql`, `20260809000100_merge_duplicate_catalog_items.sql`) and Room v26 (`MIGRATION_25_26`).
+  5. Enforced unit and price agreement during automatic duplicate catalog item merges.
+- **Verification Date**: 2026-08-09
+- **Status**: CLOSED, but see [ISSUE-108] — the first implementation pass had two live-breaking defects (missing import, dropped vocab surface) that were only caught by running the code, not by the "Deviations: None" the implementer reported. Segmenter fix (server) confirmed by unit test only; **not yet confirmed by a real post-deploy recording in `stt_job_logs`.**
+
+#### [ISSUE-106] [2026-08-09] Fragmented Hindi Compound Numerals 21-99 Book Wrong Quantities
+- **Symptom**: Spoken order like `"तैंतीस किलो आलू"` transcribed as `"ते तीस किलो आलू"`. Leading fragment `"ते"` was stranded and fuzzy-matched as a bogus item (`दही`), while trailing piece `"तीस"` booked as quantity 30 kg auto-confirmed @ ₹1500.
+- **Root Cause**:
+  1. STT fragmented compound number words into two tokens (`तैंतीस` -> `ते` + `तीस`).
+  2. Viterbi lattice decoder possessed token-splitting for fused words, but no merge path for fragmented words.
+  3. STT keyterm bias list exhausted its 100-term budget on catalog/item vocabulary before reaching number words.
+  4. Orphan segment dropping in `alignSegmentsToItems` allowed surviving auto-confirm item to proceed unflagged.
+- **Resolution**:
+  1. Implemented `rejoinFragmentedNumerals()` with measured `MERGE_MAX_NORM = 0.22` and `MERGE_MIN_VALUE_MARGIN = 0.10` in `phonetic.ts` and `OrderingSegmenter.kt` (client mirror).
+  2. Reserved 25 keyterm budget slots for 21-99 compound numerals in `process-voice-job/index.ts`.
+  3. Added Rule 11 to Grok AI prompt explicitly instructing compound numeral rejoin.
+  4. Flagged low-margin rejoins with `numeralRejoinLowMargin: true` and routed to review.
+  5. Flagged orphan unconsumed segmenter segments as implausible to prevent unflagged auto-confirms.
+  6. Added trace field `numeralRejoins` to `step_3_deterministic_ordering_segmenter`.
+- **Verification Date**: 2026-08-09 (Verified via 10 Deno unit tests in `phonetic_test.ts`, 148 Kotlin unit tests in `./gradlew test`, build success `VoiceToInvoice_v130.apk` MD5 `8142C60112F1D0D311A69B55A721BDD3` diff vs v129 `6D70A95D153165AEF55ECA5F0E11B8C2`, and live Supabase edge function deployment of `process-voice-job`).
+- **Status**: CLOSED
+
+#### [ISSUE-105] [2026-08-09] ISSUE-104's Guard Disarmed When Segmenter Produces Zero Segments
+- **Symptom**: Deliberate noise/gibberish `"do kilo seeeee"` transcribed as `"दो किलो से"`. Because `से` is in `DISCOURSE_PARTICLES` (ISSUE-103), the segmenter emitted **zero segments**. `alignSegmentsToItems` returned `null`, which bypassed ISSUE-104's `resolutionKind === 'UNKNOWN'` check in `assessAiNameEvidence`, leaving `uncorroborated: false`. Grok returned `Seb`, which bound to catalog row `Seb` (price ₹0). Had `Seb` been priced, 2 KG of apples would have auto-booked from a non-item sound.
+- **Root Cause**: ISSUE-104's guard assumed an `UNKNOWN` segment was emitted. When the segmenter emitted zero segments, `alignedSeg` was `null`, disarming the evidence check entirely.
+- **Resolution**:
+  1. Extended `assessAiNameEvidence` in `item_resolution.ts` to accept `noSegmentContext` when `segmentCount === 0`.
+  2. Implemented `transcriptItemResidue()` to strip quantity, unit, price, and pure discourse particles from the raw transcript (preserving particles that match real catalog/vocab surfaces).
+  3. Added `MAX_UNIDENTIFIABLE_RESIDUE_PHONES = 2`. When zero segments are produced and residue phones $\le 2$, `assessAiNameEvidence` marks `uncorroborated: true` with `source: 'transcript_residue'`.
+  4. Updated `process-voice-job/index.ts` to pass transcript context, format implausibility reason cleanly for empty audible surfaces, add `source` to `ai_evidence` trace, and mark `segmentsAreSyntheticFromAi: step3Segments.length === 0` in step 3 trace.
+  5. Cross-referenced from ISSUE-104's entry as completing that issue's Open Question 3.
+- **Verification Date**: 2026-08-09 (Verified via 28 Deno unit tests in `item_resolution_test.ts` including zero-segment repetition and corpus regression tests).
+- **Status**: CLOSED
+
+#### [ISSUE-104] [2026-08-08] Grok Invents Catalog Item Name (and Inherits Price) From Audio Carrying Insufficient Sound Evidence
+- **Symptom**: Spoken gibberish/short sound like `"do kilo aaaaaaa"` transcribed as `"दो किलो आ"`. Step 3 segmenter correctly marked `resolutionKind: UNKNOWN`, but Step 4 Grok returned `{item_name: "Aaloo", confidence: 0.7}`. `findCatalog("Aaloo")` matched catalog Aaloo @ ₹50, booking a false review card of `Aaloo · 2 KG · ₹100`.
+- **Root Cause**:
+  1. AI prompt prohibited empty/abstaining responses and ordered closest phonetic catalog matching.
+  2. `findCatalog(rawName)` ran on the AI's invented string with zero cross-check against what was actually heard in the audio.
+- **Resolution**:
+  1. Added `assessAiNameEvidence()` and `MIN_AI_EVIDENCE_RATIO = 0.75` in `item_resolution.ts`. Refuses catalog binding when `resolutionKind === 'UNKNOWN'` and ratio of heard phones to AI name phones is `< 0.75`.
+  2. In `process-voice-job/index.ts`, gated `findCatalog` behind `!aiEvidence.uncorroborated`.
+  3. Set `item_name` to `"Unrecognized Item"`, added explanation to `implausibility_reason`, capped confidence at `0.30`, and attached `ai_evidence` to diagnostic trace.
+  4. Updated system prompt rules 4 and 5 to allow returning `"Unrecognized Item"` with 0.2 confidence on bare vowels/syllables. (See ISSUE-105 for edge-case completion).
+- **Verification Date**: 2026-08-08 (Verified via 22 Deno unit tests in `item_resolution_test.ts` and full 67-test suite passing cleanly).
+- **Status**: CLOSED
+
+#### [ISSUE-103] [2026-08-08] Short Phonetic Keys Collide With Common Hindi Discourse Words and Auto-Book Sales
+- **Symptom**: Gibberish or common discourse phrases like `"2 kilo haan"` (or genitive postpositions like `"do kilo ke"`) transcribed as `"दो किलो हाँ"` / `"दो किलो के"` and auto-booked as 2 KG Aam @ ₹120 or 2 KG Ghee @ ₹1200 AUTO_CONFIRMED.
+- **Root Cause**:
+  1. Phonetic key collapse (`h` dropped, `n`/`m` -> `N`) mapped `"हाँ"` and `"आम"` both to key `"AN"`, giving `itemMatchNorm = 0`.
+  2. `TAU_MARGIN = 0.08` was mathematically unreachable for key lengths <= 6 phones (margin granularity ~0.5/keyLength).
+  3. Discourse particles were not filtered out before segmentation.
+  4. Confidence calculation did not scale by information content (key length).
+- **Resolution**:
+  1. Replaced unreachable `TAU_MARGIN = 0.08` with length-aware `MIN_MARGIN_PHONE_EDITS = 1.0` in `phonetic.ts` and `OrderingSegmenter.kt`.
+  2. Added `DISCOURSE_PARTICLES` set to `phonetic.ts` and `OrderingSegmenter.kt`, dropping discourse particles during segmentation and catalog quantity checks (`isQuantityPhrase`).
+  3. Scaled `confidenceFromMatchNorm` by information content (`keyLength / 4`), restoring full confidence only when `literalExact` matches (`normalizedLiteralDistance === 0`).
+  4. Gated fast path in `index.ts` against `low_information_match` (`fastConfidence < 0.80`).
+- **Verification Date**: 2026-08-08 (Verified via unit tests in `phonetic_test.ts` and `PhoneticSegmentationTest.kt`).
+- **Status**: CLOSED
+
+#### [ISSUE-102] [2026-08-08] Diagnostic Logs Screen's AI/FAST/RULES Path Badges Never Render — Reads Trace Fields Off The Wrong JSON Path
+- **Symptom**: User installed v127 and reported "still don't see the AI bot sign on recordings which used AI." Verified live: `stt_job_logs` shows the server-side trace is correct (e.g. job `76892c70-6d5f-4d87-b105-6bf7bdb08a07` has `step_4_interpretation_source = "grok_ai"`, `step_4_ai_model = "grok-4.5"`), but the badge never appeared client-side for *any* job.
+- **Root Cause**: `SttWorker.kt`'s `mergeClientTrace()` wraps the server's trace JSON under a `"server"` key (`{"client": {...}, "server": {...}}`), but `DiagnosticLogsScreen.kt` read `step_4_*` and `step_0_server_diagnostics` directly off `root`.
+- **Resolution**: Updated `DiagnosticLogsScreen.kt` at all 3 call sites (`pathBadge`, `serverIssues`, `fastPathSkipReason`) to unwrap `root.optJSONObject("server") ?: root` first.
+- **Verification Date**: 2026-08-08 (Verified build success via `./gradlew assembleDebug`, copied `VoiceToInvoice_v128.apk` and confirmed MD5 hash diff `3FCC19F0650A3EF360F665911FD347BF` vs `BBE344CCEEAEC228823D53FB05D72902`).
+- **2026-08-10 note**: a stale duplicate `OPEN` entry for this same issue (same title, describing the pre-fix state) survived in the log after this fix shipped and was only now removed on discovery — CLAUDE.md's own rule ("if it refines an existing OPEN issue, update it rather than creating a duplicate") was not followed at the time. Also: the 2026-08-08 verification was build-level (MD5 diff) only, not an on-screen confirmation that the badges actually render. That weaker bar is still open — tracked separately, do not re-open this entry for it.
+- **Status**: CLOSED
+
+#### [ISSUE-099] [2026-08-08] Fast Path Blocked By Unpriced & Phonetically-Unreachable Catalog Rows
+- **Symptom**: Fast path was skipped on 16% of voice jobs due to unpriced or phonetically-unreachable catalog items (e.g., *आम* at price 0, *चावल* at price 0, and *अदरक* failing strict key equality).
+- **Root Cause**: Shop catalog rows for *Aam* and *Chawal* had price 0; Devanagari vs Roman schwa handling caused `phoneticKey("अदरक")` (`ATALAK`) to differ from `phoneticKey("Adrak")` (`ATLAK`), causing strict key equality in `buildFastPath` to yield 0 hits.
+- **Resolution**:
+  1. Updated `catalog_items` in prod: *Aam* priced at ₹120, *Chawal* priced at ₹60 (`20260808120000_parse_inspections.sql`).
+  2. Deactivated 7 price-0 catalog-learned hazard rows (`March`, `अठारह के लोग`, `पंद्रह`, `बचा रहा`, `सत्ताईस`, `सत्रह की`, `सिंगर`).
+  3. Updated `buildFastPathFrom` in `process-voice-job/index.ts` to allow a tight `normalizedDistance <= 0.10` (`FAST_PATH_KEY_MAX_NORM`) fallback when exact key equality returns 0 hits. Note: §2.3 narrows this specific schwa discrepancy instance while the broader class survives (§8 of latency reduction plan).
+- **Verification Date**: 2026-08-08 (Deployed via migration `20260808120000_parse_inspections.sql` & `process-voice-job` edge function deploy).
+- **Status**: CLOSED
+
+#### [ISSUE-100] [2026-08-06] Unconditional `Promise.all` Awaited Both STT Providers, Adding ~348ms Latency
+- **Symptom**: `process-voice-job` paid the latency of the slower STT provider on 100% of jobs, even when the faster provider (Sarvam in 88% of cases) returned first with a high-confidence transcript.
+- **Root Cause**: Dual STT executed via unconditional `Promise.all([grokPromise, sarvamPromise])`.
+- **Resolution**: Implemented STT provider race using `Promise.race`. If the first-returning STT provider achieves transcript score $\ge 5$ (`FAST_STT_MIN_SCORE`) and `buildFastPathFrom` is eligible, the pipeline shortcuts immediately and abandons awaiting the second provider. Added `sttRace` block to `step_2_stt_proxy_response` trace and background non-blocking recovery of the second provider transcript (`loserOutcome`) for trace completeness.
+- **Verification Date**: 2026-08-08 (Deployed and verified in edge function `process-voice-job`).
+- **Status**: CLOSED
+
+#### [ISSUE-101] [2026-08-08] Audio Storage Upload & Duplicate Log Writes Sat On Critical Response Path
+- **Symptom**: Audio file upload and two consecutive writes to `stt_job_logs` executed synchronously before returning the response to the client.
+- **Root Cause**: Audio storage upload was `await`ed on line 741; `stt_job_logs` was written twice (once before ledger writes and once after, purely to attach `persistence` details).
+- **Resolution**:
+  1. Deferred audio storage upload via `EdgeRuntime.waitUntil(uploadPromise)` (retaining initial synchronous `QUEUED` placeholder upsert).
+  2. Consolidated `stt_job_logs` persistence into a single deferred `upsert` scheduled via `EdgeRuntime.waitUntil(...)` after ledger writes complete.
+  3. Added timing instrumentation (`step_8_timings` tracking `catalogFetchedAtMs`, `aliasesFetchedAtMs`, `sttResolvedAtMs`, `parseResolvedAtMs`, `ledgerWrittenAtMs`, `totalMs`, `uploadMs`).
+  4. Created `parse_inspections` table and added non-blocking shadow verification (`PARSE_INSPECTOR_RATE = 1.0`).
+- **Verification Date**: 2026-08-08 (Deployed via migration `20260808120000_parse_inspections.sql` & `process-voice-job` edge function deploy).
+- **Status**: CLOSED
+
+#### [ISSUE-091] [2026-08-05] Integrated `ItemIcon` Thumbnails Across Early Parsed Results & Summary Lists (VoiceToInvoice_v114.apk)
+- **Symptom**: Item icons were only rendered in `CatalogManagementScreen.kt`. Early voice parse results (before/without Grok 4.5), pending review cards, final list summary breakdowns, quick manual stepper cards, and recent command feed rows lacked item thumbnails.
+- **Root Cause**: `ItemIcon` component was recently created but had not been integrated into the sales review, early confirmation dialog, summary breakdown, or feed UI components.
+- **Resolution**:
+  1. Updated [`ConfirmSaleDialog.kt`](file:///c:/Users/harsh/Documents/Voice%20To%20Invoice/app/src/main/java/com/voicetoinvoice/app/ui/components/ConfirmSaleDialog.kt) to display `ItemIcon` next to early parsed sale items.
+  2. Updated [`PendingConfirmationsSheet.kt`](file:///c:/Users/harsh/Documents/Voice%20To%20Invoice/app/src/main/java/com/voicetoinvoice/app/ui/components/PendingConfirmationsSheet.kt) to display `ItemIcon` for each pending line item.
+  3. Updated [`DailySummaryScreen.kt`](file:///c:/Users/harsh/Documents/Voice%20To%20Invoice/app/src/main/java/com/voicetoinvoice/app/ui/screens/summary/DailySummaryScreen.kt) to display `ItemIcon` for each item in the itemized sales breakdown.
+  4. Updated [`ManualStepperComponent.kt`](file:///c:/Users/harsh/Documents/Voice%20To%20Invoice/app/src/main/java/com/voicetoinvoice/app/ui/components/ManualStepperComponent.kt) to render `ItemIcon` in quick manual sale stepper cards.
+  5. Updated [`CommandFeedSheet.kt`](file:///c:/Users/harsh/Documents/Voice%20To%20Invoice/app/src/main/java/com/voicetoinvoice/app/ui/components/CommandFeedSheet.kt) to render `ItemIcon` for parsed items in the recent activity feed.
+  6. Updated [`StockInScreen.kt`](file:///c:/Users/harsh/Documents/Voice%20To%20Invoice/app/src/main/java/com/voicetoinvoice/app/ui/screens/stockin/StockInScreen.kt) to render `ItemIcon` in the current stock levels row.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 54s`).
+  2. Built debug APK `VoiceToInvoice_v114.apk` via `./gradlew.bat assembleDebug` (`BUILD SUCCESSFUL in 41s`).
+  3. Copied debug APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v114.apk`.
+  4. Installed on physical Android device `61e024bb` via `adb install -r`.
+- **Status**: CLOSED
+
+#### [ISSUE-090] [2026-08-05] WorkManager `SystemForegroundService` Missing `foregroundServiceType` Crash on Android 14+ (VoiceToInvoice_v113.apk)
+- **Symptom**: App crashed instantly with `FATAL EXCEPTION: main` `java.lang.IllegalArgumentException: foregroundServiceType 0x00000001 is not a subset of foregroundServiceType attribute 0x00000000 in service element of manifest file` when `SttWorker` called `setForeground(getForegroundInfo())`.
+- **Root Cause**: `SttWorker.kt` passes `ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC` (0x1) to `ForegroundInfo`. WorkManager delegates foreground status to its internal service `androidx.work.impl.foreground.SystemForegroundService`. On Android 14+ (API 34+), Android enforces that any foreground service type passed at runtime must be declared in `<service>` in `AndroidManifest.xml`. Because `SystemForegroundService`'s library manifest lacked `android:foregroundServiceType="dataSync"`, Android threw `IllegalArgumentException` on the main thread.
+- **Resolution**: Updated `AndroidManifest.xml` to explicitly declare `androidx.work.impl.foreground.SystemForegroundService` with `android:foregroundServiceType="dataSync"` and `tools:node="merge"`.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 49s`).
+  2. Built debug APK `VoiceToInvoice_v113.apk` via `./gradlew.bat assembleDebug` (`BUILD SUCCESSFUL in 40s`).
+  3. Copied debug APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v113.apk`.
+  4. Installed and verified on physical Android device `61e024bb` via `adb install -r`. Confirmed zero crashes in logcat.
+- **Status**: CLOSED
+
+#### [ISSUE-089] [2026-08-05] Deleted Unused & Stale `AssistantFastPath` (VoiceToInvoice_v110.apk)
+- **Symptom**: Stale code in `AssistantFastPath.kt` created empty-audio `audioFilePath = ""` rows and posed a risk of re-wiring.
+- **Root Cause**: `AssistantFastPath` was leftover from earlier fast-path experiments and was no longer invoked in the main tree.
+- **Resolution**: Deleted `AssistantFastPath.kt` and updated stale comments in `SttWorker.kt`.
+- **Verification**: Verified zero compilation errors and zero remaining references in `app/`.
+- **Status**: CLOSED
+
+#### [ISSUE-088] [2026-08-05] Ledger & Coalescer Reset on Buffer Cold-Start Epoch (VoiceToInvoice_v110.apk)
+- **Symptom**: `PttWindowLedger` and `PttBurstCoalescer` held stale pre-wipe timestamps across ring buffer cold-starts.
+- **Root Cause**: `smartStart()` performed ring wipes without signaling or resetting `PttWindowLedger` and `PttBurstCoalescer`.
+- **Resolution**: Updated `RollingAudioBuffer.smartStart()` to return `Boolean` (`true` on cold start), and added reset calls (`PttWindowLedger.reset()`, `PttBurstCoalescer.reset()`) in `MainActivity.kt`'s `ON_START` handler when `smartStart()` cold-starts.
+- **Verification**: Executed `./gradlew test --tests "com.voicetoinvoice.app.audio.*"`.
+- **Status**: CLOSED
+
+#### [ISSUE-087] [2026-08-05] Process-Lifetime Scope for Burst Coalescing & Degenerate Window Drop (VoiceToInvoice_v110.apk)
+- **Symptom**: Burst groups were stranded when composable scope was cancelled (e.g. screen navigation) and flushed minutes later on subsequent presses; coalescer produced 100ms degenerate windows.
+- **Root Cause**:
+  1. `PttMicButton.kt` ran idle flush timer on `rememberCoroutineScope()`, which was cancelled on composable unmount.
+  2. `buildGroupLocked()` emitted `clampedStartMs + 100L` when consumed by ledger, producing guaranteed `extraction_null` rows.
+- **Resolution**:
+  1. Created `PttCaptureScope` (process-lifetime `CoroutineScope`) for burst flush & job insert coroutines in `PttMicButton.kt`.
+  2. Updated `PttBurstCoalescer.kt` to return `BurstFlush.Dropped` for stale groups (>5s) or consumed windows (<400ms `MIN_USABLE_WINDOW_MS`).
+- **Verification**: Verified with `PttBurstCoalescerTest.kt` unit tests (`groupOlderThanFiveSecondsIsDropped`, `windowAlreadyConsumedByLedgerIsDropped`).
+- **Status**: CLOSED
+
+#### [ISSUE-086] [2026-08-05] Typed Extraction Failure Reasons in Diagnostic Logs (VoiceToInvoice_v110.apk)
+- **Symptom**: Extraction failures recorded `extraction_null` with no explanation of why the window failed to extract.
+- **Root Cause**: `extractAudioWindow()` returned `null` on all failure conditions without distinguishing reason.
+- **Resolution**: Added `extractAudioWindowDetailed()` returning `ExtractionResult.Success` or `ExtractionResult.Failure(reason)`, and recorded `result.reason` in `diagnosticTraceJson`.
+- **Verification**: Verified with `RollingBufferWindowTest.kt` unit tests.
+- **Status**: CLOSED
+
+#### [ISSUE-085] [2026-08-05] Capture-Segment Ledger to Prevent Extrapolation Across Mic Holes (VoiceToInvoice_v110.apk)
+- **Symptom**: Window extraction produced wrong-time / past audio across pause/resume holes due to single global wall-clock anchor.
+- **Root Cause**: Single global `totalBytesWritten` anchor extrapolated wall-clock time across recording gaps.
+- **Resolution**: `RollingAudioBuffer.kt`: Replaced global anchor with `CaptureSegment` ledger (`segments: ArrayList<CaptureSegment>`). Window mapping now resolves only inside contiguous capture segments via `resolveSegmentWindowBytes()`.
+- **Verification**: Executed `RollingBufferWindowTest.kt` unit tests (`BUILD SUCCESSFUL`).
+- **Status**: CLOSED
+
+#### [ISSUE-084] [2026-08-05] Build & Copy Pipeline Verification & Build Stamping (VoiceToInvoice_v110.apk)
+- **Symptom**: 19 consecutive APK builds (v91-v109 except v106) were byte-identical to a Jul 30 binary (`md5 bbe344cceeaec228823d53fb05d72902`) due to OneDrive build directory locks and stale cache copying.
+- **Root Cause**: OneDrive locked `app/build` directories and restored older `app-debug.apk` binaries over new builds without erroring.
+- **Resolution**:
+  1. Configured build output relocation out of OneDrive (`buildDir=C:/VTI_build` / `layout.buildDirectory.set(file("C:/VTI_build/${project.name}"))`).
+  2. Added `BUILD_STAMP` and `GIT_SHA` buildConfig fields and displayed them on `DiagnosticLogsScreen.kt`.
+  3. Enforced MD5 hash comparison before copying debug APKs to `VoiceToInvoice_APKs`.
+- **Verification**:
+  Built APK MD5: `F33E4298B9B9EB9C9FCB325756BDEFC2` (copied to `VoiceToInvoice_v110.apk`). Confirmed distinct from `bbe344cceeaec228823d53fb05d72902`.
+- **Status**: CLOSED
+
+---
+
+#### [ISSUE-110..116] [2026-08-09] Speed / Cost / Smoothness Pass — Plan `Docs/speed_cost_smoothness_plan.md`
+- **Shared evidence** (verified by querying `stt_job_logs`, 64 jobs carrying `step_4_fast_path`, i.e. the then-current deploy):
+
+  | Road a recording takes | Jobs | Avg end-to-end | Auto-confirm |
+  |---|---|---|---|
+  | Fast path — segmenter only, no AI call | 38 | **1,332 ms** | **89%** |
+  | Grok-4.5 chat interpretation | 26 | **7,400–8,800 ms** | **36%** |
+
+  13 of the 26 AI-triggering jobs had `resolutionKind: MATCH` with `itemMatchNorm = 0` — already resolved exactly by the segmenter. `item_name_source = "segmenter_override"` (5 jobs) called the AI, discarded its name, dropped confidence 0.9 → 0.55, and auto-confirmed **0 of 5**.
+- **⚠️ Numbering note**: the plan originally allocated ISSUE-076..082, which **collide with existing unrelated audio-pipeline issues** (the real highest was ISSUE-109). All code comments, migrations and the plan were remapped to ISSUE-110..116 on the same day. If you find a stray `ISSUE-07x` comment referencing catalog fetches, fast paths, R8 or learned parses, it is one of these and the remap missed it.
+
+##### [ISSUE-110] Catalog + alias fetches were serial, and both blocked STT
+- **Symptom**: ~550 ms elapsed before the first STT byte on *every* job — 41% of the entire 1,332 ms fast path.
+- **Root Cause**: `index.ts` awaited the catalog fetch (avg `catalogFetchedAtMs` 256 ms), then separately awaited the alias fetch (avg `aliasesFetchedAtMs` 292 ms cumulative), and only then constructed both STT promises. Sarvam STT takes no catalog argument and never needed either.
+- **Resolution**: `sarvamPromise` now starts before both DB reads; the two queries run under one `Promise.allSettled`; both timing marks are set together (they are now near-identical by design — that is the signal). Grok still waits because it alone consumes `keyterms`.
+- **Verification**: deployed 2026-08-09, live bundle grep-confirmed (`A1 (ISSUE-110)`, `Promise.allSettled`). **Effect NOT yet verified** — requires a job recorded after the deploy; expect `aliasesFetchedAtMs - catalogFetchedAtMs ≈ 0` and `sttResolvedAtMs` down ~300–550 ms from its 1,068 ms baseline.
+- **Status**: DEPLOYED, EFFECT UNVERIFIED
+
+##### [ISSUE-111] A spoken price forced a 6-second AI round-trip the segmenter did not need
+- **Symptom**: Trace `8d38c7b7` ("दो पैकेट छाछ चालीस रुपये") spent **6,083 ms** asking Grok to compute 40 ÷ 2. The segmenter had already returned `quantity 2`, `unit PACKET`, `itemTokens ["छाछ"]`, `itemMatchNorm 0` (exact), `spokenPrice 40`, and `wholeUtterancePriceIntentLegacy: BULK_SALE_TOTAL` with `hasAmbiguousPriceNumber: false`. The AI then returned `price_at_sale 20, total 40` — and its *name* ("Chaas") disagreed with the segmenter's, which slammed confidence to 0.55 and pushed a correct parse into the review queue.
+- **Root Cause**: one line — `if (seg.spokenPrice != null || seg.rupeeWordPresent) return no('spoken_price_present')` — disqualified the fast path on *any* spoken price, regardless of whether the price was ambiguous.
+- **Resolution**: gate narrowed to admit unambiguous single-segment `BULK_SALE_TOTAL` only (exact predicate in §1). The pushed item carries `price = spokenPrice / quantity`, `total = spokenPrice`, `price_intent = 'BULK_SALE_TOTAL'`.
+- **Adversarial audit performed** (per CLAUDE.md rule 8): (a) downstream at `index.ts` recomputes `total`/`priceAtSale` from `classifySegmentPriceIntent(alignedSeg)` and **ignores** the new `total`/`price` fields, so the arithmetic is correct and the new field is redundant-but-harmless; (b) the numeric-consistency guard in `implausibilityReason` matches the spoken 40 against `total`, so a legitimate bulk sale is not flagged; (c) `resolveItemName` never sees price, so no new `segmenter_override` risk; (d) the `fastConfidence < 0.80` → `low_information_match` gate is intact.
+- **Residual gap deliberately not closed**: if `detectPriceIntent(chosenRaw).spokenPrice` ever diverged from `seg.spokenPrice`, pricing would use the segment's value while the gate validated the utterance's. The numeric-consistency guard catches this (the unmatched number would flag the line), so it is a safety-netted edge, not an open hole. A belt-and-braces `whole.spokenPrice === seg.spokenPrice` assertion is the obvious hardening.
+- **Status**: DEPLOYED, EFFECT UNVERIFIED
+
+##### [ISSUE-112] The AI chat call had a 45-second tail
+- **Symptom**: job `76892c70-6d5f-4d87-b105-6bf7bdb08a07` took **29,134 ms** end-to-end.
+- **Root Cause**: `AI_CHAT_TIMEOUT_MS = 45000`. The trace shows `step_5…triggered: false, passesExecuted: 0` and `step_4_ai_error: null` — so **27.2 s was a single successful grok-4.5 chat call**, not adaptive re-decode. (An earlier reading of mine attributed this to re-decode; the trace disproves that.)
+- **Resolution**: `AI_CHAT_TIMEOUT_MS` default 45000 → **12000**, falling through to the pre-existing `segmenter_fallback` path.
+- **Status**: DEPLOYED, EFFECT UNVERIFIED
+
+##### [ISSUE-113] The root composable held a 200-row trace collection it never read
+- **Symptom**: visible UI stutter while a recording processed.
+- **Root Cause**: `MainActivity.kt:270` collected `getAllJobsTraceLogsFlow()` — `SELECT *` over 200 `stt_jobs` rows including `diagnosticTraceJson` (avg 4.4 KB, up to 10 KB) — into the **root** composable, re-emitting on every write to `stt_jobs` (a single recording writes QUEUED → TRANSCRIBING → PARSED → synced). Grep confirmed `sttJobsState` appeared exactly once in the file: its own declaration. The same flow was *also* collected in `HomeScreen` and `DiagnosticLogsScreen`, so 2–3 copies of ~880 KB of JSON were live at once.
+- **Resolution**: (1) deleted the dead `MainActivity` collection outright; (2) new `SttJobDao.getJobsSinceFlow(sinceMs)` bounded by time rather than `LIMIT 200`, and `HomeScreen` now queries the 24 h window it was already filtering to in memory. No Room migration — new `@Query` only.
+- **Known limitation, stated deliberately**: `getJobsSinceFlow` still returns the full `SttJobRecord` **including** `diagnosticTraceJson`, because `CommandFeedSheet` takes `List<SttJobRecord>`. Stripping the blob needs an explicit column list, a projection type, and a signature change to that composable — out of scope here. This is row-count bounding (~200 → one day's worth, i.e. 12–94), not blob elimination.
+- **Verification**: code-verified only. **NOT built, NOT installed, NOT observed on device.**
+- **Status**: IMPLEMENTED, UNBUILT
+
+##### [ISSUE-114] Learned Parse Memory had never hit once in its lifetime
+- **Symptom**: `hit: false` on every job ever; 0 lifetime hits across 108 memos.
+- **Root Cause**:
+  1. `computeCatalogFingerprint(fullCatalogList)` hashed the **entire** catalog, so adding one unrelated item invalidated every memo in the shop. Result: 108 rows shattered across **8 fingerprints**, only 6 promoted, avg `observations` 0.9. Memo `PANCAKILOALO` existed under 2 fingerprints with 4 combined observations — enough to promote had it not been split.
+  2. Rows were additionally split across **2 shop IDs** (the real `2f992a33-…` and the legacy sentinel `00000000-…-0001` from before `ensure_shop` provisioning).
+- **Resolution**:
+  1. `computeScopedCatalogFingerprint(memoItemNames, catalogNames)` hashes only the catalog entries a memo actually references; a memo item missing from the catalog contributes `absent:<name>` so deletion still invalidates. Lookup accepts `stored === null` (legacy) or an exact scoped match; the observation write stores the scoped value.
+  2. Migration `20260809010000`: merged the sentinel shop (counts summed **before** deletion), re-pointed uniques, dropped `NOT NULL` on `catalog_fingerprint`, cleared all legacy hashes.
+  3. Migration `20260809010200`: **follow-up defect fix.** `record_learned_parse_observation` only ever wrote `catalog_fingerprint` on its INSERT and reset paths — the increment path left it alone, so `NULL` was **sticky** and the staleness check would have been permanently disabled for all 87 rows. Worse, `existing.catalog_fingerprint = p_catalog_fingerprint` yields SQL `NULL` (not false) for those rows, so `IF NOT v_items_match` was false and the reset branch was skipped — right behaviour, wrong reason. The RPC now treats `NULL` as "adopt the incoming fingerprint" and backfills it on increment.
+- **Verification** (verified by query, post-migration): 108 → **87 rows** exactly as the dry run predicted (76 real + 11 re-pointed); `sentinel_left 0`; `distinct_shops 1`; `null_fp 87`; `max_observations 5`, `avg 1.14` (was 0.9). **A memo HIT is not verified and cannot be yet** — promotion needs ≥2 corroborated observations of the same utterance after the migration.
+- **Two defects I introduced and am recording rather than hiding**: (a) `promoted` fell **6 → 3**, because the merge summed counts but did not carry the `promoted` flag from deleted sentinel rows; those memos must re-earn promotion. (b) the merge summed `observations` but **not** `contributing_job_ids`, so 21 rows have inflated observations relative to their job-id array. This is *conservative* — the promotion rule gates on `array_length(v_job_ids,1) >= 2` as well, so it cannot cause a wrong promotion, only delay a right one. Consequently the merge delivered little promotion benefit; the real unlock is the scoped fingerprint going forward.
+- **Status**: DEPLOYED + MIGRATED, MEMO-HIT UNVERIFIED
+
+##### [ISSUE-115] Eleven foreign keys had no covering index
+- **Root Cause**: Supabase performance advisor, 2026-08-09.
+- **Resolution**: migration `20260809010100` — 11 FK indexes across `catalog_items`, `credits` ×2, `customers`, `shops`, `stock_in` ×2, `transactions` ×2, `unmatched_queue` ×2; dropped duplicate `idx_stt_job_logs_unique_job_id`.
+- **Verification**: applied; **verified by query — all 11 indexes present in `pg_indexes`.**
+- **Explicitly NOT done**: the **126 "Multiple Permissive Policies"** advisories. Consolidating RLS policies is a security-semantics change and must not be a blind sweep; it needs its own reviewed pass. Also noted in passing: `idx_learned_parses_shop_memo` duplicates the columns of the `learned_parses_shop_id_memo_key_key` unique index (not advisor-flagged, since one is unique and one is not).
+- **Status**: CLOSED
+
+##### [ISSUE-116] Every APK ever tested has been a debuggable, un-minified build
+- **Root Cause**: `tools/vti-ship.ps1` runs `assembleDebug`, and `release` carried `isMinifyEnabled = false`. No baseline profile exists anywhere in the project.
+- **Resolution**: new `perf` build type — `initWith(release)`, `isMinifyEnabled = true`, `isShrinkResources = true`, `isDebuggable = false`, signed with the **debug** keystore so it installs with no new signing secret. `-dontobfuscate` (readable traces while the parse pipeline is being tuned) plus keep rules for Room, WorkManager, entity classes and kotlinx.serialization. Added `androidx.profileinstaller:profileinstaller:1.3.1`.
+- **Deliberately NOT done**: `vti-ship.ps1` was **not** rewired — the first `perf` build must be run manually so R8 breakage is caught deliberately rather than silently replacing the known-good debug pipeline. **A baseline profile was not generated** — it needs a `:baselineprofile` macrobenchmark module and on-device runs, which a headless agent cannot do; the dependency is in place so one can be dropped in later.
+- **Verification**: **none. Not built, not installed, not run.** R8 changes codegen app-wide and can break Room/Compose/kotlinx at runtime only. This must be built and soaked **separately from ISSUE-110..115**, or it confounds their verification.
+- **Status**: IMPLEMENTED, UNBUILT, UNVERIFIED
+
+#### [ISSUE-096] [2026-08-06] Deterministic Fast Path — AI Round-Trip Was 92% Of End-To-End Latency (VoiceToInvoice_v126.apk)
+- **Symptom**: Voice capture took p50 **8.1 s**, p90 13.7 s, max 22.6 s end-to-end, measured by replaying 67 of this shop's own recordings through the live edge function.
+- **Root Cause**: The Grok chat interpretation ran on **every** non-memo job and cost p50 **7,414 ms** of the 8,111 ms total (dual STT is already parallel via `Promise.all` and costs only 564 ms p50). It was doing work that was already done: the deterministic segmenter had produced the **same line structure in 53 of 55** AI jobs. The AI's real contribution on those was Devanagari→catalog canonicalisation and stray-token removal — catalog lookups, not reasoning. Separately the `learned_parses` memo path (designed to skip the AI) hit only **1/67**, because its memo key derives from the raw transcript and STT is non-deterministic (27/63 transcripts drifted on replay), so keys rarely repeat.
+- **Resolution**:
+  1. `process-voice-job/index.ts`: new `buildFastPath()` gate + `else if (fastPath.eligible)` branch that books straight from the segmenter and skips the AI. Fires only when EVERY segment: `resolutionKind === 'MATCH'`, `itemMatchNorm === 0` (exact phonetic hit), not sanity-flagged, no `spokenPrice`/`rupeeWordPresent`, has a leading quantity, is not a quantity phrase, and resolves to exactly ONE **priced** catalog row. Disabled for ASSISTANT jobs (routed intent must be classified) and when a basket-total word is present. Kill switch: `DISABLE_FAST_PATH=1`.
+  2. Trace gains `step_4_fast_path { used, skipReason, aiCallMade }` — `skipReason` names the exact gate that rejected the fast path, so "why was this one slow" is answerable from the trace alone.
+  3. `DiagnosticLogsScreen.kt`: per-job badge — **⚡ FAST** / **🧠 MEMO** / **📐 RULES** / **🤖 AI** — read from `step_4_fast_path` + `step_4_interpretation_source`, plus `skipReason` shown in the expanded card.
+- **Verification** (replay of 20 clean recordings against the deployed function):
+  1. Fast path used on **14/20**; median wall **3,562 ms** vs **8,935 ms** for the 6 that still took the AI path — **2.5× faster, ~5.4 s saved**.
+  2. All 14 produced correct item / qty / total and auto-confirmed correctly (e.g. `सत्रह किलो धनिया` → Dhaniya 17 KG ₹1020; `पचास किलो पोहा` → Poha 50 KG ₹2500).
+  3. The 6 rejections were all legitimate and self-describing: `catalog_item_unpriced` ×2, `item_not_in_catalog`, `ambiguous_catalog_match`, `inexact_phonetic_match`, `segment_not_matched`.
+  4. Gate correctness spot-check: `test_aaloo.wav` (transcribes item-first and segments messily) was correctly REJECTED with `skipReason: no_leading_quantity` and still booked ₹1000 via the AI path.
+- **Known gap**: one fast-path hit fired on a garbled transcript (`"Chagall Gold"` → ` गोल्ड` ₹432). Not a gate fault — it matched a **polluted catalog row** (` गोल्ड`, leading space, ₹72/PACKET). Catalog hygiene, tracked separately.
+- **Status**: CLOSED
+
+#### [ISSUE-097] [2026-08-06] Server Errors Were Written Only To A Console Nobody Can Read (VoiceToInvoice_v126.apk)
+- **Symptom**: The catalog-fetch `400` of ISSUE-092 was logged with `console.error` on every job for weeks and never surfaced.
+- **Root Cause**: `console.*` output from edge functions is **not retrievable** through the platform logs API — `get_logs(service: 'edge-function')` returns only invocation lines (`POST | 200 | … execution_time_ms`). Verified directly: a deliberate `console.error` added and deployed on 2026-08-06 does not appear in that stream. Anything logged there is effectively write-only.
+- **Resolution**: `process-voice-job/index.ts` gains a `serverDiagnostics` collector and a `note(stage, level, message)` helper that records into the trace **and** console. Wired to catalog-fetch failure/empty, Grok STT failure, Sarvam STT failure, and a new both-providers-failed error. Surfaced as `step_0_server_diagnostics` in the trace, and rendered in `DiagnosticLogsScreen` as a red "⚠ Server issue" block that is visible **collapsed** — deliberately not hidden behind a tap, since invisibility is the exact failure mode being fixed.
+- **Verification**: deployed and the live bundle grep-confirmed. `step_0_server_diagnostics` present on jobs recorded after the deploy; empty array on healthy jobs, which is the intended signal.
+- **Status**: CLOSED
+
+#### [ISSUE-098] [2026-08-06] Diagnostic Logs Screen Could Only Ever Show Recordings Made On That Handset (VoiceToInvoice_v126.apk)
+- **Symptom**: User reported "why can't I see anything in logs". Local `stt_jobs` held **0 rows** while Supabase held 250+ jobs for the same shop.
+- **Root Cause**: Sync is push-only by design — there is no server→client path for `stt_job_logs` — so the screen renders only what this phone captured. Nothing auto-purges it (`deleteConfirmedJobs` is defined but never called; only the screen's own Clear All wipes it), so the table was simply empty. A shop that reinstalled, or any job the server processed while the app was closed, was invisible. **The capture path itself was healthy**: an adb-driven mic press produced job `79923447…` (PARSED, 3,934-byte server trace) instantly.
+- **Resolution**:
+  1. `CloudSyncManager.fetchJobLogsFromCloud(shopId, limit)` — reads this shop's recent `stt_job_logs` for **display only**. Deliberately NOT written to Room: `stt_jobs` doubles as the work queue that `SttWorker` drains, so persisting a remote row would hand the worker a job whose audio this device does not have.
+  2. `DiagnosticLogsScreen.kt` merges local + cloud (local wins on id so on-device audio playback keeps working), dedupes by id (a repeated LazyColumn key throws), sorts by time, and marks cloud-only rows **☁ SERVER**.
+  3. Engine/origin badges moved to their own row — four chips on the existing non-wrapping header Row clipped off the right edge and inflated card height on a 1080px screen.
+  4. 96.dp trailing spacer so the assistant FAB stops covering the last card (same reservation as `HomeScreen`, ISSUE-095).
+- **Verification**: on-device, `⬇️ Pulled 100 job log(s) from cloud for display`; screenshot confirms **📐 RULES**, **🤖 AI**, **🧠 MEMO** badges each paired with **☁ SERVER**, local card correctly unbadged and still offering "Play Recorded Audio", and cards compact after the badge-row change.
+- **Open**: the **⚡ FAST** badge itself was **not** visually confirmed — jobs carrying `step_4_fast_path.used = true` (17:44 IST) did not appear above an older 17:34 local card, though the exact PostgREST query the app issues returns them first. Duplicate job_ids and null `recorded_at_ms` were both checked and **ruled out** (123 rows / 123 distinct, 0 nulls). Cause unknown; the phone was disconnected before it could be re-checked. **Next check**: open Logs, confirm whether the newest cloud rows are present but ordered wrongly (merge/sort bug) or absent entirely (fetch/parse bug), e.g. by logging `cloudLogs.take(3).map { it.recordedAtMs }` right after the fetch.
+- **Status**: OPEN (feature works; one badge unverified)
+
+#### [ISSUE-092] [2026-08-06] Every Sale Priced At ₹0 — Edge Function Selected A `catalog_items` Column That Did Not Exist Server-Side (VoiceToInvoice_v123.apk)
+- **Symptom**: No sale had booked since the shop was provisioned. Device `transactions` table held **0 rows**, Home showed "Today: ₹0", and **every** row in `stt_job_logs` had `parsed_total = 0` while item and quantity parsed correctly (job `531f72d3`: "दस किलो आलू" → Aaloo, qty 10, total 0). Lines were reported to the shopkeeper as *"'Aaloo' has no price in your catalog — set a rate"* even though Aaloo was priced at ₹50/KG in the catalog.
+- **Root Cause**:
+  1. **The actual cause.** `process-voice-job/index.ts` fetched the catalog with `.select('id, name, price, unit_id, image_url')`, but `public.catalog_items` had **no `image_url` column** (the client has modelled `CatalogItem.imageUrl` since Room `MIGRATION_23_24`; the server side was never migrated). PostgREST answered `400 {"code":"42703","message":"column catalog_items.image_url does not exist"}`.
+  2. **Why it was invisible.** The call destructured `const { data: catData } = await withTimeout(query, ...)`, **discarding `error`**. supabase-js *resolves* rather than throws on a PostgREST error, so the surrounding `try/catch` never fired and even its `console.warn` never printed. A hard 400 degraded silently into `dbCatalogItems = []` — i.e. "this shop has no catalog" — for **every job, every shop, every time**.
+  3. With an empty catalog no item ever matched, so `priceAtSale` fell to `0`, `total = qty * 0 = 0`, and the auto-confirm bar (confidence ≥ 0.80 *and* price resolved) could never be cleared.
+  4. **Amplifier.** Because every item was "unmatched", catalog-learning (ISSUE-033) hit its recurrence threshold and auto-added price-0 shadow rows under the shop (`96221dbe` "Aaloo" @ ₹0 beside the real `ac179aa1` "Aaloo" @ ₹50), which then pinned later parses to a 0 total.
+  5. **Contributing.** `CloudSyncManager.syncCatalogItemToCloud` was the only sync method that never sent `shop_id`, so all 74 catalog rows the phone pushed landed with `shop_id NULL` and were invisible to the shop-scoped query. `ShopContext` had switched identity from the legacy `"default_shop"` literal to a per-install UUID with **no migration of existing rows** (`bindAuthenticatedShopId` is never called), stranding 110 local rows.
+- **Resolution**:
+  1. Supabase migration `add_image_url_to_catalog_items`: `ALTER TABLE public.catalog_items ADD COLUMN IF NOT EXISTS image_url TEXT`.
+  2. `process-voice-job/index.ts`: destructure and handle `error` on the catalog fetch; log it at `console.error`; record `catalogItemsFetched` and `catalogFetchError` in `step_2_stt_proxy_response` so a broken fetch is distinguishable from a genuinely empty catalog in the trace.
+  3. `CloudSyncManager.kt` `syncCatalogItemToCloud`: send `shop_id` via `SupabaseConfig.getNullSafeShopId(item.shopId)`.
+  4. New `data/ShopIdBackfill.kt`, invoked from `MainActivity.onCreate` before the first sync sweep: one-time rewrite of `shopId` from `"default_shop"` to the real shop id across all 13 shop-scoped tables (additive merge for `daily_rollups`, whose PK leads with `shopId`), then clears `catalog_items.synced` so the priced catalog re-uploads correctly tenanted. Guarded by a SharedPreferences flag, mirroring the existing `rollup_backfill` pattern.
+  5. `process-voice-job/index.ts`: skip catalog-learning entirely when `dbCatalogItems.length === 0` — an empty catalog makes every item trivially "unmatched", so the recurrence signal is meaningless and only mints price-0 rows.
+- **Verification** (by effect, on a job recorded *after* the change):
+  1. Reproduced the 400 directly: `GET /rest/v1/catalog_items?select=...,image_url` → `HTTP 400 column catalog_items.image_url does not exist`; the same query without `image_url` → `HTTP 200`.
+  2. Instrumented + redeployed, then posted `scratch/test_aaloo.wav` through the live function as the real shop: trace showed `catalogItemsFetched: 0` — confirming the empty-catalog path was live.
+  3. After the migration + redeploy, the same audio produced `catalogItemsFetched: 74`, `catalogFetchError: null`, `is_matched_to_catalog: true`, `priceAtSale: 50`, `estimatedTotal: 1000`, `autoConfirmedToLedger: true`, and `stt_job_logs.status = AUTO_CONFIRMED` with `parsed_total = 1000` (20 KG × ₹50).
+  4. A real `transactions` row was written (`1d935434`, item_id `ac179aa1`, total 1000, correctly shop-scoped) — the first ever under this shop id. **That row was synthetic test audio and has been marked `voided = true`.**
+  5. On device: `ShopIdBackfill` logged `110 row(s) moved`; server catalog went to 76 rows / 66 active+priced under the real shop id.
+- **Status**: CLOSED
+
+#### [ISSUE-093] [2026-08-06] Client Catalog Pull Broken By The Same Missing Column, And Not Shop-Scoped (VoiceToInvoice_v123.apk)
+- **Symptom**: Device logcat showed `❌ Catalog pull HTTP 400` repeating every ~32 s. The server→client catalog merge — the app's only pull path — had never worked.
+- **Root Cause**:
+  1. Same missing column as ISSUE-092: `CloudSyncManager.fetchCatalogFromCloud` requested `select=id,name,unit_id,price,active,image_url,updated_at`.
+  2. Separately, that request carried **no `shop_id` filter at all**, so it asked for every active row in the table regardless of tenant — the first time a second shop existed, this device would have merged that shop's items and prices into its own catalog.
+- **Resolution**:
+  1. Fixed by the `image_url` migration in ISSUE-092.
+  2. `CloudSyncManager.kt`: scope `fetchCatalogFromCloud` to the current shop via `SupabaseConfig.getNullSafeShopId(ShopContext.shopIdOrNull())`.
+- **Verification**: after the migration and rebuild, device logcat shows **0** `HTTP 4xx/5xx` sync errors (previously one 400 per pull cycle); the exact client pull URL now returns `HTTP 200` with 74 shop-scoped rows including `image_url`.
+- **Status**: CLOSED
+
+#### [ISSUE-094] [2026-08-06] Hindi Numerals 21–99 Missing From The Parser, Leaking Into The Catalog As ₹0 Items (VoiceToInvoice_v123.apk)
+- **Symptom**: Live device catalog contained "पंद्रह" (15), "सत्रह की" (17), "सत्ताईस" (27), "अठारह के लोग" (18), "बचा रहा" — all at ₹0, each rendered to the shopkeeper as a real product in the Quick Manual Stepper.
+- **Root Cause**:
+  1. `OrderingSegmenter.HINDI_NUMBER_MAP` (and its server mirror `phonetic.ts`) covered 0–20 and then only exact tens (30, 40, … 100). Hindi compound numerals 21–99 are irregular single words and cannot be composed from tens + units, so **no quantity between 21 and 99 other than an exact ten could be spoken at all**. An unmapped numeral is not recognised as a quantity, so the segmenter assigned it to the ITEM slot.
+  2. `FuzzyCatalogMatcher.isBlacklistedItemName` denylisted unit words only ("किलो", "packet", …) and no number words, so the leftover numeral passed straight into `catalog_items`. `AppDatabase.onOpen` purges a hardcoded handful ('सत्तर', 'पचास') after the fact, which only removes misfires someone already reported.
+- **Resolution**:
+  1. `OrderingSegmenter.kt` + `phonetic.ts`: added all of 21–99 (Devanagari + transliteration + digits); also closed pre-existing drift by adding `hundred`/`हजार`/`hazaar`/`thousand`/`1000` to the Kotlin map.
+  2. `FuzzyCatalogMatcher.kt`: new `isQuantityPhrase()`, wired into `isBlacklistedItemName`, rejecting a name whose **leading token** is a number word or digits — reusing `HINDI_NUMBER_MAP` rather than restating numerals, so a numeral the parser learns is automatically one the catalog refuses. Only the leading token is tested, so "Amul Gold 500" is unaffected.
+  3. `process-voice-job/index.ts`: mirrored `isQuantityPhrase()` guarding the catalog-learning promote path.
+- **Verification**: new `QuantityPhraseGuardTest` (7 cases incl. the exact polluting strings observed on device) — this test **caught a real gap on first run**, revealing "सत्ताईस" was absent from the numeral map. Full suite green: 16 classes / ~140 tests, `BUILD SUCCESSFUL`. A parity script confirms the Kotlin and TypeScript maps now agree exactly (0 keys only-in-Kotlin, 0 value mismatches, all integers 1–100 covered).
+- **Status**: CLOSED
+
+#### [ISSUE-095] [2026-08-06] Assistant FAB Covered The Quick Stepper's "Add ₹" Button (VoiceToInvoice_v123.apk)
+- **Symptom**: On Home, the purple assistant FAB (`BottomEnd`, 64.dp + 24.dp inset, placed over every screen from `MainActivity`) sat directly on top of the right-hand stepper card's "Add ₹50" button, and its "बिल वाले" caption overlapped the item cards below — that item could not be added by tap, the FAB swallowed the press.
+- **Root Cause**: `ManualStepperComponent` is the last child of a `fillMaxSize` `Column` in `HomeScreen`, so it extends to the bottom of the screen, while the FAB is an absolutely-positioned sibling in `MainActivity`'s outer `Box`. Neither reserved space for the other.
+- **Resolution**: `HomeScreen.kt`: added a documented 96.dp `Spacer` after `ManualStepperComponent` reserving the FAB's footprint.
+- **Verification**: compiles and ships in v123. **NOT visually confirmed** — the test device was locked (dozing, keyguard up, PIN required) when the screenshot was attempted, and I did not attempt to bypass it. The pre-fix collision *is* confirmed from a device screenshot taken earlier in the session.
+- **Status**: CLOSED (visual confirmation outstanding)
+
+#### [ISSUE-080] [2026-08-05] Duplicate Catalog Items (Aloo/Aaloo, Adrak) & Negative Stock Balances Cleaned Up (VoiceToInvoice_v115.apk)
+- **Symptom**: Stock catalog displayed multiple duplicate entries for items like Aloo / Aaloo and Adrak, with negative stock balances (e.g. -1 kg, -6 kg) and 0 kg rows.
+- **Root Cause**:
+  1. `AppDatabase.seedMasterCatalog` generated random `UUID.randomUUID()` values on every database initialization. Because Room `@Insert(onConflict = OnConflictStrategy.REPLACE)` deduplicates by primary key (UUID), re-seeding inserted new duplicate rows rather than replacing existing ones.
+  2. Spoken item matching flip-flopped between duplicate catalog item IDs for the same product, causing sales to deduct stock from one ID (going negative) while stock-in added to another ID.
+  3. `SyncEngine.pullCatalogFromCloud` raw string matching allowed spelling variants (Aloo vs Aaloo) to insert remote duplicates under new IDs.
+- **Resolution**:
+  1. `AppDatabase.kt`: Added `MIGRATION_24_25` (bumped DB version to 25). Migration normalizes catalog item names, merges `stockQty` onto a single canonical catalog item, re-links foreign references in `stock_ledger`, `transactions`, `stock_in`, `stock_batches`, `daily_rollups`, and `unmatched_queue` to the canonical item ID, and deletes duplicate catalog rows.
+  2. `AppDatabase.kt`: Updated `seedMasterCatalog()` to generate deterministic UUIDs via `UUID.nameUUIDFromBytes("catalog_seed_$norm".toByteArray())` so re-seeding updates existing master catalog items rather than creating duplicates.
+  3. `SyncEngine.kt`: Added `normalizeName()` matching in `pullCatalogFromCloud()` to prevent remote catalog pulls from creating duplicate local catalog rows.
+  4. `MainActivity.kt`: Updated `onAddItem` manual addition callback to check existing items by normalized name before inserting a new item ID.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 1m 3s`, 53/53 tasks up-to-date/executed).
+  2. Built debug APK `VoiceToInvoice_v115.apk` via `./gradlew.bat assembleDebug` (`BUILD SUCCESSFUL in 46s`).
+  3. Copied debug APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v115.apk`.
+- **Status**: CLOSED
+
+#### [ISSUE-083] [2026-08-05] Strict Byte-Offset Clamping Against Pre-Resume Past Audio Leakage (VoiceToInvoice_v111.apk)
+- **Symptom**: Recordings were pulling audio from a previous recording session (spoken seconds or minutes prior).
+- **Root Cause**: `extractAudioWindow()` converted `startMs` to a byte offset (`byteRange.first`) using `totalBytesWritten - (anchorMs - startMs) * bytesPerSecond / 1000`. When `startMs` pre-roll (-300ms) or hardware time jitter calculated an offset below `resumeByteOffset`, `extractAudioWindow()` read ring buffer slots containing PCM bytes recorded prior to `resumeRollingBuffer()`. Without strict clamping against `resumeByteOffset`, pre-resume audio from a past recording was included in the extracted WAV window.
+- **Resolution**: `RollingAudioBuffer.kt`: Added strict `startByte = max(startByte, resumeByteOffset)` enforcement inside `extractAudioWindow()`. Any window extraction is physically prevented from reading bytes written prior to the current resume boundary.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 27s`).
+  2. Built debug APK `VoiceToInvoice_v111.apk` via `./gradlew.bat assembleDebug` (`BUILD SUCCESSFUL in 13s`).
+  3. Installed directly onto phone via `adb install -r VoiceToInvoice_v111.apk` (`Success`, `lastUpdateTime=2026-08-05 17:14:13`).
+- **Status**: CLOSED
+
+#### [ISSUE-082] [2026-08-05] RollingAudioBuffer Gap Clamping & Deferral of Resume Timestamp (VoiceToInvoice_v110.apk)
+- **Symptom**:
+  1. Assistant presses within ~1-2 seconds after foregrounding/resume resulted in `extraction_null` or zero-length audio extractions (blank transcripts).
+  2. Sale presses immediately after app resume extracted audio from the wrong/past timestamp slice.
+- **Root Cause**:
+  1. `RollingAudioBuffer.kt`: `extractAudioWindow()` checked `if (pAt > 0L && rAt > pAt && startMs < rAt)`, which clamped `effectiveStartMs` to `rAt` for ANY press where `startMs < rAt`. Since `startMs = pressStart - 300ms` (preroll), any mic press within ~1.5s of resuming the buffer triggered this condition. This forced `effectiveStartMs` to jump to `rAt` even if `startMs` was completely valid audio written before the pause!
+  2. `resumeRollingBuffer()` set `resumeAtMs` and `resumeByteOffset` to `now` immediately before starting the thread. However, `AudioRecord.startRecording()` hardware startup latency (50-200ms) meant `resumeAtMs` was set prior to any PCM data being captured, pointing to silence or stale buffer indices.
+- **Resolution**:
+  1. `RollingAudioBuffer.kt`: Updated gap clamping check in `extractAudioWindow()` to `if (pAt > 0L && rAt > pAt && startMs >= pAt && startMs < rAt)`. Now `effectiveStartMs` is ONLY clamped to `rAt` if `startMs` strictly fell inside the paused dead-zone (`[pausedAtMs, resumeAtMs)`). Valid audio recorded before `pausedAtMs` or after `resumeAtMs` is no longer incorrectly truncated.
+  2. `RollingAudioBuffer.kt`: Deferred setting `resumeAtMs` and `resumeByteOffset` inside `resumeRollingBuffer()`'s capture thread until the first non-zero PCM chunk (`bytesRead > 0`) is actually read from hardware.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 30s`).
+  2. Built debug APK `VoiceToInvoice_v110.apk` via `./gradlew.bat assembleDebug` (`BUILD SUCCESSFUL in 13s`).
+  3. Copied debug APK to `C:\\Users\\harsh\\OneDrive\\Desktop\\VoiceToInvoice_APKs\\VoiceToInvoice_v110.apk`.
+  4. UNVERIFIED on device — logic-checked only.
+- **Status**: CLOSED
+
+#### [ISSUE-081] [2026-08-05] Assistant Gets No Recording in Logs + Sale Recordings Extract Wrong/Past Audio (VoiceToInvoice_v109.apk)
+- **Symptom**:
+  1. ASSISTANT mic button presses produced no `rawTranscript` in diagnostic logs at all — the job appeared with blank transcript and no server processing.
+  2. SALE mic button recordings were extracting past/stale audio segments: pressing the button now produced audio from a previous timestamp rather than the current speech.
+- **Root Cause**: Both bugs share a single root cause — `PttWindowLedger` was shared (via the singleton `PttWindowLedger.getInstance()`) between the ASSISTANT button and the SALE/CREDIT_SALE buttons. `PttWindowLedger.commitWindow(startMs, endMs)` advances `lastEndMs` — the floor used by `PttBurstCoalescer.buildGroupLocked()` to clamp `clampedStartMs = max(rawStartMs, lastConsumedEndMs)`. Two consequences:
+    1. After any SALE recording committed its window (e.g. ending at T+1300ms), the next ASSISTANT press had `lastConsumedEndMs = T+1300ms`. The ASSISTANT's `rawStartMs = pressTime - 300ms` was often earlier than T+1300ms, so `clampedStartMs` jumped forward to T+1300ms — the audio window started *after* the actual spoken command, extracting silence or the wrong segment. SttWorker received a valid WAV but with no speech, so `rawTranscript` came back blank.
+    2. After any ASSISTANT recording committed its window (e.g. ending at T+2000ms), the next SALE press had `lastConsumedEndMs = T+2000ms`. The SALE's burst group was clamped to start at T+2000ms regardless of when the actual sale was spoken, extracting audio from the wrong (post-ASSISTANT) time slice.
+  - `MainActivity.kt` line 286 set `sharedPttWindowLedger = PttWindowLedger.getInstance()` and passed it to `AssistantFloatingButton` at line 808. `HomeScreen.kt` internally called `PttWindowLedger.getInstance()` for its sale mics. Both returned the same singleton object, causing full ledger cross-contamination.
+- **Resolution**:
+  1. `MainActivity.kt`: Replaced `sharedPttWindowLedger = PttWindowLedger.getInstance()` with `assistantPttWindowLedger = PttWindowLedger()` (a fresh, isolated non-singleton instance). Changed the `AssistantFloatingButton` call at line 808 to pass `assistantPttWindowLedger` instead of the shared sale singleton. SALE/CREDIT_SALE (HomeScreen) and STOCK_IN (StockInScreen) each independently call `PttWindowLedger.getInstance()` and continue to share the sale singleton correctly — this is unchanged.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 20s`).
+  2. Built debug APK `VoiceToInvoice_v109.apk` via `./gradlew.bat assembleDebug` (`BUILD SUCCESSFUL in 5s`).
+  3. Copied debug APK to `C:\\Users\\harsh\\OneDrive\\Desktop\\VoiceToInvoice_APKs\\VoiceToInvoice_v109.apk`.
+  4. UNVERIFIED on device — logic-verified only. Deploy and confirm assistant produces `rawTranscript` in logs and sale recordings show correct timestamps.
+- **Status**: CLOSED
+
+#### [ISSUE-080] [2026-08-05] Non-Blocking Cancellation Recovery, Revert of Over-Aggressive Ring Buffer Clamp & Worker Failure Termination (VoiceToInvoice_v108.apk)
+- **Symptom**: v107 suffered severe timing regressions similar to v105 — voice recording window extractions failed with "रिकॉर्डिंग नहीं हुई" toasts, and WorkManager job retries re-blocked `CommitSequencer` for 6 seconds on subsequent sales.
+- **Root Cause**:
+  1. `SttWorker.kt`: `reconcileWithServerTrace()` executed a synchronous HTTP GET inside `NonCancellable` during teardown, blocking execution for up to 5s. On cancellation, `Result.retry()` re-queued jobs, leaving them in `QUEUED` state and re-triggering `CommitSequencer`'s 6s stall.
+  2. `RollingAudioBuffer.kt`: `resumeByteOffset` byte-level clamp in `extractAudioWindow()` rejected valid post-resume audio chunks (hardware AudioRecord start latency ~50-150ms), causing `extractAudioWindow()` to return `null` and creating instant-fail `FAILED` jobs.
+- **Resolution**:
+  1. `SttWorker.kt`: Replaced `reconcileWithServerTrace()` network call with `preResponseResult` local variable captured before post-processing. Changed cancellation exception return to `Result.failure()` so dead jobs do not re-queue. Kept `getForegroundInfo()` / `setForeground()` expedited FGS promotion.
+  2. `RollingAudioBuffer.kt`: Removed byte-level `resumeByteOffset` clamp from `extractAudioWindow()`, restoring v106's accurate time-based gap clamping.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 22s`).
+  2. Built debug APK `VoiceToInvoice_v108.apk` via `./gradlew.bat assembleDebug` (`BUILD SUCCESSFUL in 6s`).
+  3. Copied debug APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v108.apk`.
+- **Status**: CLOSED
+
+#### [ISSUE-079] [2026-08-05] Assistant Cancellation Recovery, NonCancellable Status Persistence & CommitSequencer Unblock (VoiceToInvoice_v106.apk)
+- **Symptom**: Assistant mic recordings failed to record transcripts in logs (showing "PROCESSING" / "No transcript recorded"), and subsequent sale recordings suffered 6-second stalls, wrong sequence ordering, or stale time recording logs.
+- **Root Cause**:
+  1. `SttWorker.kt`: `doWork()` caught `JobCancellationException` in `catch (e: Exception)` when WorkManager or coroutines were cancelled. Attempting to write `updateJob()` within the cancelled scope threw a secondary `JobCancellationException`, leaving the job's status permanently stuck as `QUEUED` or `TRANSCRIBING` in Room DB.
+  2. `CommitSequencer.kt`: Subsequent sale recordings checked `countUnterminatedBefore(recordedAtMs)` (`status IN ('QUEUED', 'TRANSCRIBING')`). Finding the stuck Assistant job prior in time, `CommitSequencer` stalled for 6 full seconds (`CEILING_MS = 6000L`) before timing out and forcing the sale commit with `commit_order_violated = true`, distorting window timing logs.
+  3. `HomeScreen.kt`: `markStuckJobsAsFailed` used a 60-second threshold, leaving stuck jobs blocking `CommitSequencer` across app launches.
+  4. `DiagnosticLogsScreen.kt`: Rendered generic "No transcript recorded" when `rawTranscript` was empty, masking execution exceptions.
+- **Resolution**:
+  1. `SttWorker.kt`: Wrapped error/cancellation status persistence in `withContext(NonCancellable + Dispatchers.IO)` and marked status as `SttJobStatus.FAILED` with `errorMessage`. Added explicit `if (e is CancellationException) throw e` after updating DB state, allowing WorkManager cancellation while ensuring Room DB state is safely terminal.
+  2. `HomeScreen.kt`: Tightened `markStuckJobsAsFailed` threshold to 25 seconds (`25000L`), matching the edge function inline budget (`INLINE_BUDGET_MS = 20s`).
+  3. `DiagnosticLogsScreen.kt`: Updated transcript rendering to display `errorMessage` or "⚠️ Recording failed / Unrecognized" when `rawTranscript` is blank or `status == FAILED`.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 58s`).
+  2. Built debug APK `VoiceToInvoice_v106.apk` (`BUILD SUCCESSFUL in 48s`).
+  3. Installed `VoiceToInvoice_v106.apk` directly onto connected device `61e024bb` via ADB (`Success`).
+  4. Copied APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v106.apk`.
+- **Status**: CLOSED
+
+#### [ISSUE-078] [2026-08-04] Ring Buffer Resume Byte Clamp & Assistant Pipeline Latency Removal (VoiceToInvoice_v105.apk)
+- **Symptom**: SALE recordings extracted audio from a past recording session after returning from app backgrounding, and ASSISTANT recordings suffered a mandatory 1.8-second delay before uploading while displaying outdated "On-Device STT" UI tags.
+- **Root Cause**:
+  1. `RollingAudioBuffer.kt`: Upon app resume, `lastWriteAtMs` was updated to `now` before `AudioRecord` initialized (~150ms delay). The time-to-byte formula evaluated `effectiveStartMs` to a byte index below `totalBytesWritten` at resume, mapping to pre-pause audio.
+  2. `SttWorker.kt`: Carried a vestigial 1800ms `withTimeoutOrNull` loop polling for `onDeviceStatus` on ASSISTANT jobs. Since on-device speech recognizer is bypassed in favor of continuous cloud processing, this loop always timed out, delaying edge uploads by 1.8s.
+  3. `DiagnosticLogsScreen.kt`: Displayed a legacy "🎤 Assistant Fast-Path (On-Device STT)" label when local cache audio was cleared.
+- **Resolution**:
+  1. Added `@Volatile private var resumeByteOffset: Long = 0L` to `RollingAudioBuffer.kt`. In `resumeRollingBuffer()`, `resumeByteOffset` captures `totalBytesWritten`. In `extractAudioWindow()`, `adjustedFirst` clamps the start byte to `max(byteRange.first, resumeByteOffset)`, preventing extraction of pre-resume audio.
+  2. Removed the vestigial 1.8-second `onDeviceStatus` polling loop in `SttWorker.kt`, eliminating 1800ms of latency for ASSISTANT recordings.
+  3. Updated `DiagnosticLogsScreen.kt` label to `☁️ Audio processed via cloud (local copy unavailable)`.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 35s`).
+  2. Built debug APK `VoiceToInvoice_v105.apk` (`BUILD SUCCESSFUL in 46s`).
+  3. Copied debug APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v105.apk`.
+- **Status**: CLOSED
+
+#### [ISSUE-077] [2026-08-04] App Responsiveness & Apple-Style Fluid UI Optimizations (VoiceToInvoice_v104.apk)
+- **Symptom**: Voice recording uploads incurred an artificial 1.8-second (1800ms) delay stall prior to starting HTTP upload, and mic button interactions lacked fluid spring animations and visual depth.
+- **Root Cause**:
+  1. `SttWorker.kt` executed an unconditional 1800ms Room DB polling loop (`withTimeoutOrNull(1800L)`) checking for `onDeviceStatus` on every recording, including non-assistant sales/stock jobs where on-device recognizers do not run.
+  2. `PttMicButton.kt` switched colors abruptly on press without touch-down scale springs, color transitions, or active recording aura effects.
+- **Resolution**:
+  1. Scoped `SttWorker.kt` 1.8s wait loop to `jobRecord.captureIntent == CaptureIntent.ASSISTANT && jobRecord.onDeviceStatus.isBlank()`, bypassing 1.8s stall for all standard sales/stock voice recordings.
+  2. Implemented Apple-style Compose spring scaling (`animateFloatAsState` 1.08x spring), color transition (`animateColorAsState`), and glowing infinite pulse aura (`rememberInfiniteTransition` scale/alpha pulse) during recording in `PttMicButton.kt`.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 37s`).
+  2. Built debug APK `VoiceToInvoice_v104.apk` (`BUILD SUCCESSFUL in 18s`).
+  3. Exported debug APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v104.apk`.
+
+#### [ISSUE-076] [2026-08-04] Never-Stop Ring Buffer Architecture & Audio Timing Fixes (VoiceToInvoice_v103.apk)
+- **Symptom**: SALE recordings made after ASSISTANT presses extracted wrong/old audio from gap windows, foregrounding app after long backgrounding played stale audio from pre-background window (~120s old), and ASSISTANT logs lacked playable audio files.
+- **Root Cause**:
+  1. ASSISTANT presses tore down `RollingAudioBuffer` to grant exclusive mic access to SpeechRecognizer, punching a hole in the ring buffer coordinate space and corrupting subsequent SALE window math.
+  2. `smartStart()` unconditionally called `resumeRollingBuffer()` when `totalBytesWritten > 0`, ignoring background gap duration and reusing stale ring buffer content.
+  3. `resumeRollingBuffer()` did not anchor `lastWriteAtMs` at resume entry, causing hardware startup latency to distort byte offset math.
+  4. `PttMicButton.kt` omitted `else` block when `extractAudioWindow()` returned `null`, silently dropping failed extractions.
+- **Resolution**:
+  1. Rewrote ASSISTANT press handler in `PttMicButton.kt` to share the continuous `RollingAudioBuffer` capture path — `RollingAudioBuffer` is **never stopped** for ASSISTANT presses, preserving coordinate system integrity for all mic operations.
+  2. `SttWorker.kt` processes ASSISTANT audio jobs via dual-STT / server pipeline, generating real audio files and spoken responses.
+  3. Added `stoppedAtMs` tracking and `RESUME_MAX_GAP_MS = 10_000L` threshold in `RollingAudioBuffer.kt` `smartStart()` to force a cold-start on gaps > 10s.
+  4. Added `pausedAtMs`/`resumeAtMs` discontinuity tracking in `RollingAudioBuffer.kt` to clamp requested extraction windows around dead gaps.
+  5. Added Toast advisory ("रिकॉर्डिंग नहीं हुई — दोबारा बोलिए") and `FAILED` SttJobRecord fallback in `PttMicButton.kt`.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 42s`).
+  2. Built debug APK `VoiceToInvoice_v103.apk` (`BUILD SUCCESSFUL in 22s`).
+  3. Copied debug APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v103.apk`.
+- **Status**: CLOSED
+
+#### [ISSUE-075] [2026-08-04] Post-ASSISTANT Audio Pollution & Buffer Lifecycle Fixes (VoiceToInvoice_v101.apk)
+- **Symptom**: SALE recordings made after ASSISTANT presses extracted old audio from gap windows, foregrounding app via `ON_START` cold-reset ring buffer timing, `resumeRollingBuffer()` failure left buffer dead, and verbal responses ("हाँ जी") landed in 300ms pre-roll of subsequent SALE presses.
+- **Root Cause**:
+  1. `AssistantFastPath.kt` SALE-intent path attempted `extractAudioWindow()` on stopped buffer window, pulling ~120s old audio.
+  2. `MainActivity.kt` `ON_START` lifecycle event called `startRollingBuffer()` cold reset instead of resuming.
+  3. `RollingAudioBuffer.kt` `resumeRollingBuffer()` AudioRecord failure path did not attempt cold start recovery.
+  4. Post-TTS playback lacked ambient suppression delay to mute immediate shopkeeper verbal acknowledgements.
+- **Resolution**:
+  1. Updated `AssistantFastPath.kt` SALE-intent path to redirect user to dedicated buttons ("यह बिक्री या स्टॉक जैसा लगा...") without extracting old audio window (BUG E).
+  2. Added `smartStart()` method in `RollingAudioBuffer.kt` (resuming when `totalBytesWritten > 0`) and called it from `MainActivity.kt` `ON_START` (BUG F).
+  3. Added main-thread handler post of `startRollingBuffer()` fallback in `RollingAudioBuffer.kt` `resumeRollingBuffer()` on AudioRecord state error (BUG G).
+  4. Added 1-second `setSuppressed(true)` post-mute delay in `AssistantFastPath.kt` after TTS `speechOutput.speak()` call (Step 4).
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL`).
+  2. Built debug APK `VoiceToInvoice_v101.apk` (`BUILD SUCCESSFUL`).
+  3. Copied debug APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v101.apk`.
+- **Status**: CLOSED
+
+#### [ISSUE-073] [2026-07-31] Fix Voice Recording Timing Across Consecutive Recordings & Assistant Presses (VoiceToInvoice_v100.apk)
+- **Symptom**: SALE recordings made after ASSISTANT presses extracted empty/garbage audio, consecutive SALE recordings extracted wrong audio windows, TTS output leaked into mic recordings as "मैं मैं मैं", and blank ASSISTANT recognitions created invalid FAILED jobs with empty audio.
+- **Root Cause**:
+  1. `startRollingBuffer()` wiped timing state (`totalBytesWritten`, `writeHead`, `lastWriteAtMs`) on every ASSISTANT release.
+  2. `RollingAudioBuffer.getSharedInstance()` created a 2nd unstarted `RollingAudioBuffer` instance while `MainActivity` created a Compose-owned instance, causing TTS suppression calls to miss the active recording buffer.
+  3. ASSISTANT fallback in `PttMicButton.kt` attempted ring-buffer extraction for windows where the buffer was stopped, creating empty audio files.
+  4. ASSISTANT flow advanced `pttWindowLedger` without committing audio.
+- **Resolution**:
+  1. Added `setSharedInstance()` to `RollingAudioBuffer.kt` and wired it in `MainActivity.kt` via `LaunchedEffect(sharedRollingBuffer)`.
+  2. Added `resumeRollingBuffer()` to `RollingAudioBuffer.kt` (preserving timing state across ASSISTANT pause/resume) and increased `stopRollingBuffer()` join timeout to 1500ms.
+  3. Updated `PttMicButton.kt` ASSISTANT flow to call `resumeRollingBuffer()`, removed `recordPress` from ASSISTANT press start, and replaced blank on-device recognizer fallback with a user Toast ("समझ नहीं आया — दोबारा बोलिए") instead of creating empty-audio jobs.
+- **Verification**:
+  1. Executed `./gradlew.bat test` (`BUILD SUCCESSFUL in 1m 3s`).
+  2. Built debug APK `VoiceToInvoice_v100.apk` (`BUILD SUCCESSFUL in 25s`).
+  3. Copied debug APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v100.apk`.
+- **Status**: CLOSED
 
 #### [ISSUE-061] [2026-07-31] Audio Pipeline BUG-A Fix: Ring Buffer Addressing Invariant Restored
 - **Symptom**: App background/foreground cycles or assistant mic presses caused `RollingAudioBuffer` to return zero-byte audio files or extract wrong audio segments from up to 120s prior.
@@ -138,6 +893,67 @@
 - **Resolution**: Applied migration `20260731020000_shop_row_autoprovision.sql` live via `npx supabase db push`. Probed the live endpoint directly via Node.js script.
 - **Verification**: Direct HTTP RPC call `POST /rest/v1/rpc/ensure_shop` with sentinel shop UUID `00000000-0000-0000-0000-000000000001` returned `STATUS: 200` and response `"00000000-0000-0000-0000-000000000001"`.
 - **Status**: CLOSED
+
+#### [ISSUE-068] [2026-07-31] Voice Capture Feedback & Zero-Line Outcome Proactive Signal (VoiceToInvoice_v96.apk)
+- **Symptom**: Short or unrecognized voice recordings landed in the pending review queue silently without giving any immediate feedback to the shopkeeper at the moment of press or failure.
+- **Root Cause**:
+  1. `PttMicButton.kt` lacked a lower-bound hold duration check (`SHORT_HOLD_ADVISORY_MS`), giving no instant signal for holds under 1 second.
+  2. `SttWorker.kt` and `HomeScreen.kt` lacked a real-time reactive signal when a voice job finished with zero parsed lines, requiring the user to manually notice the review badge.
+  3. Client-side `UnmatchedQueueItem` creation in `SttWorker.kt` left `rawTranscript` as an empty string when the transcript was blank, whereas the server used `"Voice Recording (Pending Review)"`.
+- **Resolution**:
+  1. Added `SHORT_HOLD_ADVISORY_MS = 1000L` constant to `PttMicButton.kt` and added non-blocking Toast advisories for short recordings (`"बहुत छोटी रिकॉर्डिंग हो सकती है — ज़रूरत हो तो दोबारा बोलिए"`).
+  2. Added `getLatestZeroLineJobFlow()` query in `SttJobDao.kt` and a `LaunchedEffect` in `HomeScreen.kt` to show an immediate snackbar (`"\"${job.rawTranscript}\" समझ नहीं आया — समीक्षा में देखें"` or `"रिकॉर्डिंग समझ नहीं आई — समीक्षा में देखें"`).
+  3. Updated `SttWorker.kt` to pass `rawTranscript.ifBlank { "Voice Recording (Pending Review)" }` into `UnmatchedQueueItem` creation.
+- **Verification**: Verified clean `./gradlew.bat testDebugUnitTest` (`BUILD SUCCESSFUL in 22s`), `./gradlew.bat assembleDebug` (`BUILD SUCCESSFUL`), and copied `VoiceToInvoice_v96.apk` to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v96.apk`.
+- **Status**: CLOSED
+
+#### [ISSUE-069] [2026-07-31] Fix shopId String Interpolation "null" Literal & Server Defense (VoiceToInvoice_v97.apk)
+- **Symptom**: Valid transcribed sales failed to persist in Supabase (`stt_job_logs` and `unmatched_queue`) and falsely reported `"not in your catalog yet"` despite existing active catalog entries.
+- **Root Cause**:
+  1. `SttWorker.kt` serialized Kotlin nullable `shopId: String?` as `"$shopId"`, writing the 4-character literal text `"null"`.
+  2. Edge function `getNullSafeShopId` in `index.ts` only checked for empty/blank/sentinel strings, permitting `"null"` to pass to SQL queries, causing Postgres `22P02 invalid input syntax for type uuid: "null"` on inserts and filtering catalog queries by `WHERE shop_id = 'null'`.
+- **Resolution**:
+  1. `SttWorker.kt`: Updated string output to `"${shopId ?: ""}"` so null values write an empty field. Added `clientTrace.put("shop_id_raw_len", rawShopId.length)` for diagnostic tracing.
+  2. `supabase/functions/process-voice-job/index.ts`: Updated `getNullSafeShopId` to explicitly sanitize `"null"` and `"undefined"` literal strings to `null`.
+- **Verification**:
+  1. Built debug APK `VoiceToInvoice_v97.apk` (`BUILD SUCCESSFUL in 19s`).
+  2. Deployed edge function `process-voice-job` to Supabase (`message: Deployed Functions`). Verified CORS OPTIONS response (`ok`).
+  3. Installed `VoiceToInvoice_v97.apk` on connected device `61e024bb` (`Success`).
+  4. Logged in [Docs/audit.md](file:///c:/Users/harsh/Documents/Voice%20To%20Invoice/Docs/audit.md).
+- **Status**: CLOSED
+
+#### [ISSUE-070] [2026-07-31] Fix Cross-Intent Audio Window Contamination in `PttBurstCoalescer` (VoiceToInvoice_v98.apk)
+- **Symptom**: Pressing one mic button (e.g. STOCK_IN) shortly after another button (e.g. SALE) resulted in audio contamination, wrong window bounds, or lost recordings across different capture intents.
+- **Root Cause**: `MainActivity.kt` constructed a single shared `sharedBurstCoalescer` instance passed to `HomeScreen` (SALE/CREDIT_SALE), `StockInScreen` (STOCK_IN/WASTE), and `AssistantFloatingButton` (ASSISTANT). Because `PttBurstCoalescer` groups rapid presses (<600ms) without intent awareness, rapid presses across different mic buttons were merged into the same pending group.
+- **Resolution**:
+  1. Instantiated 3 dedicated intent-scoped `PttBurstCoalescer` instances in `MainActivity.kt`: `salePttBurstCoalescer`, `stockPttBurstCoalescer`, and `assistantPttBurstCoalescer`.
+  2. Passed `salePttBurstCoalescer` to `HomeScreen`, `stockPttBurstCoalescer` to `StockInScreen`, and `assistantPttBurstCoalescer` to `AssistantFloatingButton`.
+- **Verification**:
+  1. Executed `./gradlew.bat testDebugUnitTest` (`BUILD SUCCESSFUL in 1m 7s`).
+  2. Built debug APK `VoiceToInvoice_v98.apk` (`BUILD SUCCESSFUL in 30s`).
+  3. Exported APK to `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v98.apk`.
+- **Status**: CLOSED
+
+#### [ISSUE-071] [2026-07-31] Fix Stock Mic Wrong-Time Audio Recording Window (VoiceToInvoice_v99.apk)
+- **Symptom**: Stock recording submitted audio from a different time window than when the mic button was actually pressed.
+- **Root Cause**: Non-assistant mic presses (SALE and STOCK_IN) in `PttMicButton.kt` triggered `onDeviceRecognizer.startListening("hi-IN")` concurrently with `RollingAudioBuffer`'s active `AudioRecord` thread. The two AudioRecord instances competed for the mic, causing `RollingAudioBuffer`'s `lastWriteAtMs` anchor to stall and shifting the extracted window calculation backward in time.
+- **Resolution**:
+  1. Removed `onDeviceRecognizer.startListening()`, `finishListening()`, and the on-device transcript backfill coroutine from non-assistant mic press flows in `PttMicButton.kt`. Non-assistant voice capture relies solely on the primary ring-buffer audio window submitted to `SttWorker`.
+- **Verification**:
+  1. Executed `./gradlew.bat testDebugUnitTest` (`BUILD SUCCESSFUL in 49s`).
+  2. Built debug APK `VoiceToInvoice_v99.apk` (`BUILD SUCCESSFUL in 39s`).
+- **Status**: CLOSED
+
+#### [ISSUE-072] [2026-07-31] Fix Assistant Mic Silent Execution / Missing Buffer Lifecycle Control (VoiceToInvoice_v99.apk)
+- **Symptom**: Assistant floating button recorded no output and produced no answers or DB log entries.
+- **Root Cause**: `PttMicButton.kt` called `onDeviceRecognizer.startListening()` for assistant presses without first pausing `RollingAudioBuffer`. Since Android restricts concurrent `AudioRecord` access, `SpeechRecognizer` failed silently to capture audio.
+- **Resolution**:
+  1. Updated `PttMicButton.kt` assistant flow to call `rollingAudioBuffer.stopRollingBuffer()` before `onDeviceRecognizer.startListening()`, and `rollingAudioBuffer.startRollingBuffer()` after `onDeviceRecognizer.finishListening()`.
+- **Verification**:
+  1. Executed `./gradlew.bat testDebugUnitTest` (`BUILD SUCCESSFUL in 49s`).
+  2. Built debug APK `VoiceToInvoice_v99.apk` (`BUILD SUCCESSFUL in 39s`).
+- **Status**: CLOSED
+
 
 #### [ISSUE-060] [2026-07-31] Phase 2 Feature Expansion Complete — Snooze Persistence (DB v23), Item Velocity Bucketing, Expiry Batching & Tracking, Bill PNG Builder, and Repeat Order Sheet
 - **Symptom**: Feature expansion required for Phase 2:
@@ -880,4 +1696,158 @@ CREATE TABLE IF NOT EXISTS public.transactions (
 - **Primary Edge Function**: [process-voice-job/index.ts](file:///C:/Users/harsh/Documents/Voice%20To%20Invoice/supabase/functions/process-voice-job/index.ts)
 - **DB Setup Function**: [db-setup/index.ts](file:///C:/Users/harsh/Documents/Voice%20To%20Invoice/supabase/functions/db-setup/index.ts)
 - **Android Background Worker**: [SttWorker.kt](file:///C:/Users/harsh/Documents/Voice%20To%20Invoice/app/src/main/java/com/voicetoinvoice/app/domain/processor/SttWorker.kt)
-- **Latest Debug APK**: `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v95.apk`
+- **Latest Debug APK**: `C:\Users\harsh\OneDrive\Desktop\VoiceToInvoice_APKs\VoiceToInvoice_v106.apk` (corrected 2026-08-05 — this row said v105 while ISSUE-079 already documented v106 as built/installed; §5 had drifted behind §2)
+
+---
+
+## 6. Audio Capture Subsystem — Call Map (verified against working-tree source, 2026-08-05)
+
+This section exists because ISSUE-061 through ISSUE-079 are nineteen consecutive fixes to
+one subsystem (`RollingAudioBuffer` + its callers). Six of those plans (061-075) patched
+symptoms of the same design conflict — a continuously-running ring buffer being stopped
+for ASSISTANT presses — without ever naming the conflict. ISSUE-076 finally named it and
+rewrote the architecture. This map documents the **current, post-076 state** so the next
+session (any agent) can see the whole call graph before writing fix #20, instead of
+re-deriving it from a partial file read the way this happened repeatedly in 061-075.
+
+**Re-verify this map against the live files before trusting it for a new diagnosis** — it
+is accurate as of the commit state at the time of writing, not a guarantee about any later
+session's working tree control the flow of a specific press.
+
+```
+RollingAudioBuffer (app/src/main/java/.../audio/RollingAudioBuffer.kt)
+├── startRollingBuffer()      cold reset: totalBytesWritten=0, writeHead=0, lastWriteAtMs=0,
+│                             stoppedAtMs=0, pausedAtMs=0, resumeAtMs=0, resumeByteOffset=0,
+│                             ring buffer zeroed. Starts a new AudioRecord capture thread.
+│   called by:
+│   ├── smartStart()                          — when totalBytesWritten==0 (first launch) or gapMs > 10s
+│   ├── resumeRollingBuffer()'s AudioRecord-init-failure fallback (posted to main thread)
+│   ├── HomeScreen.kt:123  DisposableEffect    — DEAD CODE today: only fires if
+│   ├── StockInScreen.kt:99 DisposableEffect   —   sharedRollingAudioBuffer param is null,
+│   │                                             which MainActivity never leaves null
+│   │                                             (passes sharedRollingBuffer at lines
+│   │                                             416/587/805). A future screen that omits
+│   │                                             that parameter would silently re-enable
+│   │                                             this cold-reset path — verify the param
+│   │                                             is wired before adding any new screen
+│   │                                             that owns a PttMicButton.
+│
+├── stopRollingBuffer()       sets isRecordingRunning=false, stoppedAtMs=now, pausedAtMs=now,
+│                             joins capture thread (1500ms timeout)
+│   called by:
+│   ├── MainActivity.kt:313  ON_STOP lifecycle event (app backgrounded)
+│   └── MainActivity.kt:320  onDispose (activity destroyed)
+│   NOT called by: PttMicButton.kt — confirmed zero call sites. ASSISTANT presses no
+│   longer stop the buffer (this is the ISSUE-076 architectural change). If a future
+│   diagnosis assumes ASSISTANT stops the buffer, re-grep before trusting that assumption —
+│   it was true through ISSUE-075 and has not been true since ISSUE-076.
+│
+├── smartStart()              gapMs = now - stoppedAtMs; routes to startRollingBuffer() if
+│                             totalBytesWritten==0 or gapMs > RESUME_MAX_GAP_MS (10s),
+│                             else resumeRollingBuffer()
+│   called by:
+│   └── MainActivity.kt:312  ON_START lifecycle event (app foregrounded)
+│   This is the ONLY entry point that carries the long-gap guard. Anything that calls
+│   resumeRollingBuffer() directly bypasses the 10s gap check by construction — currently
+│   nothing does this (verified: resumeRollingBuffer's only caller is smartStart() and its
+│   own AudioRecord-failure branch calls startRollingBuffer, not itself), but this is the
+│   invariant to re-check first if a future change reintroduces a direct caller.
+│
+├── resumeRollingBuffer()     preserves totalBytesWritten/writeHead/ring content, sets
+│                             lastWriteAtMs=now, resumeAtMs=now, resumeByteOffset=totalBytesWritten
+│                             (snapshot BEFORE the capture thread starts)
+│   called by:
+│   └── smartStart()          only
+│
+└── extractAudioWindow(startMs, endMs, outputFile, floorStartMs)
+    called by:
+    └── PttMicButton.kt:239  processGroup lambda — the ONLY audio-extraction call site
+                              in the app, shared identically by SALE, STOCK, and ASSISTANT
+                              (CaptureIntent no longer branches the capture path — it only
+                              tags the resulting SttJobRecord and selects which
+                              PttBurstCoalescer instance is used: salePttBurstCoalescer /
+                              stockPttBurstCoalescer / assistantPttBurstCoalescer,
+                              MainActivity.kt:287-295)
+    internal clamping (both must independently agree an extraction is valid):
+    1. pausedAtMs/resumeAtMs floor (RollingAudioBuffer.kt:283-287) — if the requested
+       startMs falls before the most recent resume, clamp forward to resumeAtMs
+    2. resumeByteOffset clamp (RollingAudioBuffer.kt:319-325) — even after (1), the linear
+       time→byte formula can still resolve to a byte position before resumeByteOffset
+       because AudioRecord.startRecording() has ~50-200ms hardware latency after
+       lastWriteAtMs is stamped; this clamp catches that residual case (ISSUE-078)
+    on any failure: PttMicButton.kt:281-300 — Toast "रिकॉर्डिंग नहीं हुई" + a FAILED
+    SttJobRecord with diagnosticTraceJson.client.extraction_null=true (ISSUE-076 Bug 3).
+    Before this fix, a null extraction produced zero trace of the press anywhere.
+
+PttMicButton.kt — single unified press handler for ALL three CaptureIntent values
+    onPress → pttWindowLedger.recordPress(pressTimestamp) → tryAwaitRelease() →
+    pttBurstCoalescer.recordPressRelease(...) → [immediate flush or 300ms-idle flush] →
+    processGroup(burstGroup) → extractAudioWindow(...) → SttJobRecord(status=QUEUED,
+    captureIntent=intent) → WorkManager.enqueue(SttWorker)
+
+    There is no CaptureIntent.ASSISTANT branch in this file (verified 2026-08-05 — grepped
+    for "ASSISTANT" and "AssistantFastPath" import, both absent). AssistantFastPath.kt's
+    on-device-STT fast path described in ISSUE-073/075 (stopRollingBuffer → SpeechRecognizer
+    → resumeRollingBuffer) is superseded; per ISSUE-076/078, ASSISTANT audio is now captured
+    by the same ring-buffer extraction as SALE/STOCK and answered server-side via
+    SttWorker.kt's dual-STT pipeline. If AssistantFastPath.kt still exists on disk, treat it
+    as dead code pending a grep confirming nothing calls it — do not assume the doc comments
+    inside that file describe the live path.
+
+Tests covering this subsystem:
+- JVM unit: app/src/test/java/.../audio/RollingBufferWindowTest.kt — pure resolveWindowBytes
+  only (5 tests, no stop/resume/gap scenarios as of 2026-08-05 — see §7 dead-end log)
+- Instrumented (physical device required): app/src/androidTest/java/.../audio/RollingBufferRestartTest.kt
+  — referenced by ISSUE-061/062/063 for writeHead-reset, mic-release-join, and suppression-leak
+  behavior; exists on disk, not run as part of `./gradlew test` (JVM), only `connectedAndroidTest`
+
+---
+
+## 7. Diagnostic Dead Ends & Failed Hypotheses
+
+Purpose: §2 (Living Issues Log) records what was fixed. This section records what was
+**wrongly believed** while trying to fix it, and for how long, so a future session doesn't
+spend a repeat round-trip re-discovering that a plausible-sounding diagnosis was already
+tried and was wrong. An unlogged dead end is exactly as invisible to the next agent as an
+unlogged fix — CLAUDE.md's sync rule for §2 applies here too.
+
+#### [DEAD-END-001] [2026-08-04 → 2026-08-05] "Old APK still running" maintained across a live architecture rewrite
+
+**What was believed:** Across a multi-hour Claude Code session, every wrong-window symptom
+report from the user was attributed to the user still running a stale APK (v100/v101),
+based on `stt_job_logs` traces whose `{"client":{"fast_path":true,...}}` shape matched only
+code that predated the session's own fix plan.
+
+**Why it was wrong to hold this long:** The attribution was correct for the *specific
+traces checked* — those really were old-APK jobs. The error was extending "the DB rows I
+checked are old" to "the user's claim that the bug persists is explained by this" without
+re-opening the current source after the user pushed back twice ("i have 101 alr", "i said
+everything properly its all wrong"). By the time of the second pushback, ISSUE-076 through
+078 (`Never-Stop Ring Buffer Architecture`, `Ring Buffer Resume Byte Clamp`) had already
+been implemented in the working tree — ahead of the file state the diagnosis was reasoning
+from, which had been read once earlier in the session and never re-read.
+
+**Concrete miss:** In the same session, after being asked to demonstrate independent
+analysis, Claude Code re-derived a "bug" — ASSISTANT's `resumeRollingBuffer()` call
+bypassing `smartStart()`'s 10-second gap guard — by reading `PttMicButton.kt` from a
+**cached read several turns earlier**, not the file on disk at that moment. The bug had
+already stopped existing: ISSUE-076 had removed the `CaptureIntent.ASSISTANT` branch from
+`PttMicButton.kt` entirely, so there was no `resumeRollingBuffer()` call left in that file
+to bypass anything. Re-reading the file fresh (prompted by an unrelated request to write
+regression tests) surfaced the drift immediately.
+
+**Disconfirming check that would have caught this sooner and wasn't run until forced:**
+`git status` / a fresh `Read` of `PttMicButton.kt` and `RollingAudioBuffer.kt` immediately
+after the user's first "I have v101, it's still wrong" — before producing another paragraph
+of explanation. The check is one tool call; the miss cost two exchanges plus a wrong
+"finding" presented as new analysis.
+
+**Rule this violates:** Global CLAUDE.md rule 7 ("when the user contradicts your diagnosis,
+investigate your model, not their claim") and rule 5 ("delegated/prior conclusions are
+hypotheses until independently re-verified — including your own prior reads in the same
+session"). Logged here per the instruction in that same rule set, so the next agent
+inherits the lesson from the log instead of the private memory file only Claude Code reads.
+
+**Status:** Closed by inspection — current source (2026-08-05) confirms ISSUE-076/078/079
+are real, present, and address the reported symptom class. No outstanding action beyond
+what §6 documents.

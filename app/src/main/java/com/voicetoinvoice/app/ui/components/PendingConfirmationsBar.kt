@@ -17,6 +17,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.voicetoinvoice.app.ui.theme.LedgerColors
 
 @Composable
 fun PendingConfirmationsBar(
@@ -42,7 +43,7 @@ fun PendingConfirmationsBar(
                 modifier = Modifier
                     .background(
                         Brush.horizontalGradient(
-                            colors = listOf(Color(0xFF0288D1), Color(0xFF0077C2))
+                            colors = listOf(LedgerColors.Upi, Color(0xFF0077C2))
                         )
                     )
                     .padding(horizontal = 20.dp, vertical = 12.dp)

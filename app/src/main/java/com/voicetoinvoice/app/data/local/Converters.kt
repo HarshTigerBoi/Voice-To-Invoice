@@ -34,4 +34,10 @@ class Converters {
 
     @TypeConverter
     fun toSyncAction(value: String): SyncAction = SyncAction.valueOf(value)
+
+    @TypeConverter
+    fun fromExpenseCategory(value: ExpenseCategory): String = value.name
+
+    @TypeConverter
+    fun toExpenseCategory(value: String): ExpenseCategory = ExpenseCategory.valueOf(value)
 }

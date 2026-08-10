@@ -24,6 +24,8 @@ class ProfitCalculator(private val db: AppDatabase) {
     suspend fun compute(startMs: Long, endMs: Long): ProfitResult {
         val t = db.transactionDao().getPeriodTotals(startMs, endMs)
 
+        val expenses = db.expenseDao().getPeriodTotal(startMs, endMs)
+
         val grossProfit = t.revenueWithCost - t.cogs
         // Margin's denominator is revenue WITH cost, never total revenue: mixing costed and
         // uncosted lines understates margin by exactly the uncosted share.
@@ -38,7 +40,9 @@ class ProfitCalculator(private val db: AppDatabase) {
             marginPct = marginPct,
             costCoveragePct = coveragePct,
             linesWithCost = (t.lineCount - t.linesWithoutCost).coerceAtLeast(0),
-            linesWithoutCost = t.linesWithoutCost
+            linesWithoutCost = t.linesWithoutCost,
+            expenses = expenses,
+            hasExpenseData = expenses > 0.0
         )
     }
 }
@@ -51,8 +55,13 @@ data class ProfitResult(
     val marginPct: Double,
     val costCoveragePct: Double,
     val linesWithCost: Int,
-    val linesWithoutCost: Int
+    val linesWithoutCost: Int,
+    val expenses: Double = 0.0,
+    val hasExpenseData: Boolean = false
 ) {
+    /** Gross profit minus period expenses. Only meaningful when [hasExpenseData]. */
+    val netProfit: Double get() = grossProfit - expenses
+
     /** True when the figure covers essentially all revenue and needs no caveat. */
     val isFullyCosted: Boolean get() = linesWithoutCost == 0 || costCoveragePct >= 99.5
 

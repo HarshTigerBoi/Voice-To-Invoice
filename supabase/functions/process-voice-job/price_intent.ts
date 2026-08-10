@@ -214,6 +214,11 @@ export function implausibilityReason(
     return `sale value ₹${total.toFixed(2)} is below the ₹${MIN_PLAUSIBLE_SALE_VALUE} auto-confirm floor`
   }
 
+  const MAX_PLAUSIBLE_SALE_VALUE = mode === 'STOCK' ? 500000 : 50000
+  if (total > MAX_PLAUSIBLE_SALE_VALUE) {
+    return `sale value ₹${total.toFixed(2)} exceeds the ₹${MAX_PLAUSIBLE_SALE_VALUE} auto-confirm ceiling`
+  }
+
   // Numeric consistency guard: check if any compound number >= 10 in transcript was silently dropped
   if (rawTranscript) {
     const spokenNumbers = extractSpokenNumbers(rawTranscript)

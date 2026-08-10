@@ -23,6 +23,15 @@ data class ItemSales(
     val revenue: Double
 )
 
+data class FilteredTotals(
+    val revenue: Double,
+    val cash: Double,
+    val upi: Double,
+    val credit: Double,
+    val qty: Double,
+    val lineCount: Int
+)
+
 @Dao
 interface TransactionDao {
     @Query("SELECT * FROM transactions WHERE voided = 0 ORDER BY timestamp DESC")
@@ -30,6 +39,9 @@ interface TransactionDao {
 
     @Query("SELECT * FROM transactions WHERE voided = 0 ORDER BY timestamp DESC")
     suspend fun getAllTransactionsList(): List<TransactionRecord>
+
+    @Query("UPDATE transactions SET itemId = :newId WHERE itemId = :oldId")
+    suspend fun relinkItemId(oldId: String, newId: String)
 
     @Query("SELECT * FROM transactions WHERE voided = 0 AND timestamp >= :startTimeOfDay ORDER BY timestamp DESC")
     fun getTodayTransactions(startTimeOfDay: Long): Flow<List<TransactionRecord>>
@@ -196,4 +208,14 @@ interface TransactionDao {
         """
     )
     suspend fun getMostRecentBillId(): String?
+
+    // NOTE (ISSUE-119): SQL-side filtered row/total queries were specified in the plan and then
+    // deliberately removed after implementation. `DailySummaryScreen` already receives the FULL
+    // unpaginated row set for the selected range (`getTransactionsBetween`), so filtering and
+    // totalling that list in Kotlin yields identical results to a second round trip — the plan's
+    // stated rationale ("the filtered set can be larger than what is on screen") does not hold
+    // when nothing is paginated. Keeping two never-called @Query methods would have left dead
+    // code whose existence implied a mechanism the screen does not use. If pagination is ever
+    // introduced, reinstate them — the WHERE clause must then be byte-identical between the row
+    // query and the totals query, or the footer stops describing the rows above it.
 }

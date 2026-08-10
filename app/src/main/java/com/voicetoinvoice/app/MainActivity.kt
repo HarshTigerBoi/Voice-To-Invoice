@@ -24,6 +24,7 @@ import com.voicetoinvoice.app.ui.screens.stockin.StockInScreen
 import com.voicetoinvoice.app.ui.screens.summary.DailySummaryScreen
 import com.voicetoinvoice.app.ui.screens.udhaar.UdhaarScreen
 import com.voicetoinvoice.app.ui.theme.VoiceToInvoiceTheme
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 import java.util.Calendar
 
@@ -51,6 +52,7 @@ import com.voicetoinvoice.app.domain.processor.BackgroundSttProcessor
 import com.voicetoinvoice.app.ui.components.AssistantFloatingButton
 import com.voicetoinvoice.app.ui.screens.logs.DiagnosticLogsScreen
 import com.voicetoinvoice.app.data.ShopContext
+import com.voicetoinvoice.app.data.ShopIdBackfill
 import com.voicetoinvoice.app.data.repository.StockLedgerRepository
 import com.voicetoinvoice.app.domain.action.ActionExecutor
 import com.voicetoinvoice.app.domain.action.ActionKind
@@ -73,6 +75,27 @@ class MainActivity : ComponentActivity() {
         // into another's, which is unrecoverable once synced.
         ShopContext.initialize(this)
         database = AppDatabase.getInstance(this)
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            // Must run before the first sync sweep: it re-tenants rows stranded on the legacy
+            // "default_shop" literal and clears catalog_items.synced so the priced catalog
+            // re-uploads under the real shop id.
+            ShopIdBackfill.runIfNeeded(this@MainActivity, database)
+            try {
+                android.util.Log.e("MAIN_ACTIVITY", "🚀 Starting deduplicateCatalog from lifecycleScope...")
+                database.catalogDao().deduplicateCatalog(
+                    database.transactionDao(),
+                    database.stockLedgerDao(),
+                    database.stockInDao(),
+                    database.stockBatchDao(),
+                    database.unmatchedQueueDao()
+                )
+                android.util.Log.e("MAIN_ACTIVITY", "✅ deduplicateCatalog finished!")
+            } catch (e: Exception) {
+                android.util.Log.e("MAIN_ACTIVITY", "❌ deduplicateCatalog failed!", e)
+            }
+        }
+
         enableEdgeToEdge()
 
         try {
@@ -91,7 +114,7 @@ class MainActivity : ComponentActivity() {
 }
 
 enum class Screen {
-    ONBOARDING, HOME, CATALOG, UDHAAR, SUPPLIER, PRICE_UPDATE, STOCK_IN, SUMMARY, SETTINGS, DIAGNOSTIC_LOGS, CUSTOMER_LIST, CUSTOMER_EDIT, CUSTOMER_DETAIL, REPORTS
+    ONBOARDING, HOME, CATALOG, UDHAAR, SUPPLIER, PRICE_UPDATE, STOCK_IN, SUMMARY, SETTINGS, DIAGNOSTIC_LOGS, CUSTOMER_LIST, CUSTOMER_EDIT, CUSTOMER_DETAIL, REPORTS, EXPENSE
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -110,6 +133,19 @@ fun MainAppScreen(database: AppDatabase) {
     // correct reports immediately instead of only from the upgrade date forward.
     LaunchedEffect(Unit) {
         kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                android.util.Log.e("MAIN_ACTIVITY", "🚀 Starting deduplicateCatalog from LaunchedEffect...")
+                database.catalogDao().deduplicateCatalog(
+                    database.transactionDao(),
+                    database.stockLedgerDao(),
+                    database.stockInDao(),
+                    database.stockBatchDao(),
+                    database.unmatchedQueueDao()
+                )
+                android.util.Log.e("MAIN_ACTIVITY", "✅ deduplicateCatalog completed successfully!")
+            } catch (e: Exception) {
+                android.util.Log.e("MAIN_ACTIVITY", "❌ deduplicateCatalog failed with exception: ${e.message}", e)
+            }
             database.alertDismissalDao().purgeExpired(System.currentTimeMillis())
             com.voicetoinvoice.app.domain.action.BillBuilder.purgeOld(context)
             val prefs = context.getSharedPreferences("rollup_backfill", android.content.Context.MODE_PRIVATE)
@@ -231,7 +267,6 @@ fun MainAppScreen(database: AppDatabase) {
     }.collectAsState(initial = emptyList())
     val creditsState by database.creditDao().getAllCredits().collectAsState(initial = emptyList())
     val unmatchedState by database.unmatchedQueueDao().getPendingItems().collectAsState(initial = emptyList())
-    val sttJobsState by database.sttJobDao().getAllJobsTraceLogsFlow().collectAsState(initial = emptyList())
     val customersState by database.customerDao().getActiveCustomers().collectAsState(initial = emptyList())
 
     // Fix 3: CustomerListScreen/CustomerDetailScreen need outstanding-per-customer, not just
@@ -278,8 +313,27 @@ fun MainAppScreen(database: AppDatabase) {
     // started once, for the app's lifetime.
     val sharedAudioRecorder = remember { AudioRecorder(context) }
     val sharedRollingBuffer = remember { RollingAudioBuffer(context) }
-    val sharedPttWindowLedger = remember { PttWindowLedger.getInstance() }
-    val sharedBurstCoalescer = remember(sharedRollingBuffer) {
+    // Wire the Compose-owned buffer as the static singleton so SpeechOutput (in SttWorker)
+    // calls setSuppressed() on the same instance that is actually recording.
+    LaunchedEffect(sharedRollingBuffer) {
+        RollingAudioBuffer.setSharedInstance(sharedRollingBuffer)
+    }
+    // Each intent group must track its own lastConsumedEndMs independently.
+    // SALE + CREDIT_SALE (HomeScreen) and STOCK_IN (StockInScreen) each call
+    // PttWindowLedger.getInstance() internally -- that singleton is correct for
+    // keeping those two screens' presses from overlapping each other.
+    // The ASSISTANT button MUST have its own isolated ledger: if it shared the
+    // sale singleton, every ASSISTANT commitWindow() would advance lastEndMs and
+    // cause the next SALE press's clampedStartMs to jump past the actual speech,
+    // and vice versa -- giving the assistant an empty/wrong audio window.
+    val assistantPttWindowLedger = remember { PttWindowLedger() }
+    val salePttBurstCoalescer = remember(sharedRollingBuffer) {
+        PttBurstCoalescer(300L, 300L, (sharedRollingBuffer.getBufferDurationSeconds() - 5) * 1000L)
+    }
+    val stockPttBurstCoalescer = remember(sharedRollingBuffer) {
+        PttBurstCoalescer(300L, 300L, (sharedRollingBuffer.getBufferDurationSeconds() - 5) * 1000L)
+    }
+    val assistantPttBurstCoalescer = remember(sharedRollingBuffer) {
         PttBurstCoalescer(300L, 300L, (sharedRollingBuffer.getBufferDurationSeconds() - 5) * 1000L)
     }
     val sharedOnDeviceRecognizer = remember { OnDeviceSpeechRecognizer(context) }
@@ -298,7 +352,18 @@ fun MainAppScreen(database: AppDatabase) {
     DisposableEffect(lifecycleOwner) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
             when (event) {
-                androidx.lifecycle.Lifecycle.Event.ON_START -> sharedRollingBuffer.startRollingBuffer()
+                androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                    val coldStarted = sharedRollingBuffer.smartStart()
+                    if (coldStarted) {
+                        // The ring was wiped and totalBytesWritten reset to 0. Every timestamp the
+                        // ledger and the coalescers hold refers to the previous epoch's bytes.
+                        PttWindowLedger.getInstance().reset()
+                        assistantPttWindowLedger.reset()
+                        salePttBurstCoalescer.reset()
+                        stockPttBurstCoalescer.reset()
+                        assistantPttBurstCoalescer.reset()
+                    }
+                }
                 androidx.lifecycle.Lifecycle.Event.ON_STOP -> sharedRollingBuffer.stopRollingBuffer()
                 else -> Unit
             }
@@ -403,7 +468,7 @@ fun MainAppScreen(database: AppDatabase) {
                         },
                         sharedAudioRecorder = sharedAudioRecorder,
                         sharedRollingAudioBuffer = sharedRollingBuffer,
-                        sharedPttBurstCoalescer = sharedBurstCoalescer,
+                        sharedPttBurstCoalescer = salePttBurstCoalescer,
                         sharedOnDeviceRecognizer = sharedOnDeviceRecognizer,
                         sharedBackgroundProcessor = sharedBackgroundProcessor,
                         onConfirmSale = { parsedSale ->
@@ -463,7 +528,13 @@ fun MainAppScreen(database: AppDatabase) {
                         stockLevels = stockLevelsMap,
                         onAddItem = { name, unitId, price ->
                             scope.launch {
-                                database.catalogDao().insertOrUpdate(CatalogItem(name = name, unitId = unitId, price = price))
+                                val norm = name.trim().lowercase()
+                                val existing = database.catalogDao().getAllCatalogList().find { it.name.trim().lowercase() == norm }
+                                if (existing != null) {
+                                    database.catalogDao().insertOrUpdate(existing.copy(name = name, unitId = unitId, price = price, active = true, synced = false))
+                                } else {
+                                    database.catalogDao().insertOrUpdate(CatalogItem(name = name, unitId = unitId, price = price))
+                                }
                                 syncEngine.syncAllUnsynced()
                             }
                         },
@@ -574,7 +645,7 @@ fun MainAppScreen(database: AppDatabase) {
                         onNavigateBack = { currentScreen = Screen.HOME },
                         sharedAudioRecorder = sharedAudioRecorder,
                         sharedRollingAudioBuffer = sharedRollingBuffer,
-                        sharedPttBurstCoalescer = sharedBurstCoalescer,
+                        sharedPttBurstCoalescer = stockPttBurstCoalescer,
                         sharedOnDeviceRecognizer = sharedOnDeviceRecognizer,
                         sharedBackgroundProcessor = sharedBackgroundProcessor
                     )
@@ -584,6 +655,7 @@ fun MainAppScreen(database: AppDatabase) {
                         rangeTransactions = rangeTransactionsState,
                         rangeMode = summaryRangeMode,
                         onRangeModeChange = { summaryRangeMode = it },
+                        catalog = catalogState,
                         onUpdateTxPrice = { tx, newUnitPrice ->
                             scope.launch {
                                 val newTotal = newUnitPrice * tx.quantity
@@ -609,6 +681,12 @@ fun MainAppScreen(database: AppDatabase) {
                 }
                 Screen.REPORTS -> {
                     com.voicetoinvoice.app.ui.screens.reports.ReportsScreen(
+                        onNavigateBack = { currentScreen = reportsOrigin },
+                        onNavigateToExpense = { currentScreen = Screen.EXPENSE }
+                    )
+                }
+                Screen.EXPENSE -> {
+                    com.voicetoinvoice.app.ui.screens.expense.ExpenseScreen(
                         onNavigateBack = { currentScreen = reportsOrigin }
                     )
                 }
@@ -699,7 +777,7 @@ fun MainAppScreen(database: AppDatabase) {
                 Screen.CUSTOMER_EDIT -> {
                     CustomerEditScreen(
                         existingCustomers = customersState,
-                        onSave = { name, keyword, phone ->
+                        onSave = { name, keyword, phone, photoPath ->
                             scope.launch {
                                 val freeCode = database.customerDao().nextFreeCode()
                                 val key = com.voicetoinvoice.app.domain.parser.PhoneticKey.of(name)
@@ -708,7 +786,8 @@ fun MainAppScreen(database: AppDatabase) {
                                     code = freeCode,
                                     keyword = keyword,
                                     phone = phone,
-                                    phoneticKey = key
+                                    phoneticKey = key,
+                                    photoPath = photoPath
                                 )
                                 database.customerDao().insert(record)
 
@@ -793,8 +872,8 @@ fun MainAppScreen(database: AppDatabase) {
                     db = database,
                     rollingAudioBuffer = sharedRollingBuffer,
                     audioRecorder = sharedAudioRecorder,
-                    pttBurstCoalescer = sharedBurstCoalescer,
-                    pttWindowLedger = sharedPttWindowLedger,
+                    pttBurstCoalescer = assistantPttBurstCoalescer,
+                    pttWindowLedger = assistantPttWindowLedger,
                     onDeviceRecognizer = sharedOnDeviceRecognizer,
                     backgroundProcessor = sharedBackgroundProcessor,
                     permissionLauncher = sharedPermissionLauncher,

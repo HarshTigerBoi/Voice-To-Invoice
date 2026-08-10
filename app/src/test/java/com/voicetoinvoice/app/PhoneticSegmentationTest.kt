@@ -2,6 +2,7 @@ package com.voicetoinvoice.app
 
 import com.voicetoinvoice.app.domain.parser.OrderingSegmenter
 import com.voicetoinvoice.app.domain.parser.PhoneticKey
+import com.voicetoinvoice.app.domain.parser.ResolutionKind
 import com.voicetoinvoice.app.domain.parser.SalePlausibility
 import org.junit.Assert.*
 import org.junit.Before
@@ -405,5 +406,69 @@ class PhoneticSegmentationTest {
             "heardSegmentText must preserve सोयाबीन verbatim regardless of what it resolved to, got '${seg.heardSegmentText}'",
             seg.heardSegmentText.contains("सोयाबीन")
         )
+    }
+
+    // ---------- ISSUE-103: short key collision and discourse particle filtering ----------
+
+    @Test
+    fun discourseParticleHanIsFilteredAndDoesNotBookItem() {
+        val result = segmenter.segmentTranscript("दो किलो हाँ")
+        assertEquals(0, result.segments.size)
+        assertEquals(2.0, result.carryoverQty ?: 0.0, 0.01)
+    }
+
+    @Test
+    fun discourseParticleKeIsFilteredAndDoesNotBookItem() {
+        val result = segmenter.segmentTranscript("दो किलो के")
+        assertEquals(0, result.segments.size)
+        assertEquals(2.0, result.carryoverQty ?: 0.0, 0.01)
+    }
+
+    @Test
+    fun genuineAamSaleStillMatchesWithZeroDistance() {
+        val result = segmenter.segmentTranscript("दो किलो आम", catalogNames = listOf("Aam"))
+        assertEquals(1, result.segments.size)
+        assertEquals(2.0, result.segments[0].quantity, 0.01)
+        assertEquals(ResolutionKind.AMBIGUOUS, result.segments[0].resolutionKind)
+        assertEquals(0.0, result.segments[0].itemMatchNorm ?: -1.0, 0.001)
+    }
+
+    // ---------- ISSUE-106: Fragmented Hindi compound numerals ----------
+
+    @Test
+    fun rejoinsReportedFragmentationTaintees() {
+        val result = segmenter.segmentTranscript("ते तीस किलो आलू", catalogNames = listOf("Aaloo"))
+        assertEquals(1, result.segments.size)
+        assertEquals(33.0, result.segments[0].quantity, 0.01)
+        assertEquals("KG", result.segments[0].unit)
+        assertFalse(result.segments[0].numeralRejoinLowMargin)
+    }
+
+    @Test
+    fun rejoinsIrregularNumerals() {
+        assertEquals(52.0, segmenter.segmentTranscript("बा वन किलो आलू", catalogNames = listOf("Aaloo")).segments[0].quantity, 0.01)
+        assertEquals(92.0, segmenter.segmentTranscript("बान वे किलो आलू", catalogNames = listOf("Aaloo")).segments[0].quantity, 0.01)
+        assertEquals(45.0, segmenter.segmentTranscript("पैंता लीस किलो आलू", catalogNames = listOf("Aaloo")).segments[0].quantity, 0.01)
+    }
+
+    @Test
+    fun loadBearingDoesNotRejoinWhenLeftTokenIsRealItem() {
+        val result = segmenter.segmentTranscript("दही तीस किलो", catalogNames = listOf("Dahi"))
+        assertNotEquals(33.0, result.segments.firstOrNull()?.quantity ?: 0.0, 0.01)
+    }
+
+    @Test
+    fun doesNotCorruptCleanTranscripts() {
+        assertEquals(33.0, segmenter.segmentTranscript("तैंतीस किलो आलू", catalogNames = listOf("Aaloo")).segments[0].quantity, 0.01)
+        assertEquals(10.0, segmenter.segmentTranscript("दस किलो आलू", catalogNames = listOf("Aaloo")).segments[0].quantity, 0.01)
+        val harishRes = segmenter.segmentTranscript("हर्ष दस किलो आलू", catalogNames = listOf("Aaloo"))
+        assertEquals(10.0, harishRes.segments.find { it.quantity == 10.0 }?.quantity ?: 0.0, 0.01)
+        assertEquals(50.0, segmenter.segmentTranscript("पचास किलो आलू", catalogNames = listOf("Aaloo")).segments[0].quantity, 0.01)
+    }
+
+    @Test
+    fun flagsAmbiguousRejoinInsteadOfCommitting() {
+        val result = segmenter.segmentTranscript("ते ईस किलो आलू", catalogNames = listOf("Aaloo"))
+        assertTrue(result.segments[0].numeralRejoinLowMargin)
     }
 }

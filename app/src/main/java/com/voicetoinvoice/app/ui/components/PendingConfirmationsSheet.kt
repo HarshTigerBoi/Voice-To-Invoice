@@ -365,6 +365,14 @@ fun PendingConfirmationsSheet(
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
+                                        val matchedCatalogItem = catalog.firstOrNull { it.id == line.itemId || it.name.equals(line.itemName, ignoreCase = true) }
+                                        ItemIcon(
+                                            itemName = line.itemName,
+                                            imageUrl = matchedCatalogItem?.imageUrl,
+                                            imagePath = matchedCatalogItem?.imagePath,
+                                            size = 36.dp
+                                        )
+                                        Spacer(modifier = Modifier.width(10.dp))
                                         Column(modifier = Modifier.weight(1f)) {
                                             Text(
                                                 text = line.itemName,

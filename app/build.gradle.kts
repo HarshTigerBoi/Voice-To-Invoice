@@ -1,3 +1,5 @@
+import java.time.LocalDateTime
+
 plugins {
   alias(libs.plugins.android.application)
   alias(libs.plugins.kotlin.android)
@@ -19,12 +21,39 @@ android {
         // which cannot run AndroidJUnit4 tests -- the run died with "Instrumentation run failed
         // due to Process crashed" and reported zero tests.
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField(
+            "String",
+            "BUILD_STAMP",
+            "\"" + LocalDateTime.now().toString().substring(0, 19) + "\""
+        )
+        buildConfigField(
+            "String",
+            "GIT_SHA",
+            "\"" + (try {
+                val p = ProcessBuilder("git", "rev-parse", "--short", "HEAD")
+                    .directory(rootDir).start()
+                p.inputStream.bufferedReader().readText().trim().ifEmpty { "nogit" }
+            } catch (e: Exception) { "nogit" }) + "\""
+        )
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+        // ISSUE-116: every APK shipped so far has been `assembleDebug` — debuggable, no R8.
+        // This variant is release-shaped (not debuggable, R8 on) but signed with the debug
+        // keystore, so it installs on the test phone without introducing a signing secret.
+        // Obfuscation stays OFF: it buys nothing here and would make stack traces unreadable
+        // while the parse pipeline is still being tuned.
+        create("perf") {
+            initWith(getByName("release"))
+            isMinifyEnabled = true
+            isShrinkResources = true
+            isDebuggable = false
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
         }
     }
     compileOptions {
@@ -39,7 +68,7 @@ android {
     buildFeatures {
       compose = true
       aidl = false
-      buildConfig = false
+      buildConfig = true
       shaders = false
     }
 
@@ -64,12 +93,16 @@ dependencies {
   implementation(libs.androidx.lifecycle.runtime.compose)
   implementation(libs.androidx.lifecycle.viewmodel.compose)
   implementation("androidx.work:work-runtime-ktx:2.9.0")
+  // Lets a baseline profile be installed once one is generated (see Phase E preamble).
+  implementation("androidx.profileinstaller:profileinstaller:1.3.1")
 
   // Compose
   implementation(libs.androidx.compose.ui)
   implementation(libs.androidx.compose.ui.tooling.preview)
   implementation(libs.androidx.compose.material3)
   implementation(libs.androidx.compose.material.icons.extended)
+  // Async Image Loading (Item Icons)
+  implementation("io.coil-kt:coil-compose:2.6.0")
   // Tooling
   debugImplementation(libs.androidx.compose.ui.tooling)
   // Instrumented tests

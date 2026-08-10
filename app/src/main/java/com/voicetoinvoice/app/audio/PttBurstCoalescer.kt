@@ -34,17 +34,24 @@ data class CoalescedBurstGroup(
     }
 }
 
+sealed class BurstFlush {
+    data class Ready(val group: CoalescedBurstGroup) : BurstFlush()
+    /** Group was discarded before extraction; recorded so Diagnostic Logs shows WHY. */
+    data class Dropped(val reason: String, val firstPressMs: Long, val lastReleaseMs: Long) : BurstFlush()
+}
+
 class PttBurstCoalescer(
     private val preRollMs: Long = 300L,
     private val postRollMs: Long = 300L,
     private val maxGroupSpanMs: Long = 115000L
 ) {
     val gapThresholdMs: Long = preRollMs + postRollMs
+    private val maxGroupAgeMs: Long = 5_000L
 
     private val currentGroupPairs = mutableListOf<PressReleasePair>()
 
     @Synchronized
-    fun recordPressRelease(pressMs: Long, releaseMs: Long, lastConsumedEndMs: Long = 0L): CoalescedBurstGroup? {
+    fun recordPressRelease(pressMs: Long, releaseMs: Long, lastConsumedEndMs: Long = 0L): BurstFlush? {
         val safeReleaseMs = max(releaseMs, pressMs + 10L)
 
         if (currentGroupPairs.isNotEmpty()) {
@@ -54,7 +61,7 @@ class PttBurstCoalescer(
             val potentialSpanMs = safeReleaseMs - firstPressMs
 
             if (gapMs >= gapThresholdMs || potentialSpanMs >= maxGroupSpanMs) {
-                val flushedGroup = buildGroupLocked(lastConsumedEndMs)
+                val flushedGroup = buildGroupLocked(lastConsumedEndMs, pressMs)
                 currentGroupPairs.clear()
                 currentGroupPairs.add(PressReleasePair(pressMs, safeReleaseMs))
                 return flushedGroup
@@ -66,11 +73,11 @@ class PttBurstCoalescer(
     }
 
     @Synchronized
-    fun checkAndFlushIfIdle(lastReleaseMs: Long, nowMs: Long, lastConsumedEndMs: Long): CoalescedBurstGroup? {
+    fun checkAndFlushIfIdle(lastReleaseMs: Long, nowMs: Long, lastConsumedEndMs: Long): BurstFlush? {
         if (currentGroupPairs.isEmpty()) return null
         val groupLastRelease = currentGroupPairs.last().releaseMs
         if (groupLastRelease == lastReleaseMs && (nowMs - groupLastRelease) >= gapThresholdMs) {
-            val flushed = buildGroupLocked(lastConsumedEndMs)
+            val flushed = buildGroupLocked(lastConsumedEndMs, nowMs)
             currentGroupPairs.clear()
             return flushed
         }
@@ -78,9 +85,9 @@ class PttBurstCoalescer(
     }
 
     @Synchronized
-    fun forceFlush(lastConsumedEndMs: Long = 0L): CoalescedBurstGroup? {
+    fun forceFlush(lastConsumedEndMs: Long = 0L): BurstFlush? {
         if (currentGroupPairs.isEmpty()) return null
-        val flushed = buildGroupLocked(lastConsumedEndMs)
+        val flushed = buildGroupLocked(lastConsumedEndMs, System.currentTimeMillis())
         currentGroupPairs.clear()
         return flushed
     }
@@ -90,13 +97,23 @@ class PttBurstCoalescer(
         currentGroupPairs.clear()
     }
 
-    private fun buildGroupLocked(lastConsumedEndMs: Long = 0L): CoalescedBurstGroup {
+    private fun buildGroupLocked(lastConsumedEndMs: Long, nowMs: Long): BurstFlush {
         val firstPressMs = currentGroupPairs.first().pressMs
         val lastReleaseMs = currentGroupPairs.last().releaseMs
 
+        if (nowMs - lastReleaseMs > maxGroupAgeMs) {
+            return BurstFlush.Dropped("stale_group_age_${nowMs - lastReleaseMs}ms", firstPressMs, lastReleaseMs)
+        }
+
         val rawStartMs = max(0L, firstPressMs - preRollMs)
         val clampedStartMs = max(rawStartMs, lastConsumedEndMs)
-        val clampedEndMs = max(clampedStartMs + 100L, lastReleaseMs + postRollMs)
+        val rawEndMs = lastReleaseMs + postRollMs
+
+        // Previously this emitted `max(clampedStartMs + 100L, rawEndMs)` -- a 100ms window that
+        // is always below MIN_WINDOW_BYTES, i.e. a guaranteed extraction_null. Drop instead.
+        if (rawEndMs - clampedStartMs < MIN_USABLE_WINDOW_MS) {
+            return BurstFlush.Dropped("window_consumed_by_ledger", firstPressMs, lastReleaseMs)
+        }
 
         val boundaries = currentGroupPairs.map { pair ->
             UtteranceBoundary(
@@ -105,13 +122,17 @@ class PttBurstCoalescer(
             )
         }
 
-        return CoalescedBurstGroup(
-            startMs = clampedStartMs,
-            endMs = clampedEndMs,
-            firstPressMs = firstPressMs,
-            lastReleaseMs = lastReleaseMs,
-            pressCount = currentGroupPairs.size,
-            boundaries = boundaries
+        return BurstFlush.Ready(
+            CoalescedBurstGroup(
+                startMs = clampedStartMs,
+                endMs = rawEndMs,
+                firstPressMs = firstPressMs,
+                lastReleaseMs = lastReleaseMs,
+                pressCount = currentGroupPairs.size,
+                boundaries = boundaries
+            )
         )
     }
+
+    companion object { const val MIN_USABLE_WINDOW_MS = 400L }
 }

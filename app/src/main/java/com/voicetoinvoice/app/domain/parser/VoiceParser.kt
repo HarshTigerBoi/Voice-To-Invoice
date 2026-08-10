@@ -250,16 +250,17 @@ class VoiceParser(private val matcher: FuzzyCatalogMatcher = FuzzyCatalogMatcher
     }
 
     private fun calculateTotalForUnits(qty: Double, unit: String, unitPrice: Double, defaultCatalogUnit: String): Double {
-        val qtyInStandardUnit = when (unit) {
-            "GRAM", "ML" -> qty * 0.001
-            "PAO" -> qty * 0.25
-            "AADHA" -> qty * 0.5
-            "SAWA" -> qty * 1.25
-            "DHAI" -> qty * 2.5
-            "DOZEN" -> qty * 12.0
-            else -> qty
+        val weightBase = mapOf("GRAM" to 1.0, "KG" to 1000.0)
+        val volumeBase = mapOf("ML" to 1.0, "LITRE" to 1000.0)
+        val s = unit.uppercase()
+        val c = defaultCatalogUnit.uppercase()
+        val factor = when {
+            s == c -> 1.0
+            weightBase.containsKey(s) && weightBase.containsKey(c) -> weightBase.getValue(s) / weightBase.getValue(c)
+            volumeBase.containsKey(s) && volumeBase.containsKey(c) -> volumeBase.getValue(s) / volumeBase.getValue(c)
+            else -> 1.0
         }
-        return qtyInStandardUnit * unitPrice
+        return qty * factor * unitPrice
     }
 
     private fun extractQtyUnitAndPrice(

@@ -16,11 +16,10 @@ serve(async (req) => {
     const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     const supabase = createClient(supabaseUrl, serviceRoleKey)
 
-    // Query all verified term aliases (verified = true)
+    // Query all verified & shop term aliases
     const { data, error } = await supabase
       .from('term_aliases')
-      .select('raw_term, canonical_value, domain')
-      .eq('verified', true)
+      .select('raw_term, canonical_value, domain, phonetic_key, shop_id, verified')
 
     if (error) {
       return new Response(JSON.stringify({ error: error.message }), {

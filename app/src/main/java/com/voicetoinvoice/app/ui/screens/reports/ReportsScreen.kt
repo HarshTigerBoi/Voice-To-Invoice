@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -30,6 +31,7 @@ import com.voicetoinvoice.app.domain.query.ProfitCalculator
 import com.voicetoinvoice.app.domain.query.ProfitResult
 import com.voicetoinvoice.app.domain.query.ReceivablesAging
 import com.voicetoinvoice.app.ui.screens.summary.RangeMode
+import com.voicetoinvoice.app.ui.theme.LedgerColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -56,7 +58,7 @@ private data class ReportsData(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ReportsScreen(onNavigateBack: () -> Unit) {
+fun ReportsScreen(onNavigateBack: () -> Unit, onNavigateToExpense: () -> Unit = {}) {
     val context = LocalContext.current
     val db = remember { AppDatabase.getInstance(context) }
     val rollups = remember { DailyRollupRepository(db) }
@@ -207,7 +209,7 @@ fun ReportsScreen(onNavigateBack: () -> Unit) {
                 )
                 Spacer(Modifier.height(12.dp))
             }
-            RevenueProfitCard(data, rangeMode)
+            RevenueProfitCard(data, rangeMode, onNavigateToExpense)
             Spacer(Modifier.height(12.dp))
             PaymentSplitCard(data)
             Spacer(Modifier.height(12.dp))
@@ -283,7 +285,7 @@ private fun MoversCard(movers: List<MoverLine>) {
             Text("तेज़ और धीमा बिकने वाला", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             if (fast.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))
-                Text("तेज़ 🔥", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = Color0xFF2E7D32)
+                Text("तेज़ 🔥", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = LedgerColors.MoneyIn)
                 fast.forEach { item ->
                     Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(item.itemName, style = MaterialTheme.typography.bodyMedium)
@@ -293,7 +295,7 @@ private fun MoversCard(movers: List<MoverLine>) {
             }
             if (slowAndDead.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))
-                Text("धीमा 🐢", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                Text("धीमा 🐢", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = LedgerColors.Udhaar)
                 slowAndDead.forEach { item ->
                     Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(item.itemName, style = MaterialTheme.typography.bodyMedium)
@@ -307,7 +309,7 @@ private fun MoversCard(movers: List<MoverLine>) {
 }
 
 @Composable
-private fun RevenueProfitCard(data: ReportsData, rangeMode: RangeMode) {
+private fun RevenueProfitCard(data: ReportsData, rangeMode: RangeMode, onNavigateToExpense: () -> Unit = {}) {
     val revenueDelta = if (data.prevRevenue > 0.0) {
         ((data.profit.revenue - data.prevRevenue) / data.prevRevenue) * 100.0
     } else null
@@ -328,19 +330,39 @@ private fun RevenueProfitCard(data: ReportsData, rangeMode: RangeMode) {
                     Text(
                         "${if (up) "▲" else "▼"} ${kotlin.math.abs(revenueDelta).toInt()}% पिछली अवधि से",
                         style = MaterialTheme.typography.labelMedium,
-                        color = if (up) Color0xFF2E7D32 else MaterialTheme.colorScheme.error
+                        color = LedgerColors.forDelta(revenueDelta)
                     )
                 }
             }
             HorizontalDivider(Modifier.padding(vertical = 12.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Column {
-                    Text("मुनाफ़ा", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("मुनाफ़ा (कच्चा)", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text("₹${IndianCurrency.format(data.profit.grossProfit)}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 }
                 Column(horizontalAlignment = Alignment.End) {
                     Text("मार्जिन", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text("${data.profit.marginPct.toInt()}%", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                }
+            }
+            if (data.profit.hasExpenseData) {
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Column {
+                        Text("मुनाफ़ा (खर्चा घटाकर)", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(
+                            "₹${IndianCurrency.format(data.profit.netProfit)}",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = LedgerColors.forDelta(data.profit.netProfit)
+                        )
+                    }
+                    if (data.profit.expenses > 0.0) {
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("कुल खर्चा", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("₹${IndianCurrency.format(data.profit.expenses)}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = LedgerColors.MoneyOut)
+                        }
+                    }
                 }
             }
             if (!data.profit.isFullyCosted) {
@@ -358,6 +380,15 @@ private fun RevenueProfitCard(data: ReportsData, rangeMode: RangeMode) {
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onNavigateToExpense,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(Modifier.width(6.dp))
+                Text("खर्चा दर्ज करें (Expenses)")
+            }
         }
     }
 }
@@ -401,7 +432,7 @@ private fun WasteAndReturnsCard(data: ReportsData) {
             if (totals.wasteValue > 0.0) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text("ख़राबी / नुकसान", style = MaterialTheme.typography.bodyMedium)
-                    Text("₹${IndianCurrency.format(totals.wasteValue)}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                    Text("₹${IndianCurrency.format(totals.wasteValue)}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = LedgerColors.MoneyOut)
                 }
             }
             if (totals.returnValue > 0.0) {
@@ -428,7 +459,7 @@ private fun ReceivablesCard(data: ReportsData) {
                     Text(
                         "₹${IndianCurrency.format(aging.overdue)} — 30 दिन से ज़्यादा पुराना",
                         style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.error
+                        color = LedgerColors.MoneyOut
                     )
                 }
             }
@@ -445,7 +476,7 @@ private fun HealthScoreCard(health: HealthScoreResult) {
                     "${health.score}",
                     style = MaterialTheme.typography.displaySmall,
                     fontWeight = FontWeight.Bold,
-                    color = healthColor(health.score)
+                    color = LedgerColors.forScore(health.score)
                 )
                 Spacer(Modifier.width(8.dp))
                 Column {
@@ -462,12 +493,6 @@ private fun HealthScoreCard(health: HealthScoreResult) {
             }
         }
     }
-}
-
-private fun healthColor(score: Int) = when {
-    score >= 70 -> Color0xFF2E7D32
-    score >= 40 -> androidx.compose.ui.graphics.Color(0xFFF9A825)
-    else -> androidx.compose.ui.graphics.Color(0xFFC62828)
 }
 
 @Composable
@@ -506,5 +531,3 @@ private fun AlertsCard(
 }
 
 private fun fmtQty(q: Double): String = if (q % 1.0 == 0.0) q.toInt().toString() else "%.1f".format(q)
-
-private val Color0xFF2E7D32 = androidx.compose.ui.graphics.Color(0xFF2E7D32)

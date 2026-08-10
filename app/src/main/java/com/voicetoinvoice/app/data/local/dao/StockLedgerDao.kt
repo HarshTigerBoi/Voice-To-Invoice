@@ -90,4 +90,7 @@ interface StockLedgerDao {
 
     @Query("SELECT DISTINCT itemId FROM stock_ledger")
     suspend fun getAllItemIdsWithMovement(): List<String>
+
+    @Query("UPDATE stock_ledger SET itemId = :newId WHERE itemId = :oldId")
+    suspend fun relinkItemId(oldId: String, newId: String)
 }

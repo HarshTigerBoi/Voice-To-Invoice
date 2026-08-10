@@ -36,6 +36,7 @@ class IntentRouterFixtureTest {
 
     private val noLines = JSONArray()
     private val onePotato = lines(Triple("आलू", 5.0, 150.0))
+    private val fourPotato = lines(Triple("आलू", 4.0, 120.0))
     private val singleUnitPotato = lines(Triple("आलू", 1.0, 30.0))
 
     private fun assertIntent(expected: AssistantIntent, transcript: String, items: JSONArray = JSONArray()) {
@@ -81,6 +82,9 @@ class IntentRouterFixtureTest {
         assertIntent(AssistantIntent.SALE, "पाँच किलो आलू", onePotato)
         assertIntent(AssistantIntent.SALE, "paanch kilo aaloo", onePotato)
         assertIntent(AssistantIntent.SALE, "five kilo potato", onePotato)
+        assertIntent(AssistantIntent.SALE, "चार किलो आलू", fourPotato)
+        assertIntent(AssistantIntent.SALE, "चार किलो चाच", fourPotato)
+        assertIntent(AssistantIntent.SALE, "chaar kilo aloo", fourPotato)
     }
 
     @Test
@@ -180,6 +184,8 @@ class IntentRouterFixtureTest {
         assertIntent(AssistantIntent.ACTION_COMMAND, "रमेश को बिल भेज दो")
         assertIntent(AssistantIntent.ACTION_COMMAND, "send bill to Ramesh on whatsapp")
         assertIntent(AssistantIntent.ACTION_COMMAND, "ramesh ko yaad dilao")
+        assertIntent(AssistantIntent.ACTION_COMMAND, "रमेश को बिल भेजो")
+        assertIntent(AssistantIntent.ACTION_COMMAND, "ramesh ko call karo")
     }
 
     // ---------------------------------------------------------------- UNKNOWN / safety

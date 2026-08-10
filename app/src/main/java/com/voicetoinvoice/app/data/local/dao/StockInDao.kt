@@ -75,6 +75,9 @@ interface StockInDao {
         """
     )
     suspend fun getLatestSupplierPerItem(): List<ItemSupplier>
+
+    @Query("UPDATE stock_in SET itemId = :newId WHERE itemId = :oldId")
+    suspend fun relinkItemId(oldId: String, newId: String)
 }
 
 data class ItemSupplier(val itemId: String, val supplierId: String)

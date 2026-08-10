@@ -1,7 +1,7 @@
 import assert from 'node:assert'
 import { test } from 'node:test'
-import { segmentTranscript, normalizedLiteralDistance } from './phonetic.ts'
-import { resolveItemName, unpricedLineReason, SEGMENTER_OVERRIDE_MAX_NORM } from './item_resolution.ts'
+import { segmentTranscript, normalizedLiteralDistance, phoneticKey, normalizedDistance, DEFAULT_ITEM_VOCAB } from './phonetic.ts'
+import { resolveItemName, unpricedLineReason, assessAiNameEvidence, MIN_AI_EVIDENCE_RATIO, SEGMENTER_OVERRIDE_MAX_NORM } from './item_resolution.ts'
 import { implausibilityReason } from './price_intent.ts'
 
 // ---------------------------------------------------------------------------
@@ -155,3 +155,159 @@ test('Kela vs Kheera literal distance rejection test (ISSUE-040)', () => {
   const distMatch = normalizedLiteralDistance('केला', 'Kela')
   assert.ok(distMatch <= 0.15, `केला vs Kela literal distance (${distMatch}) must be <= 0.15`)
 })
+
+// ---------------------------------------------------------------------------
+// assessAiNameEvidence — ISSUE-104
+// ---------------------------------------------------------------------------
+
+test('ISSUE-104: blocks invention when heard sound is too short (आ -> Aaloo)', () => {
+  const v = assessAiNameEvidence('Aaloo', { itemTokens: ['आ'], resolutionKind: 'UNKNOWN' })
+  assert.strictEqual(v.uncorroborated, true)
+  assert.strictEqual(v.heardPhones, 1)
+  assert.strictEqual(v.aiPhones, 3) // ALO
+  assert.ok(Math.abs((v.ratio ?? 0) - (1 / 3)) < 0.001)
+})
+
+test('ISSUE-104: preserves rescue for fused/mangled tokens (चरगलो -> Aaloo)', () => {
+  const v = assessAiNameEvidence('Aaloo', { itemTokens: ['चरगलो'], resolutionKind: 'UNKNOWN' })
+  assert.strictEqual(v.uncorroborated, false)
+  assert.strictEqual(v.heardPhones, 8) // CALAKALO
+  assert.strictEqual(v.aiPhones, 3)
+  assert.ok((v.ratio ?? 0) > 1.0)
+})
+
+test('ISSUE-104: both conditions required (MATCH segment for Urad -> Urad is spared despite ratio 0.50)', () => {
+  const v = assessAiNameEvidence('Urad', { itemTokens: ['उड़द'], resolutionKind: 'MATCH' })
+  assert.strictEqual(v.uncorroborated, false, 'MATCH segments must never be uncorroborated')
+  assert.strictEqual(v.ratio, null)
+})
+
+test('ISSUE-104: default item vocabulary self-consistency (every item against itself has ratio 1.00)', () => {
+  for (const item of DEFAULT_ITEM_VOCAB) {
+    const v = assessAiNameEvidence(item, { itemTokens: [item], resolutionKind: 'UNKNOWN' })
+    assert.strictEqual(v.uncorroborated, false, `DEFAULT_ITEM_VOCAB item '${item}' against itself must pass`)
+    assert.strictEqual(v.ratio, 1.0)
+  }
+})
+
+test('ISSUE-104: distance is not the rule (proves why evidence ratio was chosen over distance)', () => {
+  const distInvention = normalizedDistance(phoneticKey('आ'), phoneticKey('Aaloo'))
+  const distRescue = normalizedDistance(phoneticKey('चरगलो'), phoneticKey('Aaloo'))
+  assert.strictEqual(distInvention, distRescue, 'both invention and rescue sit at distance 0.5, so distance cannot separate them')
+  assert.strictEqual(distInvention, 0.5)
+})
+
+test('ISSUE-104: tightest genuine passes (बैंगन -> Baingan, सोयाबीन -> Soyabean) remain uncorroborated = false', () => {
+  const vBaingan = assessAiNameEvidence('Baingan', { itemTokens: ['बैंगन'], resolutionKind: 'UNKNOWN' })
+  assert.strictEqual(vBaingan.uncorroborated, false)
+  assert.ok((vBaingan.ratio ?? 0) >= 0.83)
+
+  const vSoya = assessAiNameEvidence('Soyabean', { itemTokens: ['सोयाबीन'], resolutionKind: 'UNKNOWN' })
+  assert.strictEqual(vSoya.uncorroborated, false)
+  assert.ok((vSoya.ratio ?? 0) >= 0.87)
+})
+
+// ---------------------------------------------------------------------------
+// assessAiNameEvidence — ISSUE-105 (Zero-segment branch)
+// ---------------------------------------------------------------------------
+
+test('ISSUE-105: reported job input "दो किलो से" is flagged uncorroborated on zero segments', () => {
+  const surfaces = new Set(['aaloo', 'pyaz', 'seb'])
+  const v = assessAiNameEvidence('Seb', null, {
+    transcript: 'दो किलो से',
+    itemSurfaces: surfaces,
+    segmentCount: 0,
+  })
+  assert.strictEqual(v.uncorroborated, true)
+  assert.strictEqual(v.source, 'transcript_residue')
+  assert.strictEqual(v.heardPhones, 0)
+  assert.strictEqual(v.heardSurface, '')
+})
+
+test('ISSUE-105: repetition of discourse particles "हाँ जी हाँ जी" does not buy protection', () => {
+  const surfaces = new Set(['aaloo', 'pyaz'])
+  const v = assessAiNameEvidence('Aaloo', null, {
+    transcript: 'हाँ जी हाँ जी',
+    itemSurfaces: surfaces,
+    segmentCount: 0,
+  })
+  assert.strictEqual(v.uncorroborated, true)
+  assert.strictEqual(v.source, 'transcript_residue')
+  assert.strictEqual(v.heardPhones, 0)
+})
+
+test('ISSUE-105: escape hatch preserves catalog item "घी" but floor <=2 fires on 2-phone zero-segment residue', () => {
+  const surfaces = new Set(['घी', 'aaloo'])
+  const v = assessAiNameEvidence('Ghee', null, {
+    transcript: 'दो किलो घी',
+    itemSurfaces: surfaces,
+    segmentCount: 0,
+  })
+  assert.strictEqual(v.heardSurface, 'घी')
+  assert.strictEqual(v.heardPhones, 2)
+  assert.strictEqual(v.uncorroborated, true, 'floor <= 2 fires on 2-phone residue on zero-segment path')
+  assert.strictEqual(v.source, 'transcript_residue')
+})
+
+test('ISSUE-105: scoped to zero segments (segmentCount > 0 with seg = null remains source = none)', () => {
+  const surfaces = new Set(['aaloo'])
+  const v = assessAiNameEvidence('Paneer', null, {
+    transcript: 'दो किलो आलू',
+    itemSurfaces: surfaces,
+    segmentCount: 1,
+  })
+  assert.strictEqual(v.uncorroborated, false)
+  assert.strictEqual(v.source, 'none')
+})
+
+test('ISSUE-105: ISSUE-104 path returns source = segment', () => {
+  const v = assessAiNameEvidence('Aaloo', { itemTokens: ['आ'], resolutionKind: 'UNKNOWN' })
+  assert.strictEqual(v.uncorroborated, true)
+  assert.strictEqual(v.source, 'segment')
+})
+
+test('ISSUE-105: corpus regression fixture (8 zero-segment inputs fire, 10 good inputs do not)', () => {
+  const zeroSegmentTranscripts = [
+    'दो किलो से',
+    'दो किलो हाँ',
+    'हम्म',
+    'हाँ',
+    'तो ये है',
+    'हाँ जी हाँ जी',
+    'हाँ हाँ हाँ',
+    'दो किलो हाँ',
+  ]
+  const goodTranscripts = [
+    'दो किलो आलू',
+    'तीन किलो प्याज',
+    'पाँच किलो अमचूर',
+    'दस किलो आटा',
+    'दो किलो टमाटर',
+    'पाँच किलो चीनी',
+    'दो किलो चावल',
+    'एक किलो लहसुन',
+    'दो किलो बैंगन',
+    'पाँच किलो केला',
+  ]
+
+  const surfaces = new Set(['आलू', 'प्याज', 'अमचूर', 'आटा', 'टमाटर', 'चीनी', 'चावल', 'लहसुन', 'बैंगन', 'केला', 'seb'])
+
+  for (const t of zeroSegmentTranscripts) {
+    const { segments } = segmentTranscript(t)
+    assert.strictEqual(segments.length, 0, `transcript '${t}' must yield zero segments`)
+    const v = assessAiNameEvidence('Seb', null, {
+      transcript: t,
+      itemSurfaces: surfaces,
+      segmentCount: segments.length,
+    })
+    assert.strictEqual(v.uncorroborated, true, `transcript '${t}' must be uncorroborated`)
+    assert.strictEqual(v.source, 'transcript_residue')
+  }
+
+  for (const t of goodTranscripts) {
+    const { segments } = segmentTranscript(t)
+    assert.ok(segments.length > 0, `transcript '${t}' must yield >= 1 segments`)
+  }
+})
+
+

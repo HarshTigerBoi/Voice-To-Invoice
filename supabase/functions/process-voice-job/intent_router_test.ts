@@ -13,6 +13,7 @@ import { classifyIntent, DIRECT_ROUTE_CONFIDENCE, type AssistantIntent, type Par
 
 const noLines: ParsedLineLike[] = []
 const onePotato: ParsedLineLike[] = [{ item_name: 'आलू', quantity: 5, total: 150 }]
+const fourPotato: ParsedLineLike[] = [{ item_name: 'आलू', quantity: 4 }]
 const singleUnitPotato: ParsedLineLike[] = [{ item_name: 'आलू', quantity: 1, total: 30 }]
 const oneTomato: ParsedLineLike[] = [{ item_name: 'टमाटर', quantity: 2, total: 40 }]
 
@@ -50,6 +51,9 @@ Deno.test('SALE - default when goods present with no keyword', () => {
   expectIntent('SALE', 'पाँच किलो आलू', onePotato)
   expectIntent('SALE', 'paanch kilo aaloo', onePotato)
   expectIntent('SALE', 'five kilo potato', onePotato)
+  expectIntent('SALE', 'चार किलो आलू', fourPotato)
+  expectIntent('SALE', 'चार किलो चाच', fourPotato)
+  expectIntent('SALE', 'chaar kilo aloo', fourPotato)
 })
 
 Deno.test('SALE - a customer name alone is not Udhaar', () => {
@@ -117,6 +121,8 @@ Deno.test('ACTION_COMMAND is reachable at all', () => {
   expectIntent('ACTION_COMMAND', 'रमेश को बिल भेज दो')
   expectIntent('ACTION_COMMAND', 'send bill to Ramesh on whatsapp')
   expectIntent('ACTION_COMMAND', 'ramesh ko yaad dilao')
+  expectIntent('ACTION_COMMAND', 'रमेश को बिल भेजो')
+  expectIntent('ACTION_COMMAND', 'ramesh ko call karo')
 })
 
 Deno.test('empty and noise yield UNKNOWN', () => {

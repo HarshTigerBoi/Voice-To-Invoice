@@ -10,6 +10,7 @@ import com.voicetoinvoice.app.data.local.entity.StockBatch
 import com.voicetoinvoice.app.data.local.entity.StockInRecord
 import com.voicetoinvoice.app.data.local.entity.StockLedgerEntry
 import com.voicetoinvoice.app.data.local.entity.SttJobRecord
+import com.voicetoinvoice.app.data.local.entity.SttJobStatus
 import com.voicetoinvoice.app.data.local.entity.SupplierRecord
 import com.voicetoinvoice.app.data.local.entity.TransactionRecord
 import com.voicetoinvoice.app.data.local.entity.UnmatchedQueueItem
@@ -168,10 +169,16 @@ class CloudSyncManager(
         try {
             val payload = JSONObject().apply {
                 put("id", item.id)
+                // Catalog was the one entity that never sent shop_id, so every item the phone
+                // pushed landed with shop_id NULL while process-voice-job fetches the catalog
+                // with a strict `shop_id = <uuid>` filter. The shop's priced catalog was
+                // therefore invisible to the parser and every sale priced out at 0.
+                SupabaseConfig.getNullSafeShopId(item.shopId)?.let { put("shop_id", it) }
                 put("name", item.name)
                 put("unit_id", item.unitId)
                 put("price", item.price)
                 put("active", item.active)
+                if (!item.imageUrl.isNullOrBlank()) put("image_url", item.imageUrl)
                 put("updated_at", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).also {
                     it.timeZone = java.util.TimeZone.getTimeZone("UTC")
                 }.format(java.util.Date(item.updatedAt)))
@@ -614,9 +621,96 @@ class CloudSyncManager(
      * distinguish "fetch failed, change nothing" from "server genuinely has zero items" —
      * conflating those would let a transient network error look like an empty catalog.
      */
+    /**
+     * Reads this shop's recent job logs back from `stt_job_logs` for DISPLAY ONLY.
+     *
+     * Sync in this app is push-only, so the Diagnostic Logs screen could previously show
+     * nothing but recordings made on this handset -- a shop that reinstalled, or a job the
+     * server processed while the app was closed, was simply invisible. Observed 2026-08-06:
+     * 250+ jobs on the server while the phone's screen was empty, which reads as "logging is
+     * broken" when it is working perfectly.
+     *
+     * The returned records are deliberately NOT written to Room. `stt_jobs` doubles as the
+     * work queue -- `SttWorker` drains rows in QUEUED/TRANSCRIBING -- so persisting a remote
+     * row would hand the worker a job whose audio this device does not have. Display-only
+     * keeps the queue's meaning intact.
+     */
+    suspend fun fetchJobLogsFromCloud(shopId: String?, limit: Int = 100): List<SttJobRecord>? =
+        withContext(Dispatchers.IO) {
+            try {
+                val safeShopId = SupabaseConfig.getNullSafeShopId(shopId)
+                val shopFilter = safeShopId?.let { "&shop_id=eq.$it" } ?: ""
+                val url = URL(
+                    "$supabaseUrl/rest/v1/stt_job_logs?select=job_id,status,raw_transcript," +
+                        "parsed_item_name,parsed_qty,parsed_unit,parsed_total,is_sanity_flagged," +
+                        "error_message,recorded_at_ms,hold_duration_ms,diagnostic_trace_json," +
+                        "line_count$shopFilter&order=recorded_at_ms.desc&limit=$limit"
+                )
+                val connection = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 15000
+                    readTimeout = 15000
+                    setRequestProperty("Authorization", "Bearer $anonKey")
+                    setRequestProperty("apikey", anonKey)
+                    setRequestProperty("Accept", "application/json")
+                }
+                val code = connection.responseCode
+                if (code !in 200..299) {
+                    Log.w(TAG, "❌ Job log pull HTTP $code")
+                    return@withContext null
+                }
+                val body = connection.inputStream.bufferedReader().use { it.readText() }
+                val arr = org.json.JSONArray(body)
+                val out = ArrayList<SttJobRecord>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val row = arr.optJSONObject(i) ?: continue
+                    val id = row.optString("job_id", "")
+                    if (id.isBlank()) continue
+                    val status = runCatching {
+                        SttJobStatus.valueOf(row.optString("status", "PARSED"))
+                    }.getOrDefault(SttJobStatus.PARSED)
+                    out.add(
+                        SttJobRecord(
+                            id = id,
+                            // Remote jobs have no local audio file; the card falls back to the
+                            // cloud URL for playback.
+                            audioFilePath = "",
+                            status = status,
+                            rawTranscript = row.optString("raw_transcript", ""),
+                            parsedItemName = row.optString("parsed_item_name", ""),
+                            parsedQty = row.optDouble("parsed_qty", 1.0),
+                            parsedUnit = row.optString("parsed_unit", "PACKET"),
+                            parsedTotal = row.optDouble("parsed_total", 0.0),
+                            isSanityFlagged = row.optBoolean("is_sanity_flagged", false),
+                            errorMessage = row.optString("error_message", ""),
+                            recordedAtMs = row.optLong("recorded_at_ms", 0L),
+                            holdDurationMs = row.optLong("hold_duration_ms", 0L),
+                            diagnosticTraceJson = row.optString("diagnostic_trace_json", ""),
+                            lineCount = row.optInt("line_count", 0),
+                            synced = true
+                        )
+                    )
+                }
+                Log.i(TAG, "⬇️ Pulled ${out.size} job log(s) from cloud for display")
+                out
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to pull job logs from cloud: ${e.message}")
+                null
+            }
+        }
+
     suspend fun fetchCatalogFromCloud(): List<CatalogItem>? = withContext(Dispatchers.IO) {
         try {
-            val url = URL("$supabaseUrl/rest/v1/catalog_items?active=eq.true&select=id,name,unit_id,price,active,updated_at")
+            // Scoped to THIS shop. The pull previously asked for every active row in the table
+            // regardless of tenant, so the first time a second shop existed this device would
+            // have merged that shop's items (and prices) straight into its own catalog.
+            val shopFilter = SupabaseConfig.getNullSafeShopId(
+                com.voicetoinvoice.app.data.ShopContext.shopIdOrNull()
+            )?.let { "&shop_id=eq.$it" } ?: ""
+            val url = URL(
+                "$supabaseUrl/rest/v1/catalog_items?active=eq.true$shopFilter" +
+                    "&select=id,name,unit_id,price,active,image_url,updated_at"
+            )
             val connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = 15000
@@ -640,6 +734,7 @@ class CloudSyncManager(
                 val id = row.optString("id", "")
                 val name = row.optString("name", "")
                 if (id.isBlank() || name.isBlank()) continue
+                val rawImageUrl = row.optString("image_url", "").ifBlank { null }
                 out.add(
                     CatalogItem(
                         id = id,
@@ -647,6 +742,7 @@ class CloudSyncManager(
                         unitId = row.optString("unit_id", "KG").ifBlank { "KG" },
                         price = row.optDouble("price", 0.0),
                         active = row.optBoolean("active", true),
+                        imageUrl = rawImageUrl,
                         updatedAt = parseIsoTimestamp(row.optString("updated_at", "")),
                         // Straight from the server, so by definition already in sync —
                         // marking it unsynced would bounce it right back on the next push.

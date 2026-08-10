@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import postgres from "https://deno.land/x/postgresjs@v3.4.3/mod.js";
+import { phoneticKey } from "../process-voice-job/phonetic.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -87,6 +88,110 @@ serve(async (req) => {
     try {
       await sql`ALTER TABLE public.stt_job_logs DISABLE ROW LEVEL SECURITY`;
     } catch (_) {}
+
+    // 7. Alter term_aliases table (remove unique raw_term constraint, add shop_id/phonetic_key, and create unique index)
+    try {
+      await sql`ALTER TABLE public.term_aliases DROP CONSTRAINT IF EXISTS term_aliases_raw_term_key`;
+    } catch (_) {}
+
+    try {
+      await sql`ALTER TABLE public.term_aliases ADD COLUMN IF NOT EXISTS shop_id UUID REFERENCES public.shops(id) ON DELETE CASCADE`;
+    } catch (_) {}
+
+    try {
+      await sql`ALTER TABLE public.term_aliases ADD COLUMN IF NOT EXISTS phonetic_key TEXT`;
+    } catch (_) {}
+
+    try {
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_term_aliases_shop_phonetic ON public.term_aliases (COALESCE(shop_id, '00000000-0000-0000-0000-000000000000'::uuid), phonetic_key)`;
+    } catch (_) {}
+
+    try {
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_term_aliases_shop_raw_term ON public.term_aliases (shop_id, raw_term)`;
+    } catch (_) {}
+
+    try {
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_term_aliases_shop_phon_key ON public.term_aliases (shop_id, phonetic_key)`;
+    } catch (_) {}
+
+    // 8. Seed verified global term aliases for common Kirana & Sabji Mandi produce
+    const defaultShopUuid = '00000000-0000-0000-0000-000000000001'
+    const SEED_TERM_ALIASES = [
+      { raw: "aaloo", canonical: "Aaloo" },
+      { raw: "aalu", canonical: "Aaloo" },
+      { raw: "आलू", canonical: "Aaloo" },
+      { raw: "alu", canonical: "Aaloo" },
+      { raw: "aloo", canonical: "Aaloo" },
+      { raw: "pyaz", canonical: "Pyaz" },
+      { raw: "pyaaz", canonical: "Pyaz" },
+      { raw: "प्याज", canonical: "Pyaz" },
+      { raw: "pyaj", canonical: "Pyaz" },
+      { raw: "tamatar", canonical: "Tamatar" },
+      { raw: "टमाटर", canonical: "Tamatar" },
+      { raw: "tmatr", canonical: "Tamatar" },
+      { raw: "tamatr", canonical: "Tamatar" },
+      { raw: "seb", canonical: "Seb" },
+      { raw: "सेब", canonical: "Seb" },
+      { raw: "सेव", canonical: "Seb" },
+      { raw: "apple", canonical: "Seb" },
+      { raw: "desi ghee", canonical: "Desi Ghee" },
+      { raw: "ghee", canonical: "Desi Ghee" },
+      { raw: "घी", canonical: "Desi Ghee" },
+      { raw: "amul gold milk", canonical: "Amul Gold Milk" },
+      { raw: "doodh", canonical: "Amul Gold Milk" },
+      { raw: "दूध", canonical: "Amul Gold Milk" },
+      { raw: "milk", canonical: "Amul Gold Milk" },
+      { raw: "dudh", canonical: "Amul Gold Milk" },
+      { raw: "sugar", canonical: "Sugar" },
+      { raw: "chini", canonical: "Sugar" },
+      { raw: "चीनी", canonical: "Sugar" },
+      { raw: "paneer", canonical: "Paneer" },
+      { raw: "पनीर", canonical: "Paneer" },
+      { raw: "butter", canonical: "Butter" },
+      { raw: "makhan", canonical: "Butter" },
+      { raw: "मक्खन", canonical: "Butter" },
+      { raw: "maggi", canonical: "Maggi" },
+      { raw: "मैगी", canonical: "Maggi" },
+      { raw: "atta", canonical: "Atta" },
+      { raw: "आटा", canonical: "Atta" },
+      { raw: "aata", canonical: "Atta" },
+      { raw: "fortune oil", canonical: "Fortune Oil" },
+      { raw: "tel", canonical: "Fortune Oil" },
+      { raw: "तेल", canonical: "Fortune Oil" },
+      { raw: "bhindi", canonical: "Bhindi" },
+      { raw: "भिंडी", canonical: "Bhindi" },
+      { raw: "dhaniya", canonical: "Dhaniya" },
+      { raw: "धनिया", canonical: "Dhaniya" },
+      { raw: "baingan", canonical: "Baingan" },
+      { raw: "बैंगन", canonical: "Baingan" },
+      { raw: "moongphali", canonical: "Moongphali" },
+      { raw: "मूंगफली", canonical: "Moongphali" },
+      { raw: "kaju", canonical: "Kaju" },
+      { raw: "काजू", canonical: "Kaju" },
+      { raw: "badam", canonical: "Badam" },
+      { raw: "बादाम", canonical: "Badam" },
+    ]
+
+    for (const item of SEED_TERM_ALIASES) {
+      const pKey = phoneticKey(item.raw)
+      const rawTermClean = item.raw.trim().toLowerCase()
+      try {
+        await sql`
+          INSERT INTO public.term_aliases (
+            raw_term, canonical_value, domain, shop_id, phonetic_key, verified, distinct_shop_count, confirm_count
+          ) VALUES (
+            ${rawTermClean}, ${item.canonical}, 'item', ${defaultShopUuid}, ${pKey}, true, 5, 10
+          )
+          ON CONFLICT (shop_id, raw_term) DO UPDATE SET
+            canonical_value = EXCLUDED.canonical_value,
+            phonetic_key = EXCLUDED.phonetic_key,
+            verified = true,
+            distinct_shop_count = GREATEST(term_aliases.distinct_shop_count, 5);
+        `
+      } catch (seedErr) {
+        console.warn(`Failed to seed alias for ${item.raw}:`, seedErr)
+      }
+    }
 
     await sql.end();
 

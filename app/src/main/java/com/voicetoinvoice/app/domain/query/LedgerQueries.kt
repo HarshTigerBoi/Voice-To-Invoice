@@ -59,6 +59,28 @@ class LedgerQueries(private val db: AppDatabase) {
             matched.name to matched.stockQty
         }
 
+    /**
+     * Quantity and revenue for ONE item in a window.
+     *
+     * ISSUE-118: "आज कितने आलू बिके" previously fell through to the whole-shop revenue branch
+     * because REVENUE_WORDS contains "बिका" (≈ "बिके"), so the shopkeeper was told total business
+     * when they asked about one item. Resolution reuses [findCatalogItem] so "aaloo" / "आलू" /
+     * a mis-transcribed "alu" all land on the same row.
+     *
+     * @return (resolvedItemName, qtySold, revenue), or null when the name matches no catalog item.
+     */
+    suspend fun getItemSalesInPeriod(
+        itemNameQuery: String,
+        startMs: Long,
+        endMs: Long
+    ): Triple<String, Double, Double>? = withContext(Dispatchers.IO) {
+        val matched = findCatalogItem(itemNameQuery) ?: return@withContext null
+        val row = db.transactionDao().getItemSalesBetween(startMs, endMs)
+            .firstOrNull { it.itemId == matched.id }
+            ?: return@withContext Triple(matched.name, 0.0, 0.0)
+        Triple(matched.name, row.qty, row.revenue)
+    }
+
     suspend fun getTotalStockValue(): Double = withContext(Dispatchers.IO) {
         db.catalogDao().getTotalStockValueAtCost()
     }

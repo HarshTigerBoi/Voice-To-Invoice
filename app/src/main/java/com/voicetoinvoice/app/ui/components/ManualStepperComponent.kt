@@ -11,6 +11,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
 
+import androidx.compose.ui.text.style.TextOverflow
+
 @Composable
 fun ManualStepperComponent(
     topItems: List<CatalogItem>,
@@ -25,8 +27,8 @@ fun ManualStepperComponent(
             Spacer(modifier = Modifier.height(8.dp))
 
             LazyVerticalGrid(
-                columns = GridCells.Fixed(2),
-                modifier = Modifier.height(180.dp),
+                columns = GridCells.Adaptive(minSize = 108.dp),
+                modifier = Modifier.heightIn(max = 320.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
@@ -37,8 +39,24 @@ fun ManualStepperComponent(
                             modifier = Modifier.padding(8.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Text(item.name, style = MaterialTheme.typography.bodyLarge)
-                            Text("₹${item.price}/${item.unitId}", style = MaterialTheme.typography.bodySmall)
+                            ItemIcon(
+                                itemName = item.name,
+                                imageUrl = item.imageUrl,
+                                imagePath = item.imagePath,
+                                size = 72.dp
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = item.name,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "₹${item.price.toInt()}/${item.unitId}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 IconButton(onClick = { if (qty > 0.5) qty -= 0.5 }) { Text("-") }
                                 Text("${qty}", style = MaterialTheme.typography.bodyMedium)

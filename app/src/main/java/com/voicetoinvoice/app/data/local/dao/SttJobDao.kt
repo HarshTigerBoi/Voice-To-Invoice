@@ -52,9 +52,33 @@ interface SttJobDao {
     @Query("SELECT COUNT(*) FROM stt_jobs WHERE status IN ('PARSED', 'PARTIALLY_CONFIRMED', 'ERROR', 'FAILED')")
     fun getParsedJobsCountFlow(): Flow<Int>
 
+    @Query("SELECT * FROM stt_jobs WHERE status IN ('PARSED', 'FAILED') AND lineCount = 0 ORDER BY recordedAtMs DESC LIMIT 1")
+    fun getLatestZeroLineJobFlow(): Flow<SttJobRecord?>
+
     // End-to-End Processing Trace Log Queries
     @Query("SELECT * FROM stt_jobs ORDER BY recordedAtMs DESC LIMIT 200")
     fun getAllJobsTraceLogsFlow(): Flow<List<SttJobRecord>>
+
+    /**
+     * Command-feed variant of [getAllJobsTraceLogsFlow]: bounded by TIME rather than by a
+     * LIMIT 200. HomeScreen discards everything older than 24h anyway, so the old query was
+     * materialising ~200 rows x ~4.4KB of diagnosticTraceJson on every stt_jobs write and
+     * re-emitting the lot into a live composable. At observed volumes (12-94 jobs/day) this
+     * cuts the working set by roughly an order of magnitude.
+     *
+     * NOTE: this still returns the full SttJobRecord including diagnosticTraceJson, because
+     * CommandFeedSheet takes List<SttJobRecord>. Stripping the blob as well would mean an
+     * explicit column list plus a projection type and a change to that composable's
+     * signature — deliberately out of scope here. Row-count bounding is the cheap 90%.
+     */
+    @Query(
+        """
+        SELECT * FROM stt_jobs
+        WHERE recordedAtMs >= :sinceMs
+        ORDER BY recordedAtMs DESC
+        """
+    )
+    fun getJobsSinceFlow(sinceMs: Long): Flow<List<SttJobRecord>>
 
     @Query("SELECT * FROM stt_jobs ORDER BY recordedAtMs DESC LIMIT 200")
     suspend fun getAllJobsTraceLogsList(): List<SttJobRecord>

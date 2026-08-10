@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.voicetoinvoice.app.audio.AudioRecorder
+import com.voicetoinvoice.app.ui.theme.LedgerColors
 import com.voicetoinvoice.app.audio.CoalescedBurstGroup
 import com.voicetoinvoice.app.audio.OnDeviceSpeechRecognizer
 import com.voicetoinvoice.app.audio.PttBurstCoalescer
@@ -134,7 +135,7 @@ fun HomeScreen(
 
     // Auto-cleanup any jobs that got stuck in processing from a previous interrupted session
     LaunchedEffect(Unit) {
-        val thresholdMs = System.currentTimeMillis() - 60000L // 1 minute ago
+        val thresholdMs = System.currentTimeMillis() - 25000L // 25 seconds ago (aligned to INLINE_BUDGET_MS)
         db.sttJobDao().markStuckJobsAsFailed(thresholdMs)
     }
 
@@ -176,11 +177,13 @@ fun HomeScreen(
     // Command Feed (Docs/master_build_plan.md §2.5): every spoken command from the last 24h
     // with a clear status, so "confirm only when unsure" doesn't leave the shopkeeper wondering
     // what happened to everything ELSE they said.
-    val allRecentJobs by db.sttJobDao().getAllJobsTraceLogsFlow().collectAsState(initial = emptyList())
-    val commandFeedJobs = remember(allRecentJobs) {
-        val since = System.currentTimeMillis() - 24 * 60 * 60 * 1000L
-        allRecentJobs.filter { it.recordedAtMs >= since }
-    }
+    // Bounded at the query, not in memory (ISSUE-113). `since` is remembered so the flow key
+    // is stable across recompositions — recomputing System.currentTimeMillis() inline would
+    // build a new Flow on every recomposition.
+    val commandFeedSince = remember { System.currentTimeMillis() - 24 * 60 * 60 * 1000L }
+    val commandFeedJobs by remember(commandFeedSince) {
+        db.sttJobDao().getJobsSinceFlow(commandFeedSince)
+    }.collectAsState(initial = emptyList())
     val inFlightCount = remember(commandFeedJobs) {
         commandFeedJobs.count {
             it.status == com.voicetoinvoice.app.data.local.entity.SttJobStatus.QUEUED ||
@@ -212,6 +215,21 @@ fun HomeScreen(
     var pressTimestamp by remember { mutableLongStateOf(0L) }
 
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // Immediate feedback snackbar when a voice job resolves to 0 lines (Docs/voice_capture_feedback_fix_plan.md Step 2)
+    val latestZeroLineJob by db.sttJobDao().getLatestZeroLineJobFlow().collectAsState(initial = null)
+    LaunchedEffect(latestZeroLineJob?.id) {
+        latestZeroLineJob?.let { job ->
+            if (System.currentTimeMillis() - job.recordedAtMs < 60_000L) {
+                val message = if (job.rawTranscript.isNotBlank() && job.rawTranscript != "Voice Recording (Pending Review)") {
+                    "\"${job.rawTranscript}\" समझ नहीं आया — समीक्षा में देखें"
+                } else {
+                    "रिकॉर्डिंग समझ नहीं आई — समीक्षा में देखें"
+                }
+                snackbarHostState.showSnackbar(message)
+            }
+        }
+    }
 
     // Permission launcher for RECORD_AUDIO
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -274,7 +292,7 @@ fun HomeScreen(
                         intent = CaptureIntent.SALE,
                         label = "नकद बेचो",
                         size = 150.dp,
-                        containerColor = Color(0xFF2E7D32),
+                        containerColor = LedgerColors.MoneyIn,
                         db = db,
                         rollingAudioBuffer = rollingAudioBuffer,
                         audioRecorder = audioRecorder,
@@ -293,7 +311,7 @@ fun HomeScreen(
                         intent = CaptureIntent.CREDIT_SALE,
                         label = "उधार बेचो",
                         size = 120.dp,
-                        containerColor = Color(0xFFE65100),
+                        containerColor = LedgerColors.Udhaar,
                         db = db,
                         rollingAudioBuffer = rollingAudioBuffer,
                         audioRecorder = audioRecorder,
@@ -324,12 +342,19 @@ fun HomeScreen(
 
                 // Quick Manual Stepper Grid
                 ManualStepperComponent(
-                    topItems = catalog.take(4),
+                    topItems = catalog.sortedByDescending { it.lastSoldAtMs ?: 0L },
                     onAddSale = { item, qty ->
                         val sale = ParsedVoiceSale(item, "Manual Entry", qty, item.unitId, qty * item.price, 1.0f)
                         onConfirmSale(sale)
                     }
                 )
+
+                // Reserves the assistant FAB's footprint (64.dp button + 24.dp inset + its
+                // "बिल वाले" caption, placed BottomEnd over every screen from MainActivity).
+                // Without it the FAB sits directly on top of the right-hand stepper card's
+                // "Add ₹" button, so that item cannot be added by tap at all -- the FAB
+                // swallows the press.
+                Spacer(modifier = Modifier.height(96.dp))
             }
 
             // Floating Pending Sales Pill Badge
@@ -442,6 +467,7 @@ fun HomeScreen(
                 val total = line.quantity * rate
 
                 scope.launch(Dispatchers.IO) {
+                    val shopId = com.voicetoinvoice.app.data.ShopContext.requireShopId()
                     if (isNewItem) {
                         db.catalogDao().insertOrUpdate(item)
                     } else if (!isStockIntent && rate > 0.0 && rate != item.price) {
@@ -459,6 +485,15 @@ fun HomeScreen(
                     if (!isNewItem && !item.name.equals(line.itemName, ignoreCase = true)) {
                         com.voicetoinvoice.app.data.repository.ShopLearningRepository(db)
                             .recordItemAliasConfirmed(line.itemName, item.id)
+                        try {
+                            com.voicetoinvoice.app.network.TermInterpreterClient().confirmTermAlias(
+                                rawTerm = line.itemName,
+                                canonicalValue = item.name,
+                                shopId = shopId
+                            )
+                        } catch (e: Exception) {
+                            android.util.Log.e("HomeScreen", "Failed to propagate term alias: ${e.message}", e)
+                        }
                     }
 
                     // Same ledger contract as SttWorker.commitParsedLines -- this manual
@@ -466,7 +501,6 @@ fun HomeScreen(
                     // StockLedgerRepository the materialized stockQty would silently drift
                     // from the ledger for every review-queue confirmation.
                     val stockLedger = com.voicetoinvoice.app.data.repository.StockLedgerRepository(db)
-                    val shopId = com.voicetoinvoice.app.data.ShopContext.requireShopId()
 
                     if (isStockIntent) {
                         val isWaste = job.captureIntent == CaptureIntent.WASTE

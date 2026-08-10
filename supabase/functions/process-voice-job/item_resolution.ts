@@ -1,5 +1,35 @@
-import { phoneticKey, normalizedDistance, type RawItemSegment } from './phonetic.ts'
+import { phoneticKey, normalizedDistance, type RawItemSegment, UNIT_SET, HINDI_NUMBER_MAP, RUPEE_WORDS, DISCOURSE_PARTICLES } from './phonetic.ts'
 import type { PriceIntent } from './price_intent.ts'
+
+/**
+ * Item sounds that remain once quantity, unit, price and pure discourse are accounted for.
+ *
+ * Mirrors segmentTranscript's own token filter (phonetic.ts:583) including its escape hatch:
+ * a DISCOURSE_PARTICLES token is KEPT when it is a genuine item surface, so a shop that stocks
+ * a particle-shaped name is unaffected. Verified over all 182 production transcripts: the 8 that
+ * segment to nothing all reduce to "" here, and no legitimate transcript reaches this path.
+ * See ISSUE-105.
+ */
+export function transcriptItemResidue(transcript: string, itemSurfaces: Set<string>): string {
+  const clean = (transcript || '').replace(/।/g, ' ').replace(/[.,?!\-\\()]/g, ' ').trim()
+  return clean.split(/\s+/).filter(Boolean).filter(t => {
+    const lower = t.toLowerCase()
+    if (itemSurfaces.has(lower)) return true          // a real product outranks every strip rule
+    if (RUPEE_WORDS.has(lower)) return false
+    if (UNIT_SET.some(u => u.toLowerCase() === lower)) return false
+    if (HINDI_NUMBER_MAP[lower] !== undefined) return false
+    if (/^\d+(\.\d+)?$/.test(lower)) return false
+    if (DISCOURSE_PARTICLES.has(lower) || DISCOURSE_PARTICLES.has(t)) return false
+    return true
+  }).join(' ')
+}
+
+/**
+ * At or below this many phones, nothing identifiable was said. Set at 2 because the shortest
+ * real product key in DEFAULT_ITEM_VOCAB is 2 phones (आम -> AN, घी -> KI) — and such an item
+ * would have produced a segment, so it never reaches this branch. See ISSUE-105.
+ */
+export const MAX_UNIDENTIFIABLE_RESIDUE_PHONES = 2
 
 /**
  * Normalized phonetic distance at or below which the deterministic segmenter's reading of
@@ -105,3 +135,86 @@ export function unpricedLineReason(
     ? `'${itemName}' has no price in your catalog — set a rate`
     : `'${itemName}' is not in your catalog yet — set a rate to book it`
 }
+
+/**
+ * Minimum ratio of (phones actually heard) to (phones in the AI's proposed name).
+ *
+ * Below 1.0 the AI has ADDED phones that were not in the audio. Invention adds phones;
+ * a genuine rescue of a fused or mangled token rearranges phones it already has
+ * ("चरगलो"[CALAKALO] -> "Aaloo"[ALO] = 2.67). Set at 0.75 from a probe over the live
+ * phonetic.ts: every invented pair observed scores <= 0.50, every genuine rescue >= 0.83,
+ * and all 220 DEFAULT_ITEM_VOCAB words score 1.00 against themselves.
+ *
+ * Deliberately NOT a phonetic-distance test: "आ"->"Aaloo" and "चरगलो"->"Aaloo" both sit at
+ * normalizedDistance 0.5000, so distance cannot separate invention from rescue. See ISSUE-104.
+ */
+export const MIN_AI_EVIDENCE_RATIO = 0.75
+
+export interface AiEvidenceVerdict {
+  uncorroborated: boolean
+  ratio: number | null
+  heardSurface: string
+  heardPhones: number
+  aiPhones: number
+  source: 'segment' | 'transcript_residue' | 'none'
+}
+
+/**
+ * True when the AI named a product that the audio does not support.
+ *
+ * Requires BOTH no deterministic evidence (resolutionKind UNKNOWN) AND an evidence ratio
+ * below the floor. The ratio alone false-positives on "उड़द"->"Urad" (0.50, the nukta ड़
+ * drops its r), which is spared because उड़द is in DEFAULT_ITEM_VOCAB and therefore resolves
+ * MATCH, never UNKNOWN.
+ *
+ * NOTE on heardSurface: for a MATCH segment `itemTokens` holds the CANONICAL vocab name
+ * (verified: job ad0f38b8 has itemTokens ["Aaloo"] with heardSegmentText "दस किलो आलू").
+ * For an UNKNOWN segment it holds the RAW heard token — which is the only case this
+ * function reads, so itemTokens is the correct source here.
+ */
+export function assessAiNameEvidence(
+  aiName: string,
+  seg: Pick<RawItemSegment, 'itemTokens' | 'resolutionKind'> | null | undefined,
+  noSegmentContext?: { transcript: string; itemSurfaces: Set<string>; segmentCount: number }
+): AiEvidenceVerdict {
+  const aiPhones = phoneticKey((aiName || '').trim()).length
+
+  // Path 1 (ISSUE-104): a segment exists but resolved to nothing recognisable.
+  if (seg && seg.resolutionKind === 'UNKNOWN' && aiPhones > 0) {
+    const heardSurface = (seg.itemTokens || []).join(' ').trim()
+    const heardPhones = phoneticKey(heardSurface).length
+    const ratio = heardPhones / aiPhones
+    return {
+      heardSurface, heardPhones, aiPhones, ratio,
+      uncorroborated: ratio < MIN_AI_EVIDENCE_RATIO,
+      source: 'segment',
+    }
+  }
+
+  // Path 2 (ISSUE-105): the segmenter produced NOTHING. That is weaker evidence than UNKNOWN,
+  // not absent evidence — so measure what the transcript actually carried. Scoped to
+  // segmentCount === 0: when other segments DID resolve, the whole-transcript residue belongs
+  // to those siblings and would wrongly clear this item.
+  if (!seg && noSegmentContext && noSegmentContext.segmentCount === 0 && aiPhones > 0) {
+    const heardSurface = transcriptItemResidue(noSegmentContext.transcript, noSegmentContext.itemSurfaces)
+    const heardPhones = phoneticKey(heardSurface).length
+    return {
+      heardSurface, heardPhones, aiPhones,
+      ratio: heardPhones / aiPhones,
+      uncorroborated: heardPhones <= MAX_UNIDENTIFIABLE_RESIDUE_PHONES,
+      source: 'transcript_residue',
+    }
+  }
+
+  const heardSurface = seg ? (seg.itemTokens || []).join(' ').trim() : ''
+  return {
+    heardSurface,
+    heardPhones: phoneticKey(heardSurface).length,
+    aiPhones,
+    ratio: null,
+    uncorroborated: false,
+    source: 'none',
+  }
+}
+
+

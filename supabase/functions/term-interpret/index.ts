@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { phoneticKey } from "../process-voice-job/phonetic.ts"
 
 // Was hardcoded to `grok-2-latest` in three places, which xAI has since retired — every
 // call here returned "Model not found" until ISSUE-021. Keep it env-configurable and in
@@ -43,14 +44,24 @@ serve(async (req) => {
 
     // Mode 1: Confirmation Action (Atomic UPSERT with conflict handling)
     if (confirm_action && confirm_action.canonical_value && raw_term) {
-      const activeShopId = shop_id || 'default_shop'
+      const activeShopId = (shop_id === 'default_shop' || !shop_id)
+        ? '00000000-0000-0000-0000-000000000001'
+        : shop_id
       const canonicalVal = confirm_action.canonical_value
+      const domainVal = confirm_action.domain || 'modifier'
+      const phonKey = phoneticKey(raw_term)
 
       const { data: upsertData, error: upsertErr } = await supabase
         .from('term_aliases')
         .upsert(
-          { raw_term: raw_term.trim().toLowerCase(), canonical_value: canonicalVal, domain: 'modifier' },
-          { onConflict: 'raw_term' }
+          {
+            raw_term: raw_term.trim().toLowerCase(),
+            canonical_value: canonicalVal,
+            domain: domainVal,
+            shop_id: activeShopId,
+            phonetic_key: phonKey
+          },
+          { onConflict: 'shop_id,raw_term' }
         )
         .select()
         .single()

@@ -18,4 +18,7 @@ interface UnmatchedQueueDao {
 
     @Query("UPDATE unmatched_queue SET status = :status, resolvedItemId = :resolvedItemId WHERE id = :id")
     suspend fun resolveItem(id: String, status: UnmatchedStatus, resolvedItemId: String?)
+
+    @Query("UPDATE unmatched_queue SET resolvedItemId = :newId WHERE resolvedItemId = :oldId")
+    suspend fun relinkItemId(oldId: String, newId: String)
 }

@@ -31,9 +31,10 @@ import kotlinx.coroutines.launch
         CustomerPayment::class,
         DailyRollup::class,
         ShopLearning::class,
-        com.voicetoinvoice.app.data.local.entity.AlertDismissal::class
+        com.voicetoinvoice.app.data.local.entity.AlertDismissal::class,
+        ExpenseRecord::class
     ],
-    version = 23, // Bumped: alert_dismissals (persistent alert snooze/dismiss)
+    version = 29, // ISSUE-121: expenses table
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -55,6 +56,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun dailyRollupDao(): DailyRollupDao
     abstract fun shopLearningDao(): ShopLearningDao
     abstract fun alertDismissalDao(): com.voicetoinvoice.app.data.local.dao.AlertDismissalDao
+    abstract fun expenseDao(): ExpenseDao
 
     companion object {
         @Volatile
@@ -356,16 +358,8 @@ abstract class AppDatabase : RoomDatabase() {
                         sql()
                     } catch (e: Exception) {
                         try {
-                            db.execSQL(
-                                "INSERT INTO migration_status (id, migration, step, error, atMs) " +
-                                    "VALUES (?, '17_18', ?, ?, ?)",
-                                arrayOf(
-                                    java.util.UUID.randomUUID().toString(),
-                                    name,
-                                    (e.message ?: e.javaClass.simpleName).take(500),
-                                    System.currentTimeMillis()
-                                )
-                            )
+                            val safeErr = (e.message ?: e.javaClass.simpleName).replace("'", "''").take(200)
+                            db.execSQL("INSERT INTO migration_status (id, migration, step, error, atMs) VALUES ('${java.util.UUID.randomUUID()}', '17_18', '$name', '$safeErr', ${System.currentTimeMillis()})")
                         } catch (_: Exception) { }
                         e.printStackTrace()
                     }
@@ -760,6 +754,172 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** `catalog_items`: added imageUrl column for item icons. */
+        private val MIGRATION_23_24 = object : Migration(23, 24) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("ALTER TABLE catalog_items ADD COLUMN imageUrl TEXT DEFAULT NULL")
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+
+        /** `catalog_items`: deduplicate catalog items and re-link all stock ledger & transaction references. */
+        private val MIGRATION_24_25 = object : Migration(24, 25) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                performCatalogDeduplication(db)
+            }
+        }
+
+        private val MIGRATION_25_26 = object : Migration(25, 26) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try { db.execSQL("ALTER TABLE catalog_items ADD COLUMN canonicalKey TEXT NOT NULL DEFAULT ''") } catch (_: Exception) {}
+                try { db.execSQL("CREATE INDEX IF NOT EXISTS index_catalog_items_canonicalKey ON catalog_items(canonicalKey)") } catch (_: Exception) {}
+            }
+        }
+
+        private val MIGRATION_26_27 = object : Migration(26, 27) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try { db.execSQL("ALTER TABLE catalog_items ADD COLUMN baseUnit TEXT NOT NULL DEFAULT ''") } catch (_: Exception) {}
+                try { db.execSQL("CREATE INDEX IF NOT EXISTS index_catalog_items_baseUnit ON catalog_items(baseUnit)") } catch (_: Exception) {}
+            }
+        }
+
+        /** `catalog_items`: local on-device photo path. ISSUE-122. */
+        private val MIGRATION_27_28 = object : Migration(27, 28) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("ALTER TABLE catalog_items ADD COLUMN imagePath TEXT DEFAULT NULL")
+                } catch (e: Exception) {
+                    android.util.Log.w("AppDatabase", "MIGRATION_27_28 imagePath: ${e.message}")
+                }
+            }
+        }
+
+        /** New `expenses` table. ISSUE-121. */
+        private val MIGRATION_28_29 = object : Migration(28, 29) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("""
+                        CREATE TABLE IF NOT EXISTS expenses (
+                            id TEXT NOT NULL PRIMARY KEY,
+                            shopId TEXT NOT NULL,
+                            category TEXT NOT NULL,
+                            amount REAL NOT NULL,
+                            note TEXT,
+                            timestamp INTEGER NOT NULL,
+                            source TEXT NOT NULL,
+                            voided INTEGER NOT NULL DEFAULT 0,
+                            synced INTEGER NOT NULL DEFAULT 0
+                        )
+                    """.trimIndent())
+                    db.execSQL("CREATE INDEX IF NOT EXISTS index_expenses_timestamp ON expenses(timestamp)")
+                    db.execSQL("CREATE INDEX IF NOT EXISTS index_expenses_category ON expenses(category)")
+                    db.execSQL("CREATE INDEX IF NOT EXISTS index_expenses_synced ON expenses(synced)")
+                    db.execSQL("CREATE INDEX IF NOT EXISTS index_expenses_shopId ON expenses(shopId)")
+                } catch (e: Exception) {
+                    android.util.Log.w("AppDatabase", "MIGRATION_28_29 expenses: ${e.message}")
+                }
+            }
+        }
+
+        fun performCatalogDeduplication(db: SupportSQLiteDatabase) {
+            try {
+                // Ensure stockQty column exists before querying
+                val columns = mutableListOf<String>()
+                val colCursor = db.query("PRAGMA table_info(catalog_items)")
+                while (colCursor.moveToNext()) {
+                    colCursor.getString(1)?.let { columns.add(it) }
+                }
+                colCursor.close()
+
+                val missingColumns = mapOf(
+                    "stockQty" to "REAL NOT NULL DEFAULT 0.0",
+                    "avgCostPrice" to "REAL",
+                    "trackStock" to "INTEGER NOT NULL DEFAULT 1",
+                    "trackExpiry" to "INTEGER NOT NULL DEFAULT 0",
+                    "lastSoldAtMs" to "INTEGER",
+                    "lastStockedAtMs" to "INTEGER",
+                    "imageUrl" to "TEXT",
+                    "imagePath" to "TEXT"
+                )
+                for ((col, colDef) in missingColumns) {
+                    if (!columns.contains(col)) {
+                        try { db.execSQL("ALTER TABLE catalog_items ADD COLUMN $col $colDef") } catch (_: Exception) {}
+                    }
+                }
+
+                // Frozen: MIGRATION_24_25 shipped with this table. New code uses ItemLexicon.canonicalOf. ISSUE-107.
+                fun normalizeItemName(raw: String): String {
+                    val trimmed = raw.trim().lowercase()
+                    return when (trimmed) {
+                        "aloo", "aalu", "alu", "अलू", "आलू" -> "aaloo"
+                        "adrak", "अदरक" -> "adrak"
+                        "pyaz", "pyaaz", "प्याज", "प्याज़" -> "pyaz"
+                        "tamatar", "tmatar", "टमाटर" -> "tamatar"
+                        "bhindi", "bindi", "भिंडी" -> "bhindi"
+                        "dhaniya", "धनिया" -> "dhaniya"
+                        "mirch", "mirchi", "मिर्च" -> "mirchi"
+                        "gobhi", "गोभी" -> "gobhi"
+                        "baingan", "बैंगन" -> "baingan"
+                        "gajar", "गाजर" -> "gajar"
+                        "matar", "मटर" -> "matar"
+                        "kheera", "खीरा" -> "kheera"
+                        "palak", "पालक" -> "palak"
+                        "lahsun", "लहसुन" -> "lahsun"
+                        else -> trimmed
+                    }
+                }
+
+                data class ItemRow(val id: String, val name: String, val stockQty: Double, val active: Int)
+                val cursor = db.query("SELECT id, name, stockQty, active FROM catalog_items")
+                val items = mutableListOf<ItemRow>()
+                while (cursor.moveToNext()) {
+                    val id = cursor.getString(0) ?: continue
+                    val name = cursor.getString(1) ?: ""
+                    val stockQty = cursor.getDouble(2)
+                    val active = cursor.getInt(3)
+                    items.add(ItemRow(id, name, stockQty, active))
+                }
+                cursor.close()
+
+                val groups = items.groupBy { normalizeItemName(it.name) }
+                for ((_, group) in groups) {
+                    if (group.size <= 1) continue
+
+                    val canonical = group.maxByOrNull { item ->
+                        var score = 0
+                        if (item.active == 1) score += 1000
+                        if (item.stockQty > 0) score += (item.stockQty * 10).toInt()
+                        score
+                    } ?: group.first()
+
+                    val canonicalId = canonical.id
+                    val mergedStockQty = group.sumOf { it.stockQty }
+
+                    db.execSQL(
+                        "UPDATE catalog_items SET stockQty = ?, active = 1 WHERE id = ?",
+                        arrayOf(mergedStockQty, canonicalId)
+                    )
+
+                    val duplicateIds = group.map { it.id }.filter { it != canonicalId }
+                    for (dupId in duplicateIds) {
+                        try { db.execSQL("UPDATE stock_ledger SET itemId = ? WHERE itemId = ?", arrayOf(canonicalId, dupId)) } catch (_: Exception) {}
+                        try { db.execSQL("UPDATE transactions SET itemId = ? WHERE itemId = ?", arrayOf(canonicalId, dupId)) } catch (_: Exception) {}
+                        try { db.execSQL("UPDATE stock_in SET itemId = ? WHERE itemId = ?", arrayOf(canonicalId, dupId)) } catch (_: Exception) {}
+                        try { db.execSQL("UPDATE stock_batches SET itemId = ? WHERE itemId = ?", arrayOf(canonicalId, dupId)) } catch (_: Exception) {}
+                        try { db.execSQL("UPDATE daily_rollups SET itemId = ? WHERE itemId = ?", arrayOf(canonicalId, dupId)) } catch (_: Exception) {}
+                        try { db.execSQL("UPDATE unmatched_queue SET resolvedItemId = ? WHERE resolvedItemId = ?", arrayOf(canonicalId, dupId)) } catch (_: Exception) {}
+
+                        db.execSQL("DELETE FROM catalog_items WHERE id = ?", arrayOf(dupId))
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildDatabase(context).also { INSTANCE = it }
@@ -772,12 +932,7 @@ abstract class AppDatabase : RoomDatabase() {
                 AppDatabase::class.java,
                 "voice_to_invoice_db"
             )
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17, MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20, MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23)
-            // `fallbackToDestructiveMigration()` was removed deliberately. Sync is push-only
-            // (SyncEngine has no pull path for transactions), so wiping the local DB on a
-            // migration gap means a shopkeeper permanently loses their books. Failing loudly is
-            // recoverable -- silent data loss is not. Every migration step above is individually
-            // guarded and records failures to `migration_status`.
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17, MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20, MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23, MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26, MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29)
             .addCallback(object : Callback() {
                 override fun onCreate(db: SupportSQLiteDatabase) {
                     super.onCreate(db)
@@ -791,13 +946,52 @@ abstract class AppDatabase : RoomDatabase() {
 
                 override fun onOpen(db: SupportSQLiteDatabase) {
                     super.onOpen(db)
-                    CoroutineScope(Dispatchers.IO).launch {
-                        try {
-                            db.execSQL("DELETE FROM catalog_items WHERE LOWER(name) IN ('kilometer', 'किलोमीटर', 'kilo', 'kg', 'सत्तर', 'पचास', 'item', 'पचास पॉन्ड्स क्रीम')")
-                            db.execSQL("DELETE FROM transactions WHERE LOWER(itemName) IN ('kilometer', 'किलोमीटर', 'kilo', 'kg', 'item')")
-                        } catch (e: Exception) {
-                            e.printStackTrace()
+                    try {
+                        db.execSQL("DELETE FROM catalog_items WHERE LOWER(name) IN ('kilometer', 'किलोमीटर', 'kilo', 'kg', 'सत्तर', 'पचास', 'item', 'पचास पॉन्ड्स क्रीम')")
+                        db.execSQL("DELETE FROM transactions WHERE LOWER(itemName) IN ('kilometer', 'किलोमीटर', 'kilo', 'kg', 'item')")
+                        performCatalogDeduplication(db)
+
+                        val cursor = db.query("SELECT id, name FROM catalog_items WHERE active = 1 AND (canonicalKey IS NULL OR canonicalKey = '')")
+                        val updates = mutableListOf<Pair<String, String>>()
+                        while (cursor.moveToNext()) {
+                            val id = cursor.getString(0) ?: continue
+                            val name = cursor.getString(1) ?: ""
+                            val key = com.voicetoinvoice.app.domain.lexicon.ItemLexicon.canonicalOf(name)
+                            updates.add(Pair(id, key))
                         }
+                        cursor.close()
+                        for ((id, key) in updates) {
+                            db.execSQL("UPDATE catalog_items SET canonicalKey = ? WHERE id = ?", arrayOf(key, id))
+                        }
+
+                        val baseCursor = db.query("SELECT id, unitId FROM catalog_items WHERE active = 1 AND (baseUnit IS NULL OR baseUnit = '')")
+                        val baseUpdates = mutableListOf<Pair<String, String>>()
+                        while (baseCursor.moveToNext()) {
+                            val id = baseCursor.getString(0) ?: continue
+                            val unitId = baseCursor.getString(1) ?: "PACKET"
+                            val baseUnit = com.voicetoinvoice.app.domain.lexicon.ItemLexicon.baseUnitOf(unitId)
+                            baseUpdates.add(Pair(id, baseUnit))
+                        }
+                        baseCursor.close()
+                        for ((id, baseUnit) in baseUpdates) {
+                            db.execSQL("UPDATE catalog_items SET baseUnit = ? WHERE id = ?", arrayOf(baseUnit, id))
+                        }
+
+                        if (updates.isNotEmpty() || baseUpdates.isNotEmpty()) {
+                            CoroutineScope(Dispatchers.IO).launch {
+                                INSTANCE?.let { database ->
+                                    database.catalogDao().dedupeCatalogItems(
+                                        database.transactionDao(),
+                                        database.stockLedgerDao(),
+                                        database.stockInDao(),
+                                        database.stockBatchDao(),
+                                        database.unmatchedQueueDao()
+                                    )
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
                     }
                 }
             })
@@ -822,73 +1016,81 @@ abstract class AppDatabase : RoomDatabase() {
             db.itemUnitDao().insertAll(units)
         }
 
+        private fun seedItem(name: String, unitId: String, price: Double): CatalogItem {
+            val norm = name.trim().lowercase()
+            val deterministicId = java.util.UUID.nameUUIDFromBytes("catalog_seed_$norm".toByteArray()).toString()
+            val canonicalKey = com.voicetoinvoice.app.domain.lexicon.ItemLexicon.canonicalOf(name)
+            val baseUnit = com.voicetoinvoice.app.domain.lexicon.ItemLexicon.baseUnitOf(unitId)
+            return CatalogItem(id = deterministicId, name = name, unitId = unitId, price = price, canonicalKey = canonicalKey, baseUnit = baseUnit)
+        }
+
         private suspend fun seedMasterCatalog(db: AppDatabase) {
             val catalogDao = db.catalogDao()
             val preseededItems = listOf(
                 // 1. Vegetables & Produce
-                CatalogItem(name = "Pyaz", unitId = "KG", price = 35.0),
-                CatalogItem(name = "Tamatar", unitId = "KG", price = 40.0),
-                CatalogItem(name = "Aaloo", unitId = "KG", price = 30.0),
-                CatalogItem(name = "Bhindi", unitId = "KG", price = 50.0),
-                CatalogItem(name = "Adrak", unitId = "KG", price = 120.0),
-                CatalogItem(name = "Mirchi", unitId = "KG", price = 80.0),
-                CatalogItem(name = "Nimbu", unitId = "PIECE", price = 5.0),
-                CatalogItem(name = "Dhaniya", unitId = "KG", price = 60.0),
-                CatalogItem(name = "Palak", unitId = "KG", price = 40.0),
-                CatalogItem(name = "Gobhi", unitId = "PIECE", price = 30.0),
-                CatalogItem(name = "Lauki", unitId = "PIECE", price = 20.0),
-                CatalogItem(name = "Karela", unitId = "KG", price = 45.0),
-                CatalogItem(name = "Broccoli", unitId = "KG", price = 150.0),
-                CatalogItem(name = "Baingan", unitId = "KG", price = 40.0),
-                CatalogItem(name = "Gajar", unitId = "KG", price = 35.0),
-                CatalogItem(name = "Matar", unitId = "KG", price = 60.0),
-                CatalogItem(name = "Kheera", unitId = "KG", price = 30.0),
-                CatalogItem(name = "Lahsun", unitId = "KG", price = 160.0),
-                CatalogItem(name = "Dragon Fruit", unitId = "PIECE", price = 80.0),
+                seedItem(name = "Pyaz", unitId = "KG", price = 35.0),
+                seedItem(name = "Tamatar", unitId = "KG", price = 40.0),
+                seedItem(name = "Aaloo", unitId = "KG", price = 30.0),
+                seedItem(name = "Bhindi", unitId = "KG", price = 50.0),
+                seedItem(name = "Adrak", unitId = "KG", price = 120.0),
+                seedItem(name = "Mirchi", unitId = "KG", price = 80.0),
+                seedItem(name = "Nimbu", unitId = "PIECE", price = 5.0),
+                seedItem(name = "Dhaniya", unitId = "KG", price = 60.0),
+                seedItem(name = "Palak", unitId = "KG", price = 40.0),
+                seedItem(name = "Gobhi", unitId = "PIECE", price = 30.0),
+                seedItem(name = "Lauki", unitId = "PIECE", price = 20.0),
+                seedItem(name = "Karela", unitId = "KG", price = 45.0),
+                seedItem(name = "Broccoli", unitId = "KG", price = 150.0),
+                seedItem(name = "Baingan", unitId = "KG", price = 40.0),
+                seedItem(name = "Gajar", unitId = "KG", price = 35.0),
+                seedItem(name = "Matar", unitId = "KG", price = 60.0),
+                seedItem(name = "Kheera", unitId = "KG", price = 30.0),
+                seedItem(name = "Lahsun", unitId = "KG", price = 160.0),
+                seedItem(name = "Dragon Fruit", unitId = "PIECE", price = 80.0),
 
                 // 2. Dairy & Eggs
-                CatalogItem(name = "Amul Gold Milk", unitId = "PACKET", price = 34.0),
-                CatalogItem(name = "Amul Taaza Milk", unitId = "PACKET", price = 27.0),
-                CatalogItem(name = "Saras Milk", unitId = "PACKET", price = 30.0),
-                CatalogItem(name = "Curd (Dahi)", unitId = "PACKET", price = 35.0),
-                CatalogItem(name = "Chaas (Buttermilk)", unitId = "PACKET", price = 15.0),
-                CatalogItem(name = "Paneer", unitId = "KG", price = 360.0),
-                CatalogItem(name = "Butter", unitId = "PACKET", price = 56.0),
-                CatalogItem(name = "Eggs", unitId = "DOZEN", price = 84.0),
+                seedItem(name = "Amul Gold Milk", unitId = "PACKET", price = 34.0),
+                seedItem(name = "Amul Taaza Milk", unitId = "PACKET", price = 27.0),
+                seedItem(name = "Saras Milk", unitId = "PACKET", price = 30.0),
+                seedItem(name = "Curd (Dahi)", unitId = "PACKET", price = 35.0),
+                seedItem(name = "Chaas (Buttermilk)", unitId = "PACKET", price = 15.0),
+                seedItem(name = "Paneer", unitId = "KG", price = 360.0),
+                seedItem(name = "Butter", unitId = "PACKET", price = 56.0),
+                seedItem(name = "Eggs", unitId = "DOZEN", price = 84.0),
 
                 // 3. Bakery & FMCG Snacks
-                CatalogItem(name = "Bourbon Biscuit", unitId = "PACKET", price = 30.0),
-                CatalogItem(name = "Parle-G Biscuit", unitId = "PACKET", price = 10.0),
-                CatalogItem(name = "Good Day Biscuit", unitId = "PACKET", price = 20.0),
-                CatalogItem(name = "Hide & Seek Biscuit", unitId = "PACKET", price = 30.0),
-                CatalogItem(name = "Rusk", unitId = "PACKET", price = 40.0),
-                CatalogItem(name = "Bread", unitId = "PACKET", price = 45.0),
-                CatalogItem(name = "Maggi", unitId = "PACKET", price = 14.0),
+                seedItem(name = "Bourbon Biscuit", unitId = "PACKET", price = 30.0),
+                seedItem(name = "Parle-G Biscuit", unitId = "PACKET", price = 10.0),
+                seedItem(name = "Good Day Biscuit", unitId = "PACKET", price = 20.0),
+                seedItem(name = "Hide & Seek Biscuit", unitId = "PACKET", price = 30.0),
+                seedItem(name = "Rusk", unitId = "PACKET", price = 40.0),
+                seedItem(name = "Bread", unitId = "PACKET", price = 45.0),
+                seedItem(name = "Maggi", unitId = "PACKET", price = 14.0),
 
                 // 4. Staples & Sugar
-                CatalogItem(name = "Sugar (Madhur)", unitId = "KG", price = 45.0),
-                CatalogItem(name = "Atta (Aashirvaad)", unitId = "KG", price = 42.0),
-                CatalogItem(name = "Basmati Rice", unitId = "KG", price = 90.0),
-                CatalogItem(name = "Toor Dal", unitId = "KG", price = 160.0),
-                CatalogItem(name = "Chana Dal", unitId = "KG", price = 90.0),
-                CatalogItem(name = "Moong Dal", unitId = "KG", price = 110.0),
-                CatalogItem(name = "Poha", unitId = "KG", price = 50.0),
+                seedItem(name = "Sugar (Madhur)", unitId = "KG", price = 45.0),
+                seedItem(name = "Atta (Aashirvaad)", unitId = "KG", price = 42.0),
+                seedItem(name = "Basmati Rice", unitId = "KG", price = 90.0),
+                seedItem(name = "Toor Dal", unitId = "KG", price = 160.0),
+                seedItem(name = "Chana Dal", unitId = "KG", price = 90.0),
+                seedItem(name = "Moong Dal", unitId = "KG", price = 110.0),
+                seedItem(name = "Poha", unitId = "KG", price = 50.0),
 
                 // 5. Spices & Cooking Oil
-                CatalogItem(name = "Fortune Refined Oil", unitId = "LITRE", price = 140.0),
-                CatalogItem(name = "Mustard Oil", unitId = "LITRE", price = 150.0),
-                CatalogItem(name = "Desi Ghee", unitId = "KG", price = 650.0),
-                CatalogItem(name = "Tata Salt", unitId = "PACKET", price = 28.0),
-                CatalogItem(name = "Haldi Powder", unitId = "GRAM", price = 0.25),
-                CatalogItem(name = "Lal Mirch Powder", unitId = "GRAM", price = 0.30),
-                CatalogItem(name = "Jeera", unitId = "GRAM", price = 0.40),
-                CatalogItem(name = "Garam Masala", unitId = "GRAM", price = 0.60),
+                seedItem(name = "Fortune Refined Oil", unitId = "LITRE", price = 140.0),
+                seedItem(name = "Mustard Oil", unitId = "LITRE", price = 150.0),
+                seedItem(name = "Desi Ghee", unitId = "KG", price = 650.0),
+                seedItem(name = "Tata Salt", unitId = "PACKET", price = 28.0),
+                seedItem(name = "Haldi Powder", unitId = "GRAM", price = 0.25),
+                seedItem(name = "Lal Mirch Powder", unitId = "GRAM", price = 0.30),
+                seedItem(name = "Jeera", unitId = "GRAM", price = 0.40),
+                seedItem(name = "Garam Masala", unitId = "GRAM", price = 0.60),
 
                 // 6. Beverages & Energy Drinks
-                CatalogItem(name = "Tata Tea", unitId = "PACKET", price = 140.0),
-                CatalogItem(name = "Nescafe Coffee", unitId = "PACKET", price = 160.0),
-                CatalogItem(name = "Thums Up", unitId = "PIECE", price = 40.0),
-                CatalogItem(name = "Red Bull", unitId = "PIECE", price = 125.0)
+                seedItem(name = "Tata Tea", unitId = "PACKET", price = 140.0),
+                seedItem(name = "Nescafe Coffee", unitId = "PACKET", price = 160.0),
+                seedItem(name = "Thums Up", unitId = "PIECE", price = 40.0),
+                seedItem(name = "Red Bull", unitId = "PIECE", price = 125.0)
             )
             catalogDao.insertAll(preseededItems)
         }

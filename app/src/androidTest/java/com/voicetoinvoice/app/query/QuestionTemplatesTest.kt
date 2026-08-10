@@ -99,8 +99,10 @@ class QuestionTemplatesTest {
     fun revenueQuestions_allThreeScripts() {
         assertAnswered("आज कितना कमाया")
         assertAnswered("आज की बिक्री बताओ")
+        assertAnswered("आज कितने आलू बिके")
         assertAnswered("aaj kitna kamaya")
         assertAnswered("aaj ki sale kitni hui") // the headline regression
+        assertAnswered("aaj kitne aaloo bike")
         assertAnswered("what is today sale")
         assertAnswered("tell me today revenue")
         assertAnswered("total business today")

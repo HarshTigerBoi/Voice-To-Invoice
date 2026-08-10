@@ -1,6 +1,7 @@
 package com.voicetoinvoice.app.domain.router
 
 import com.voicetoinvoice.app.data.local.entity.CaptureIntent
+import com.voicetoinvoice.app.domain.parser.OrderingSegmenter
 import com.voicetoinvoice.app.domain.parser.PhoneticKey
 import org.json.JSONArray
 
@@ -242,6 +243,50 @@ object IntentRouter {
     }
 
     /**
+     * Phone keys of every numeral and unit surface. See ISSUE-120 — "चार" keys to CAL,
+     * identical to the ACTION_COMMAND trigger "call" (verified distance 0.0000), which routed
+     * three plain cash sales to review instead of booking them. Threshold tuning cannot fix a
+     * zero distance, so quantity-only spans are excluded from trigger matching outright.
+     */
+    private val QUANTITY_KEYS: Set<String> =
+        (OrderingSegmenter.HINDI_NUMBER_MAP.keys + OrderingSegmenter.UNIT_SET)
+            .map { PhoneticKey.of(it) }
+            .filter { it.isNotBlank() }
+            .toSet()
+
+    /**
+     * Literal lowercased surfaces of every trigger word.
+     *
+     * The first version of this fix asserted "no trigger phrase is a number or a unit, so
+     * filtering is safe by construction." That was WRONG and the fixture caught it: the
+     * PRICE_UPDATE trigger `भाव`/`bhav` (rate) and the quantity word `पाव` (quarter) BOTH key
+     * to `PAV`, so filtering by key alone deleted the `bhav` trigger and "aaloo ka bhav 30"
+     * degraded from PRICE_UPDATE to SALE — turning a rate change into a fake one-unit sale.
+     *
+     * The asymmetry that resolves it: the trigger lexicon is the authority on what a trigger
+     * word is. `bhav` is literally in the trigger list and is NOT literally a numeral surface,
+     * so it is kept. `चार` is literally a numeral surface and is NOT literally a trigger word,
+     * so it is still filtered and the original ISSUE-120 collision stays fixed.
+     */
+    private val TRIGGER_SURFACES: Set<String> =
+        IntentLexicon.TRIGGERS
+            .flatMap { it.phrases }
+            .flatMap { it.lowercase().split(Regex("\\s+")) }
+            .filter { it.isNotBlank() }
+            .toSet()
+
+    /** True when a word is a bare number, a number word, or a unit — and is not itself a trigger word. */
+    private fun isQuantityToken(word: String): Boolean {
+        val lower = word.lowercase().trim()
+        if (lower.isEmpty()) return true
+        // A literal trigger word is never a quantity, whatever it happens to key to.
+        if (lower in TRIGGER_SURFACES) return false
+        if (lower.toDoubleOrNull() != null) return true
+        val key = PhoneticKey.of(lower)
+        return key.isNotBlank() && key in QUANTITY_KEYS
+    }
+
+    /**
      * Unigram + bigram + trigram phone keys.
      *
      * Bigrams and trigrams are required because most trigger phrases are multi-word ("de diye",
@@ -251,13 +296,16 @@ object IntentRouter {
     private fun buildNgramKeys(transcript: String): List<String> {
         val words = transcript.split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.isEmpty()) return emptyList()
+        val isQty = words.map { isQuantityToken(it) }
         val keys = LinkedHashSet<String>()
         for (i in words.indices) {
-            PhoneticKey.of(words[i]).takeIf { it.isNotBlank() }?.let { keys.add(it) }
-            if (i + 1 < words.size) {
+            if (!isQty[i]) {
+                PhoneticKey.of(words[i]).takeIf { it.isNotBlank() }?.let { keys.add(it) }
+            }
+            if (i + 1 < words.size && !(isQty[i] && isQty[i + 1])) {
                 PhoneticKey.of(words[i] + words[i + 1]).takeIf { it.isNotBlank() }?.let { keys.add(it) }
             }
-            if (i + 2 < words.size) {
+            if (i + 2 < words.size && !(isQty[i] && isQty[i + 1] && isQty[i + 2])) {
                 PhoneticKey.of(words[i] + words[i + 1] + words[i + 2]).takeIf { it.isNotBlank() }
                     ?.let { keys.add(it) }
             }

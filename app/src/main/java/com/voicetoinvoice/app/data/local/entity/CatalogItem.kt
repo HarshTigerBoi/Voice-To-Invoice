@@ -7,7 +7,7 @@ import java.util.UUID
 
 @Entity(
     tableName = "catalog_items",
-    indices = [Index("active"), Index("name"), Index("synced"), Index("shopId"), Index("lastSoldAtMs")]
+    indices = [Index("active"), Index("name"), Index("synced"), Index("shopId"), Index("lastSoldAtMs"), Index("canonicalKey"), Index("baseUnit")]
 )
 data class CatalogItem(
     @PrimaryKey
@@ -45,5 +45,21 @@ data class CatalogItem(
 
     /** Drives dead-stock and fast/slow-moving analysis without scanning transactions. */
     val lastSoldAtMs: Long? = null,
-    val lastStockedAtMs: Long? = null
+    val lastStockedAtMs: Long? = null,
+
+    /** Visual icon / image URL hosted on Supabase Storage or external asset link. */
+    val imageUrl: String? = null,
+
+    /**
+     * On-device photo captured by the shopkeeper. Takes precedence over [imageUrl] when both
+     * exist: the shopkeeper's own photo of their own stock is a better identity than a generic
+     * pack shot. Device-local — deliberately NOT synced, because the file is not.
+     */
+    val imagePath: String? = null,
+
+    /** Lexicon identity for this item. Two spellings of one product share it. ISSUE-107. */
+    val canonicalKey: String = "",
+
+    /** Base unit for identity resolution & unit conversion (KG, PIECE, PACKET, LITRE, BOX). ISSUE-109. */
+    val baseUnit: String = ""
 )

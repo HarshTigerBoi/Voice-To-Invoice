@@ -11,6 +11,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
 
+import androidx.compose.ui.platform.LocalContext
+import com.voicetoinvoice.app.data.local.AppDatabase
+import com.voicetoinvoice.app.ui.components.ItemIcon
+import com.voicetoinvoice.app.ui.components.PhotoCaptureButton
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CatalogManagementScreen(
@@ -20,9 +28,15 @@ fun CatalogManagementScreen(
     onSetThreshold: (CatalogItem, Double?) -> Unit = { _, _ -> },
     onNavigateBack: () -> Unit
 ) {
+    val context = LocalContext.current
+    val db = remember { AppDatabase.getInstance(context) }
+    val scope = rememberCoroutineScope()
+    var reloadToken by remember { mutableStateOf(0) }
+
     var showAddDialog by remember { mutableStateOf(false) }
     var newItemName by remember { mutableStateOf("") }
     var newItemPrice by remember { mutableStateOf("") }
+    var newItemImageUrl by remember { mutableStateOf("") }
 
     var selectedItemForThreshold by remember { mutableStateOf<CatalogItem?>(null) }
     var thresholdInput by remember { mutableStateOf("") }
@@ -41,7 +55,7 @@ fun CatalogManagementScreen(
         }
     ) { padding ->
         LazyColumn(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
-            items(catalog) { item ->
+            items(catalog, key = { "${it.id}_$reloadToken" }) { item ->
                 val onHand = stockLevels[item.id] ?: 0.0
                 val isLowStock = item.lowStockThreshold != null && onHand <= item.lowStockThreshold
 
@@ -64,11 +78,30 @@ fun CatalogManagementScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
-                            Text(item.name, style = MaterialTheme.typography.titleMedium)
-                            Text("Unit: ${item.unitId} • On hand: ${onHand} ${item.unitId}", style = MaterialTheme.typography.bodySmall)
-                            if (item.lowStockThreshold != null) {
-                                Text("Low stock threshold: ${item.lowStockThreshold} ${item.unitId}", style = MaterialTheme.typography.labelSmall, color = if (isLowStock) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            PhotoCaptureButton(
+                                currentPath = item.imagePath,
+                                filePrefix = "item",
+                                onCaptured = { path ->
+                                    scope.launch {
+                                        withContext(Dispatchers.IO) {
+                                            db.catalogDao().updateImagePath(item.id, path)
+                                        }
+                                        reloadToken++
+                                    }
+                                },
+                                size = 48.dp
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                Text(item.name, style = MaterialTheme.typography.titleMedium)
+                                Text("Unit: ${item.unitId} • On hand: ${onHand} ${item.unitId}", style = MaterialTheme.typography.bodySmall)
+                                if (item.lowStockThreshold != null) {
+                                    Text("Low stock threshold: ${item.lowStockThreshold} ${item.unitId}", style = MaterialTheme.typography.labelSmall, color = if (isLowStock) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline)
+                                }
                             }
                         }
                         Column(horizontalAlignment = Alignment.End) {
@@ -90,6 +123,13 @@ fun CatalogManagementScreen(
                     OutlinedTextField(value = newItemName, onValueChange = { newItemName = it }, label = { Text("Item Name") })
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(value = newItemPrice, onValueChange = { newItemPrice = it }, label = { Text("Price per KG/Pcs") })
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = newItemImageUrl,
+                        onValueChange = { newItemImageUrl = it },
+                        label = { Text("Icon / Image Link (Optional)") },
+                        placeholder = { Text("https://... or Vecteezy link") }
+                    )
                 }
             },
             confirmButton = {

@@ -23,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.voicetoinvoice.app.data.local.entity.CaptureIntent
+import com.voicetoinvoice.app.ui.theme.LedgerColors
 import com.voicetoinvoice.app.data.local.entity.SttJobRecord
 import com.voicetoinvoice.app.data.local.entity.SttJobStatus
 import java.io.File
@@ -104,7 +105,11 @@ private fun CommandFeedRow(
             verticalAlignment = Alignment.CenterVertically
         ) {
             StatusIcon(job.status)
-            Spacer(Modifier.width(10.dp))
+            Spacer(Modifier.width(8.dp))
+            if (job.parsedItemName.isNotBlank() && job.parsedItemName != "Unrecognized Item") {
+                ItemIcon(itemName = job.parsedItemName, imageUrl = null, size = 32.dp)
+                Spacer(Modifier.width(8.dp))
+            }
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     describeJob(job),
@@ -157,12 +162,12 @@ private fun StatusIcon(status: SttJobStatus) {
         SttJobStatus.AUTO_CONFIRMED, SttJobStatus.RATE_UPDATED, SttJobStatus.CONFIRMED -> Icon(
             Icons.Default.CheckCircle,
             contentDescription = "Confirmed",
-            tint = Color(0xFF2E7D32)
+            tint = LedgerColors.MoneyIn
         )
         SttJobStatus.PARTIALLY_CONFIRMED -> Icon(
             Icons.Default.Warning,
             contentDescription = "Partially confirmed",
-            tint = Color(0xFFF9A825)
+            tint = LedgerColors.Udhaar
         )
         SttJobStatus.PARSED -> Icon(
             Icons.Default.HelpOutline,

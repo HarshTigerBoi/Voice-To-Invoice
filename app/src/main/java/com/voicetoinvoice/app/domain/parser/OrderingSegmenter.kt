@@ -1,5 +1,6 @@
 package com.voicetoinvoice.app.domain.parser
 
+import com.voicetoinvoice.app.domain.lexicon.ItemLexicon
 import kotlin.math.min
 
 data class CandidateRank(
@@ -7,6 +8,18 @@ data class CandidateRank(
     val distance: Double,
     val score: Double,
     val margin: Double? = null
+)
+
+enum class ResolutionKind { MATCH, AMBIGUOUS, UNKNOWN }
+
+data class NumeralRejoin(
+    val leftToken: String,
+    val rightToken: String,
+    val mergedSurface: String,
+    val value: Double,
+    val matchNorm: Double,
+    val valueMargin: Double,
+    val lowMargin: Boolean
 )
 
 data class RawItemSegment(
@@ -18,12 +31,15 @@ data class RawItemSegment(
     val isSanityFlagged: Boolean = false,
     val itemMatchNorm: Double? = null,
     val itemMargin: Double? = null,
-    val top3Candidates: List<CandidateRank> = emptyList()
+    val top3Candidates: List<CandidateRank> = emptyList(),
+    val resolutionKind: ResolutionKind = ResolutionKind.MATCH,
+    val numeralRejoinLowMargin: Boolean = false
 )
 
 data class SegmentResult(
     val segments: List<RawItemSegment>,
-    val carryoverQty: Double? = null
+    val carryoverQty: Double? = null,
+    val numeralRejoins: List<NumeralRejoin> = emptyList()
 )
 
 private enum class TokenType { NUM, UNIT, ITEM }
@@ -37,7 +53,9 @@ private data class DecodedToken(
     val suspect: Boolean = false,
     val matchNorm: Double? = null,
     val matchMargin: Double? = null,
-    val top3Candidates: List<CandidateRank> = emptyList()
+    val top3Candidates: List<CandidateRank> = emptyList(),
+    val fromSplit: Boolean = false,
+    val isQualifier: Boolean = false
 )
 
 /** One typed piece a source token can decode to. A source token yields several of these
@@ -52,7 +70,9 @@ private data class Emission(
     val suspect: Boolean = false,
     val matchNorm: Double? = null,
     val matchMargin: Double? = null,
-    val top3Candidates: List<CandidateRank> = emptyList()
+    val top3Candidates: List<CandidateRank> = emptyList(),
+    val fromSplit: Boolean = false,
+    val isQualifier: Boolean = false
 )
 
 /** One complete reading of a single source token: either a whole-token reading
@@ -62,6 +82,7 @@ private data class Expansion(val emissions: List<Emission>, val emissionCost: Do
 internal data class VocabEntry(
     val key: String,
     val surface: String,
+    val canonical: String,
     val numericValue: Double? = null,
     val canonicalUnit: String? = null
 )
@@ -186,9 +207,27 @@ private object GrammarLatticeDecoder {
         vocab: List<VocabEntry>,
         maxNorm: Double,
         allowElision: Boolean = false,
-        allowEcho: Boolean = false
+        allowEcho: Boolean = false,
+        aliases: Map<String, String> = emptyMap()
     ): VocabHit? {
         if (fragment.isEmpty() || vocab.isEmpty()) return null
+
+        if (aliases.containsKey(fragment)) {
+            val canonicalName = aliases[fragment]!!
+            val matchingEntry = vocab.find { it.surface.equals(canonicalName, ignoreCase = true) }
+            if (matchingEntry != null) {
+                return VocabHit(
+                    entry = matchingEntry,
+                    normalized = 0.0,
+                    margin = 1.0,
+                    top3 = listOf(CandidateRank(itemName = matchingEntry.surface, distance = 0.0, score = 0.0))
+                )
+            }
+        }
+
+        // Keyed by CANONICAL identity, not phonetic key: "अदरक" (ATALAK) and "Adrak" (ATLAK) are
+        // one item with two keys, and keying by key made them two candidates one edit apart, which
+        // read as an ambiguous match and capped a correct parse at 0.55. ISSUE-107.
         val candidateMap = mutableMapOf<String, VocabHit>()
         for (entry in vocab) {
             if (entry.key.isEmpty()) continue
@@ -200,9 +239,9 @@ private object GrammarLatticeDecoder {
                 cost = min(cost, (fragment.length - entry.key.length) * 0.5)
             }
             val norm = cost / maxOf(fragment.length, entry.key.length).toDouble()
-            val existing = candidateMap[entry.key]
+            val existing = candidateMap[entry.canonical]
             if (existing == null || norm < existing.normalized) {
-                candidateMap[entry.key] = VocabHit(entry, norm)
+                candidateMap[entry.canonical] = VocabHit(entry, norm)
             }
         }
         if (candidateMap.isEmpty()) return null
@@ -222,7 +261,11 @@ private object GrammarLatticeDecoder {
         return VocabHit(best.entry, best.normalized, margin, top3)
     }
 
-    private fun wholeTokenExpansions(raw: String, vocab: SegmenterVocabulary): List<Expansion> {
+    private fun wholeTokenExpansions(
+        raw: String,
+        vocab: SegmenterVocabulary,
+        aliases: Map<String, String> = emptyMap()
+    ): List<Expansion> {
         val lower = raw.lowercase()
         val out = mutableListOf<Expansion>()
 
@@ -251,12 +294,30 @@ private object GrammarLatticeDecoder {
         val key = PhoneticKey.of(lower)
         if (key.isNotEmpty()) {
             matchVocab(key, vocab.numbers, WHOLE_TOKEN_MAX_NORM)?.let {
-                out.add(Expansion(listOf(Emission(TokenType.NUM, it.normalized, raw, heardText = raw, numericValue = it.entry.numericValue)), it.normalized))
+                out.add(Expansion(listOf(Emission(TokenType.NUM, it.normalized, raw, heardText = raw, numericValue = it.entry.numericValue, matchNorm = it.normalized)), it.normalized))
             }
             matchVocab(key, vocab.units, WHOLE_TOKEN_MAX_NORM, allowElision = true)?.let {
-                out.add(Expansion(listOf(Emission(TokenType.UNIT, it.normalized, raw, heardText = raw, canonicalUnit = it.entry.canonicalUnit)), it.normalized))
+                out.add(Expansion(listOf(Emission(TokenType.UNIT, it.normalized, raw, heardText = raw, canonicalUnit = it.entry.canonicalUnit, matchNorm = it.normalized)), it.normalized))
             }
-            matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, allowEcho = true)?.let {
+            matchVocab(key, vocab.qualifiers, WHOLE_TOKEN_MAX_NORM)?.let { q ->
+                val cost = ITEM_MATCHED_BASE_COST + q.normalized
+                out.add(
+                    Expansion(
+                        listOf(
+                            Emission(
+                                type = TokenType.ITEM,
+                                cost = cost,
+                                surface = raw,
+                                heardText = raw,
+                                matchNorm = q.normalized,
+                                isQualifier = true
+                            )
+                        ),
+                        cost
+                    )
+                )
+            }
+            matchVocab(key, vocab.items, WHOLE_TOKEN_MAX_NORM, allowEcho = true, aliases = aliases)?.let {
                 val cost = ITEM_MATCHED_BASE_COST + it.normalized
                 out.add(
                     Expansion(
@@ -285,7 +346,11 @@ private object GrammarLatticeDecoder {
         return out
     }
 
-    private fun splitExpansions(raw: String, vocab: SegmenterVocabulary): List<Expansion> {
+    private fun splitExpansions(
+        raw: String,
+        vocab: SegmenterVocabulary,
+        aliases: Map<String, String> = emptyMap()
+    ): List<Expansion> {
         val key = PhoneticKey.of(raw.lowercase())
         if (key.length < MIN_SPLIT_PHONES * 2) return emptyList()
         val out = mutableListOf<Expansion>()
@@ -297,9 +362,10 @@ private object GrammarLatticeDecoder {
             heardText = heardText,
             numericValue = hit.entry.numericValue,
             canonicalUnit = hit.entry.canonicalUnit,
-            matchNorm = if (type == TokenType.ITEM) hit.normalized else null,
+            matchNorm = hit.normalized,
             matchMargin = if (type == TokenType.ITEM) hit.margin else null,
-            top3Candidates = if (type == TokenType.ITEM) hit.top3 else emptyList()
+            top3Candidates = if (type == TokenType.ITEM) hit.top3 else emptyList(),
+            fromSplit = true
         )
 
         // 2-way: [NUM][UNIT] ("चरगलो"), [UNIT][ITEM] ("ग्लोसोना"), [NUM][ITEM] ("एकलो").
@@ -312,15 +378,15 @@ private object GrammarLatticeDecoder {
                     val c = n.normalized + u.normalized + 2 * SPLIT_PENALTY
                     out.add(Expansion(listOf(emissionFor(TokenType.NUM, n, n.normalized), emissionFor(TokenType.UNIT, u, u.normalized)), c))
                 }
-                matchVocab(p2, vocab.items, SPLIT_PART_MAX_NORM)?.let { it2 ->
+                matchVocab(p2, vocab.items, SPLIT_PART_MAX_NORM, aliases = aliases)?.let { it2 ->
                     val c = n.normalized + it2.normalized + 2 * SPLIT_PENALTY
                     out.add(Expansion(listOf(emissionFor(TokenType.NUM, n, n.normalized), emissionFor(TokenType.ITEM, it2, it2.normalized)), c))
                 }
             }
-            matchVocab(p1, vocab.units, SPLIT_PART_MAX_NORM)?.let { u ->
-                matchVocab(p2, vocab.items, SPLIT_PART_MAX_NORM)?.let { it2 ->
-                    val c = u.normalized + it2.normalized + 2 * SPLIT_PENALTY
-                    out.add(Expansion(listOf(emissionFor(TokenType.UNIT, u, u.normalized), emissionFor(TokenType.ITEM, it2, it2.normalized)), c))
+            matchVocab(p1, vocab.units, SPLIT_PART_MAX_NORM)?.let { u1 ->
+                matchVocab(p2, vocab.items, SPLIT_PART_MAX_NORM, aliases = aliases)?.let { it2 ->
+                    val c = u1.normalized + it2.normalized + 2 * SPLIT_PENALTY
+                    out.add(Expansion(listOf(emissionFor(TokenType.UNIT, u1, u1.normalized), emissionFor(TokenType.ITEM, it2, it2.normalized)), c))
                 }
             }
         }
@@ -355,14 +421,18 @@ private object GrammarLatticeDecoder {
      * flattened winning emission sequence plus the ambiguity gap at the tightest
      * decision point (small gap = genuinely close call worth sanity-flagging).
      */
-    fun decode(tokens: List<String>, vocab: SegmenterVocabulary): Pair<List<DecodedToken>, Double> {
+    fun decode(
+        tokens: List<String>,
+        vocab: SegmenterVocabulary,
+        aliases: Map<String, String> = emptyMap()
+    ): Pair<List<DecodedToken>, Double> {
         if (tokens.isEmpty()) return emptyList<DecodedToken>() to Double.MAX_VALUE
 
         val expansionsPerToken = tokens.map { raw ->
-            val whole = wholeTokenExpansions(raw, vocab)
+            val whole = wholeTokenExpansions(raw, vocab, aliases)
             val exactOnly = whole.size == 1 && whole[0].emissionCost == EXACT_COST
             // Don't even consider splitting a token that exactly matches a known word.
-            val all = if (exactOnly) whole else whole + splitExpansions(raw, vocab)
+            val all = if (exactOnly) whole else whole + splitExpansions(raw, vocab, aliases)
             // Suspicion is a property of the SOURCE token, not of one reading of it.
             // "किलोमीटर" is a mis-decode however we choose to carve it up, so the split
             // readings have to inherit the flag too — otherwise the split wins the
@@ -445,7 +515,9 @@ private object GrammarLatticeDecoder {
                         suspect = em.suspect,
                         matchNorm = em.matchNorm,
                         matchMargin = em.matchMargin,
-                        top3Candidates = em.top3Candidates
+                        top3Candidates = em.top3Candidates,
+                        fromSplit = em.fromSplit,
+                        isQualifier = em.isQualifier
                     )
                 )
             }
@@ -458,16 +530,19 @@ private object GrammarLatticeDecoder {
 class SegmenterVocabulary(catalogNames: List<String> = emptyList()) {
     internal val numbers: List<VocabEntry> = OrderingSegmenter.HINDI_NUMBER_MAP
         .filterKeys { it.length >= 2 }
-        .map { (word, value) -> VocabEntry(PhoneticKey.of(word), word, numericValue = value) }
+        .map { (word, value) -> VocabEntry(PhoneticKey.of(word), word, canonical = "num:$value", numericValue = value) }
 
     internal val units: List<VocabEntry> = OrderingSegmenter.UNIT_SET
-        .map { unit -> VocabEntry(PhoneticKey.of(unit), unit, canonicalUnit = unit) }
+        .map { unit -> VocabEntry(PhoneticKey.of(unit), unit, canonical = "unit:$unit", canonicalUnit = unit) }
+
+    internal val qualifiers: List<VocabEntry> = ItemLexicon.ALL_QUALIFIER_SURFACES
+        .map { q -> VocabEntry(PhoneticKey.of(q), q, canonical = "qual:${ItemLexicon.canonicalQualifierOf(q)}") }
 
     internal val items: List<VocabEntry> =
         (OrderingSegmenter.DEFAULT_ITEM_VOCAB + catalogNames)
             .filter { it.isNotBlank() }
             .distinct()
-            .map { name -> VocabEntry(PhoneticKey.of(name), name) }
+            .map { name -> VocabEntry(PhoneticKey.of(name), name, canonical = ItemLexicon.canonicalOf(name)) }
 }
 
 class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
@@ -476,12 +551,46 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
         const val EXACT_COST = 0.0
         const val WHOLE_TOKEN_MAX_NORM = 0.25
         const val SPLIT_PART_MAX_NORM = 0.30
+        const val SPLIT_UNIT_TRUST_NORM = 0.15
         const val ITEM_MATCHED_BASE_COST = 0.20
         const val ITEM_BASELINE_COST = 1.20
         const val DISTANCE_TOKEN_ITEM_COST = 2.50
         const val SPLIT_PENALTY = 0.10
         const val ELISION_COST = 0.10
         const val MIN_SPLIT_PHONES = 2
+
+        /** A runner-up within one consonant edit of the winner is ambiguous regardless of key
+         *  length. Replaces TAU_MARGIN = 0.08, which was unreachable for keys <= 6 phones
+         *  (margin granularity is ~0.5/keyLength) and therefore never fired. See ISSUE-103. */
+        const val MIN_MARGIN_PHONE_EDITS = 1.0
+
+        /** A runner-up 0.30 normalized away is a clear win regardless of key length. Short real
+         *  products (घी -> KI, आम -> AN, 2 phones) can never satisfy margin*keyLen >= 1.0, which
+         *  demands margin >= 0.5 — unreachable against a genuine neighbour like गोभी at 0.375. Without
+         *  this, every 2-phone item in the catalog is permanently review-only. ISSUE-109. */
+        const val CLEAR_WIN_ABS_MARGIN = 0.30
+
+        /** Fragmented-numeral rejoin (ISSUE-106). A Hindi compound numeral 21-99 is ONE spoken
+         *  word ("तैंतीस"), but STT routinely emits it as two tokens ("ते" + "तीस"). The lattice
+         *  splits fused tokens and has no way to merge fragmented ones, so the leading fragment
+         *  became a bogus item and the trailing piece booked as the quantity -- 33 kg went into
+         *  the ledger as 30 kg.
+         *
+         *  0.22 is a measured optimum, not a guess. Below it, merges stop firing on realistically
+         *  lossy fragments and silent mis-bookings return (13 at 0.20, 55 at 0.12). Above it, real
+         *  transcripts start corrupting ("हर्ष दस किलो आलू" flips 10->27 at 0.30). At 0.22, zero of
+         *  170 production transcripts change harmfully. See Docs/fragmented_hindi_numeral_fix_plan.md §3. */
+        const val MERGE_MAX_NORM = 0.22
+        const val MERGE_MIN_VALUE_MARGIN = 0.10
+
+        /** Hindi/Hinglish discourse particles, fillers and postpositions. Never a product in
+         *  any shop, but short enough that the lossy phone key collides them with real catalog
+         *  items -- "हाँ" and "आम" are both key "AN". See ISSUE-103. */
+        val DISCOURSE_PARTICLES: Set<String> = setOf(
+            "हाँ", "हां", "हा", "ना", "नहीं", "है", "हैं", "ये", "यह", "वो", "वह", "अच्छा", "ठीक", "ओके", "जी",
+            "अरे", "बस", "और", "तो", "भी", "का", "की", "के", "में", "से", "पर", "अब", "क्या", "अम", "उम", "हम्म", "आँ",
+            "haan", "han", "haa", "hai", "ye", "wo", "achha", "theek", "ji", "bas", "aur", "ok", "okay", "hmm", "umm"
+        )
 
         val HINDI_NUMBER_MAP: Map<String, Double> = mapOf(
             "एक" to 1.0, "ek" to 1.0, "one" to 1.0, "1" to 1.0,
@@ -504,14 +613,93 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
             "अठारह" to 18.0, "athaarah" to 18.0, "18" to 18.0,
             "उन्नीस" to 19.0, "unnees" to 19.0, "19" to 19.0,
             "बीस" to 20.0, "bees" to 20.0, "20" to 20.0,
+            // 21-99. Hindi compound numerals are irregular single words, not composable from
+            // tens + units, so every one of them has to be listed. Their absence was not
+            // cosmetic: an unmapped numeral is not recognised as a quantity, so the segmenter
+            // treated it as the ITEM and the catalog accumulated ₹0 rows named "सत्ताईस" (27),
+            // "पंद्रह"-style leftovers and "अठारह के लोग". Anything 21-99 that was not an exact
+            // ten simply could not be spoken as a quantity before this.
+            "इक्कीस" to 21.0, "ikkees" to 21.0, "21" to 21.0,
+            "बाईस" to 22.0, "baees" to 22.0, "22" to 22.0,
+            "तेईस" to 23.0, "teees" to 23.0, "teis" to 23.0, "23" to 23.0,
+            "चौबीस" to 24.0, "chaubees" to 24.0, "24" to 24.0,
+            "पच्चीस" to 25.0, "pachchees" to 25.0, "pachees" to 25.0, "25" to 25.0,
+            "छब्बीस" to 26.0, "chhabbees" to 26.0, "26" to 26.0,
+            "सत्ताईस" to 27.0, "sattaees" to 27.0, "27" to 27.0,
+            "अट्ठाईस" to 28.0, "atthaees" to 28.0, "28" to 28.0,
+            "उनतीस" to 29.0, "untees" to 29.0, "29" to 29.0,
             "तीस" to 30.0, "tees" to 30.0, "30" to 30.0,
+            "इकतीस" to 31.0, "ikattees" to 31.0, "31" to 31.0,
+            "बत्तीस" to 32.0, "battees" to 32.0, "32" to 32.0,
+            "तैंतीस" to 33.0, "taintees" to 33.0, "33" to 33.0,
+            "चौंतीस" to 34.0, "chauntees" to 34.0, "34" to 34.0,
+            "पैंतीस" to 35.0, "paintees" to 35.0, "35" to 35.0,
+            "छत्तीस" to 36.0, "chhattees" to 36.0, "36" to 36.0,
+            "सैंतीस" to 37.0, "saintees" to 37.0, "37" to 37.0,
+            "अड़तीस" to 38.0, "adtees" to 38.0, "38" to 38.0,
+            "उनतालीस" to 39.0, "untaalees" to 39.0, "39" to 39.0,
             "चालीस" to 40.0, "chalees" to 40.0, "40" to 40.0,
+            "इकतालीस" to 41.0, "ikataalees" to 41.0, "41" to 41.0,
+            "बयालीस" to 42.0, "bayaalees" to 42.0, "42" to 42.0,
+            "तैंतालीस" to 43.0, "taintaalees" to 43.0, "43" to 43.0,
+            "चवालीस" to 44.0, "chavaalees" to 44.0, "44" to 44.0,
+            "पैंतालीस" to 45.0, "paintaalees" to 45.0, "45" to 45.0,
+            "छियालीस" to 46.0, "chhiyaalees" to 46.0, "46" to 46.0,
+            "सैंतालीस" to 47.0, "saintaalees" to 47.0, "47" to 47.0,
+            "अड़तालीस" to 48.0, "adtaalees" to 48.0, "48" to 48.0,
+            "उनचास" to 49.0, "unchaas" to 49.0, "49" to 49.0,
             "पचास" to 50.0, "pachaas" to 50.0, "pachas" to 50.0, "50" to 50.0,
+            "इक्यावन" to 51.0, "ikyaavan" to 51.0, "51" to 51.0,
+            "बावन" to 52.0, "baavan" to 52.0, "52" to 52.0,
+            "तिरेपन" to 53.0, "tirepan" to 53.0, "53" to 53.0,
+            "चौवन" to 54.0, "chauvan" to 54.0, "54" to 54.0,
+            "पचपन" to 55.0, "pachpan" to 55.0, "55" to 55.0,
+            "छप्पन" to 56.0, "chhappan" to 56.0, "56" to 56.0,
+            "सत्तावन" to 57.0, "sattaavan" to 57.0, "57" to 57.0,
+            "अट्ठावन" to 58.0, "atthaavan" to 58.0, "58" to 58.0,
+            "उनसठ" to 59.0, "unsath" to 59.0, "59" to 59.0,
             "साठ" to 60.0, "saath" to 60.0, "60" to 60.0,
+            "इकसठ" to 61.0, "ikasath" to 61.0, "61" to 61.0,
+            "बासठ" to 62.0, "baasath" to 62.0, "62" to 62.0,
+            "तिरेसठ" to 63.0, "tiresath" to 63.0, "63" to 63.0,
+            "चौंसठ" to 64.0, "chaunsath" to 64.0, "64" to 64.0,
+            "पैंसठ" to 65.0, "painsath" to 65.0, "65" to 65.0,
+            "छियासठ" to 66.0, "chhiyaasath" to 66.0, "66" to 66.0,
+            "सड़सठ" to 67.0, "sadsath" to 67.0, "67" to 67.0,
+            "अड़सठ" to 68.0, "adsath" to 68.0, "68" to 68.0,
+            "उनहत्तर" to 69.0, "unhattar" to 69.0, "69" to 69.0,
             "सत्तर" to 70.0, "sattar" to 70.0, "70" to 70.0,
+            "इकहत्तर" to 71.0, "ikahattar" to 71.0, "71" to 71.0,
+            "बहत्तर" to 72.0, "bahattar" to 72.0, "72" to 72.0,
+            "तिहत्तर" to 73.0, "tihattar" to 73.0, "73" to 73.0,
+            "चौहत्तर" to 74.0, "chauhattar" to 74.0, "74" to 74.0,
+            "पचहत्तर" to 75.0, "pachhattar" to 75.0, "75" to 75.0,
+            "छिहत्तर" to 76.0, "chhihattar" to 76.0, "76" to 76.0,
+            "सतहत्तर" to 77.0, "satahattar" to 77.0, "77" to 77.0,
+            "अठहत्तर" to 78.0, "athahattar" to 78.0, "78" to 78.0,
+            "उन्यासी" to 79.0, "unyaasee" to 79.0, "79" to 79.0,
             "अस्सी" to 80.0, "assi" to 80.0, "80" to 80.0,
+            "इक्यासी" to 81.0, "ikyaasee" to 81.0, "81" to 81.0,
+            "बयासी" to 82.0, "bayaasee" to 82.0, "82" to 82.0,
+            "तिरासी" to 83.0, "tiraasee" to 83.0, "83" to 83.0,
+            "चौरासी" to 84.0, "chauraasee" to 84.0, "84" to 84.0,
+            "पचासी" to 85.0, "pachaasee" to 85.0, "85" to 85.0,
+            "छियासी" to 86.0, "chhiyaasee" to 86.0, "86" to 86.0,
+            "सत्तासी" to 87.0, "sattaasee" to 87.0, "87" to 87.0,
+            "अट्ठासी" to 88.0, "atthaasee" to 88.0, "88" to 88.0,
+            "नवासी" to 89.0, "navaasee" to 89.0, "89" to 89.0,
             "नब्बे" to 90.0, "nabbe" to 90.0, "90" to 90.0,
-            "सौ" to 100.0, "sau" to 100.0, "100" to 100.0,
+            "इक्यानवे" to 91.0, "ikyaanave" to 91.0, "91" to 91.0,
+            "बानवे" to 92.0, "baanave" to 92.0, "92" to 92.0,
+            "तिरानवे" to 93.0, "tiraanave" to 93.0, "93" to 93.0,
+            "चौरानवे" to 94.0, "chauraanave" to 94.0, "94" to 94.0,
+            "पंचानवे" to 95.0, "panchaanave" to 95.0, "95" to 95.0,
+            "छियानवे" to 96.0, "chhiyaanave" to 96.0, "96" to 96.0,
+            "सत्तानवे" to 97.0, "sattaanave" to 97.0, "97" to 97.0,
+            "अट्ठानवे" to 98.0, "atthaanave" to 98.0, "98" to 98.0,
+            "निन्यानवे" to 99.0, "ninyaanave" to 99.0, "99" to 99.0,
+            "सौ" to 100.0, "sau" to 100.0, "hundred" to 100.0, "100" to 100.0,
+            "हजार" to 1000.0, "hazaar" to 1000.0, "thousand" to 1000.0, "1000" to 1000.0,
             // Indic Fractions & Modifiers
             "आधा" to 0.5, "आधी" to 0.5, "aadha" to 0.5, "aadhi" to 0.5, "half" to 0.5,
             "पाव" to 0.25, "पाओ" to 0.25, "pao" to 0.25, "paao" to 0.25,
@@ -538,50 +726,97 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
             "mile", "miles", "मील", "foot", "feet", "फुट", "फीट"
         )
 
-        val DEFAULT_ITEM_VOCAB: List<String> = listOf(
-            // Vegetables & fruit
-            "सेब", "Seb", "आलू", "Aaloo", "प्याज", "Pyaz", "टमाटर", "Tamatar",
-            "भिंडी", "Bhindi", "धनिया", "Dhaniya", "मिर्च", "Mirch", "गोभी", "Gobhi",
-            "बैंगन", "Baingan", "गाजर", "Gajar", "मटर", "Matar", "खीरा", "Kheera",
-            "पालक", "Palak", "लहसुन", "Lahsun", "अदरक", "Adrak", "केला", "Kela",
-            "नींबू", "Nimbu", "शिमला मिर्च", "Shimla Mirch", "लौकी", "Lauki",
-            "तोरई", "Torai", "करेला", "Karela", "कद्दू", "Kaddu", "मूली", "Mooli",
-            "चुकंदर", "Chukandar", "अंगूर", "Angoor", "आम", "Aam", "संतरा", "Santra",
-            "पपीता", "Papita", "अनार", "Anar", "तरबूज", "Tarbooj", "अमरूद", "Amrood",
-            // Dairy & eggs
-            "दूध", "Doodh", "दही", "Dahi", "पनीर", "Paneer", "घी", "Ghee",
-            "मक्खन", "Butter", "अंडे", "Anda", "मलाई", "Malai", "छाछ", "Chaach",
-            // Staples & grains
-            "चीनी", "Chini", "आटा", "Atta", "चावल", "Chawal", "नमक", "Namak",
-            "तेल", "Tel", "मैदा", "Maida", "सूजी", "Sooji", "बेसन", "Besan",
-            "पोहा", "Poha", "सेवई", "Sewai", "साबूदाना", "Sabudana", "गुड़", "Gud",
-            // Dals & pulses
-            "चना", "Chana", "राजमा", "Rajma", "मूंग", "Moong", "मसूर", "Masoor",
-            "अरहर", "Arhar", "तूर", "Toor", "उड़द", "Urad", "छोले", "Chole",
-            // Spices
-            "अमचूर", "Amchoor", "हल्दी", "Haldi", "जीरा", "Jeera", "राई", "Rai",
-            "मेथी", "Methi", "सौंफ", "Saunf", "इलायची", "Elaichi", "दालचीनी", "Dalchini",
-            "लौंग", "Laung", "काली मिर्च", "Kali Mirch", "तेजपत्ता", "Tejpatta",
-            "हींग", "Hing", "अजवाइन", "Ajwain", "गरम मसाला", "Garam Masala",
-            "कसूरी मेथी", "Kasuri Methi", "इमली", "Imli", "खटाई", "Khatai",
-            // Dry fruit
-            "काजू", "Kaju", "बादाम", "Badam", "मूंगफली", "Moongphali",
-            "किशमिश", "Kishmish", "अखरोट", "Akhrot", "पिस्ता", "Pista", "खजूर", "Khajoor",
-            "नारियल", "Nariyal",
-            // Packaged & misc
-            "मैगी", "Maggi", "चायपत्ती", "Chaipatti", "कॉफी", "Coffee",
-            "साबुन", "Sabun", "शैम्पू", "Shampoo", "अगरबत्ती", "Agarbatti",
-            "माचिस", "Machis", "बिस्कुट", "Biscuit", "ब्रेड", "Bread", "नमकीन", "Namkeen",
-            // Precious metals
-            "सोना", "Sona", "चांदी", "Chaandi",
-            // Pooja & regional staples
-            "चंदन", "Chandan", "कुमकुम", "Kumkum", "रोली", "Roli", "मौली", "Mouli",
-            "अक्षत", "Akshat", "कपूर", "Kapoor", "धूप", "Dhoop", "दीया", "Diya",
-            "रुई", "Rooi", "हवन सामग्री", "Havan Samagri", "गंगाजल", "Gangajal",
-            "करोंजा", "Karonja", "करौंदा", "Karonda", "सोयाबीन", "Soyabean"
-        )
+        /** Derived from ItemLexicon — do not hand-edit. Add items in ItemLexicon.kt. */
+        val DEFAULT_ITEM_VOCAB: List<String> = ItemLexicon.ALL_SURFACES
 
         private const val LOW_CONFIDENCE_GAP_THRESHOLD = 0.15
+
+        fun rejoinFragmentedNumerals(
+            tokens: List<String>,
+            vocab: SegmenterVocabulary,
+            itemSurfaceSet: Set<String>
+        ): Pair<List<String>, List<NumeralRejoin>> {
+            if (tokens.size < 2) return Pair(tokens, emptyList())
+            val out = mutableListOf<String>()
+            val rejoins = mutableListOf<NumeralRejoin>()
+
+            var i = 0
+            while (i < tokens.size) {
+                if (i == tokens.size - 1) {
+                    out.add(tokens[i])
+                    i++
+                    continue
+                }
+
+                val left = tokens[i]
+                val right = tokens[i + 1]
+                val leftLower = left.lowercase()
+
+                if (
+                    HINDI_NUMBER_MAP[leftLower] != null ||
+                    leftLower.matches(Regex("^\\d+(\\.\\d+)?$")) ||
+                    UNIT_SET.contains(leftLower) ||
+                    DISTANCE_UNIT_TOKENS.contains(leftLower) ||
+                    itemSurfaceSet.contains(leftLower)
+                ) {
+                    out.add(left)
+                    i++
+                    continue
+                }
+
+                val joinedKey = PhoneticKey.of(left + right)
+                if (joinedKey.isEmpty()) {
+                    out.add(left)
+                    i++
+                    continue
+                }
+
+                data class CandidateVal(val surface: String, val value: Double, val norm: Double)
+                val bestPerValue = mutableMapOf<Double, CandidateVal>()
+
+                for (entry in vocab.numbers) {
+                    if (entry.key.isEmpty() || entry.numericValue == null) continue
+                    val keyLen = maxOf(joinedKey.length, entry.key.length)
+                    val norm = PhoneticKey.distance(joinedKey, entry.key).toDouble() / keyLen.toDouble()
+                    val cur = bestPerValue[entry.numericValue]
+                    if (cur == null || norm < cur.norm) {
+                        bestPerValue[entry.numericValue] = CandidateVal(entry.surface, entry.numericValue, norm)
+                    }
+                }
+
+                val ranked = bestPerValue.values.sortedBy { it.norm }
+                if (ranked.isEmpty()) {
+                    out.add(left)
+                    i++
+                    continue
+                }
+
+                val best = ranked[0]
+                if (best.norm > MERGE_MAX_NORM) {
+                    out.add(left)
+                    i++
+                    continue
+                }
+
+                val valueMargin = if (ranked.size > 1) ranked[1].norm - best.norm else 1.0
+
+                out.add(best.surface)
+                rejoins.add(
+                    NumeralRejoin(
+                        leftToken = left,
+                        rightToken = right,
+                        mergedSurface = best.surface,
+                        value = best.value,
+                        matchNorm = best.norm,
+                        valueMargin = valueMargin,
+                        lowMargin = valueMargin < MERGE_MIN_VALUE_MARGIN
+                    )
+                )
+                i += 2
+            }
+
+            return Pair(out, rejoins)
+        }
     }
 
     private val defaultVocabulary = SegmenterVocabulary(catalogNames)
@@ -589,7 +824,8 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
     fun segmentTranscript(
         transcript: String,
         pendingCarryoverQty: Double? = null,
-        catalogNames: List<String> = emptyList()
+        catalogNames: List<String> = emptyList(),
+        aliases: Map<String, String> = emptyMap()
     ): SegmentResult {
         val cleanText = transcript
             .replace("।", " ")
@@ -597,12 +833,26 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
             .trim()
 
         if (cleanText.isBlank()) {
-            return SegmentResult(emptyList(), pendingCarryoverQty)
+            return SegmentResult(emptyList(), pendingCarryoverQty, emptyList())
         }
 
         val vocabulary = if (catalogNames.isEmpty()) defaultVocabulary else SegmenterVocabulary(catalogNames)
-        val tokens = cleanText.split(Regex("\\s+")).filter { it.isNotBlank() }
-        val (decoded, minGap) = GrammarLatticeDecoder.decode(tokens, vocabulary)
+        val rawTokens = cleanText.split(Regex("\\s+")).filter { it.isNotBlank() }
+        val itemSurfaceSet = (DEFAULT_ITEM_VOCAB + catalogNames)
+            .filter { it.isNotBlank() }
+            .map { it.trim().lowercase() }
+            .toSet()
+        val tokens = rawTokens.filter { token ->
+            val lower = token.lowercase()
+            if (DISCOURSE_PARTICLES.contains(lower) || DISCOURSE_PARTICLES.contains(token)) {
+                itemSurfaceSet.contains(lower)
+            } else {
+                true
+            }
+        }
+        val (mergedTokens, rejoins) = rejoinFragmentedNumerals(tokens, vocabulary, itemSurfaceSet)
+        val lowMarginSurfaces = rejoins.filter { it.lowMargin }.map { it.mergedSurface.lowercase() }.toSet()
+        val (decoded, minGap) = GrammarLatticeDecoder.decode(mergedTokens, vocabulary, aliases)
 
         var currentQty: Double? = pendingCarryoverQty
         var currentUnit: String? = null
@@ -613,6 +863,8 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
         var suspectReading = false
         var worstItemNorm: Double? = null
         var bestItemMargin: Double? = null
+        var worstNonItemNorm: Double? = null
+        var anyFromSplit = false
         var segmentTop3 = mutableListOf<CandidateRank>()
         val segments = mutableListOf<RawItemSegment>()
 
@@ -620,6 +872,17 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
             if (currentItemTokens.isNotEmpty()) {
                 val rawText = currentSegmentTokens.joinToString(" ").trim()
                 val heardText = currentHeardTokens.joinToString(" ").trim()
+                val nonItemUntrustworthy = anyFromSplit && worstNonItemNorm != null && worstNonItemNorm!! > SPLIT_UNIT_TRUST_NORM
+                val itemKeyLength = if (currentItemTokens.isNotEmpty()) PhoneticKey.of(currentItemTokens.joinToString(" ")).length else 0
+                val isAmbiguousByMargin = bestItemMargin != null && itemKeyLength > 0 &&
+                    bestItemMargin!! < CLEAR_WIN_ABS_MARGIN &&
+                    (bestItemMargin!! * itemKeyLength) < MIN_MARGIN_PHONE_EDITS
+                val resKind = when {
+                    worstItemNorm == null -> ResolutionKind.UNKNOWN
+                    nonItemUntrustworthy || isAmbiguousByMargin -> ResolutionKind.AMBIGUOUS
+                    else -> ResolutionKind.MATCH
+                }
+                val hasLowMarginRejoin = currentSegmentTokens.any { lowMarginSurfaces.contains(it.lowercase()) }
                 segments.add(
                     RawItemSegment(
                         quantity = currentQty ?: 1.0,
@@ -627,10 +890,12 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
                         itemTokens = currentItemTokens.toList(),
                         rawSegmentText = if (rawText.isNotBlank()) rawText else currentItemTokens.joinToString(" "),
                         heardSegmentText = if (heardText.isNotBlank()) heardText else currentHeardTokens.joinToString(" "),
-                        isSanityFlagged = ambiguousDoubleQty || suspectReading,
+                        isSanityFlagged = ambiguousDoubleQty || suspectReading || (resKind != ResolutionKind.MATCH),
                         itemMatchNorm = worstItemNorm,
                         itemMargin = bestItemMargin,
-                        top3Candidates = segmentTop3.toList()
+                        top3Candidates = segmentTop3.toList(),
+                        resolutionKind = resKind,
+                        numeralRejoinLowMargin = hasLowMarginRejoin
                     )
                 )
             }
@@ -643,6 +908,8 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
             suspectReading = false
             worstItemNorm = null
             bestItemMargin = null
+            worstNonItemNorm = null
+            anyFromSplit = false
             segmentTop3 = mutableListOf()
         }
 
@@ -658,21 +925,35 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
                     currentQty = dt.numericValue ?: 1.0
                     currentSegmentTokens.add(dt.rawToken)
                     currentHeardTokens.add(dt.heardText)
+                    dt.matchNorm?.let { n ->
+                        worstNonItemNorm = worstNonItemNorm?.let { maxOf(it, n) } ?: n
+                    }
+                    if (dt.fromSplit) anyFromSplit = true
                 }
                 TokenType.UNIT -> {
                     currentUnit = normalizeUnit(dt.canonicalUnit ?: dt.rawToken)
                     currentSegmentTokens.add(dt.rawToken)
                     currentHeardTokens.add(dt.heardText)
+                    dt.matchNorm?.let { n ->
+                        worstNonItemNorm = worstNonItemNorm?.let { maxOf(it, n) } ?: n
+                    }
+                    if (dt.fromSplit) anyFromSplit = true
                 }
                 TokenType.ITEM -> {
-                    dt.matchNorm?.let { n ->
-                        worstItemNorm = worstItemNorm?.let { maxOf(it, n) } ?: n
-                    }
-                    dt.matchMargin?.let { m ->
-                        bestItemMargin = m
-                    }
-                    if (dt.top3Candidates.isNotEmpty()) {
-                        segmentTop3 = dt.top3Candidates.toMutableList()
+                    if (dt.isQualifier) {
+                        // A brand or variety word is part of the item PHRASE but is not a competing product. Letting
+                        // its match statistics into the ambiguity margin is what flagged "पाँच किलो आलू" as AMBIGUOUS
+                        // (हरा/हरी sit 0.167 from आलू). ISSUE-109.
+                    } else {
+                        dt.matchNorm?.let { n ->
+                            worstItemNorm = worstItemNorm?.let { maxOf(it, n) } ?: n
+                        }
+                        dt.matchMargin?.let { m ->
+                            bestItemMargin = m
+                        }
+                        if (dt.top3Candidates.isNotEmpty()) {
+                            segmentTop3 = dt.top3Candidates.toMutableList()
+                        }
                     }
                     currentItemTokens.add(dt.rawToken)
                     currentSegmentTokens.add(dt.rawToken)
@@ -686,7 +967,7 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
             closeSegment()
         }
 
-        return SegmentResult(segments, carryover)
+        return SegmentResult(segments, carryover, rejoins)
     }
 
     private fun normalizeUnit(unitStr: String): String {

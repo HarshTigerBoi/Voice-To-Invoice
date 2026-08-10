@@ -1,6 +1,7 @@
 package com.voicetoinvoice.app
 
 import com.voicetoinvoice.app.domain.parser.OrderingSegmenter
+import com.voicetoinvoice.app.domain.parser.ResolutionKind
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
@@ -23,7 +24,7 @@ class OrderingSegmenterTest {
         assertEquals(2.0, seg.quantity, 0.01)
         assertEquals("KG", seg.unit)
         assertTrue(seg.itemTokens.contains("सेब"))
-        assertFalse(seg.isSanityFlagged)
+        assertEquals(ResolutionKind.AMBIGUOUS, seg.resolutionKind)
     }
 
     @Test
