@@ -23,5 +23,5 @@ val relocatedBuildRoot: String = System.getenv("VTI_BUILD_DIR")
     ?: "C:/VTI_build"
 
 allprojects {
-    layout.buildDirectory.set(file("C:/VTI_build/${project.name}"))
+    layout.buildDirectory.set(file("$relocatedBuildRoot/${project.name}"))
 }

@@ -1,0 +1,60 @@
+name: Build APK
+
+# Lets the app be built and installed on the phone with the laptop off:
+# push to master (or a manual dispatch from any branch) builds a debug APK
+# and attaches it to a GitHub Release. Open the release link on the phone
+# and tap it to install -- no adb, no USB, no local Gradle run.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK platform 36 + build-tools
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Neutralize local-machine-only Gradle settings
+        # gradle.properties pins org.gradle.java.home to a Windows Android Studio path
+        # for the dev laptop; that path doesn't exist on this runner, so Gradle would
+        # fail to even start the daemon. Strip it and let setup-java's JDK win instead.
+        run: sed -i '/^org.gradle.java.home=/d' gradle.properties
+
+      - name: Build debug APK
+        env:
+          # Root build.gradle.kts relocates buildDir to keep OneDrive off the build
+          # output on the dev laptop; on this ephemeral runner just use the workspace.
+          VTI_BUILD_DIR: ${{ github.workspace }}/build-out
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Locate and rename APK
+        run: |
+          APK_SRC="$GITHUB_WORKSPACE/build-out/app/outputs/apk/debug/app-debug.apk"
+          APK_OUT="VoiceToInvoice-v${{ github.run_number }}.apk"
+          test -f "$APK_SRC"
+          cp "$APK_SRC" "$APK_OUT"
+          echo "APK_OUT=$APK_OUT" >> "$GITHUB_ENV"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: "VoiceToInvoice build ${{ github.run_number }} (${{ github.sha }})"
+          prerelease: true
+          files: ${{ env.APK_OUT }}

@@ -42,6 +42,30 @@ Execute the plan exactly: same steps, order, files, names, constants. `0.80` mea
 No plan provided? Trivial one-file change: just do it. Otherwise ask whether to implement
 directly or send it back to Claude Code.
 
+### Exception: cloud sessions (no local machine)
+
+The plan/implement split above assumes a laptop running Antigravity CLI. When Claude Code is
+opened from claude.ai/code or the mobile app (no laptop, no Antigravity available), Claude Code
+plans **and** implements directly instead of stopping at a plan file — there's no local
+implementer to hand off to. This exception applies only to sessions with no access to the local
+machine; on the laptop, the plan-only default still stands.
+
+## Building from the cloud / installing without the laptop
+
+`.github/workflows/build-apk.yml` builds `assembleDebug` on GitHub's runners and attaches the
+APK to a GitHub Release (tag `apk-<run_number>`) — triggered by every push to `master`, or
+on-demand via `gh workflow run build-apk.yml` / the Actions tab. Open the release on the phone
+and tap the APK to install; no adb, no USB, no wireless pairing. Debug builds are signed with the
+debug keystore already committed to the build config, so no signing secret is needed in CI.
+
+The workflow strips `org.gradle.java.home` from `gradle.properties` before building (that path
+points at the dev laptop's Android Studio JDK and doesn't exist on the runner) and points
+`VTI_BUILD_DIR` at the runner's workspace instead of `C:/VTI_build` (root `build.gradle.kts`
+reads `VTI_BUILD_DIR` via `relocatedBuildRoot`, falling back to `C:/VTI_build` only when unset).
+
+This is separate from `tools/vti-ship.ps1`, which remains the path for shipping straight to the
+physical test phone over wireless adb when the laptop *is* on.
+
 ## `/ship` — automated issue → installed APK
 
 `/ship <issue>` (`.claude/commands/ship.md`) runs diagnose → plan → implement → build →
