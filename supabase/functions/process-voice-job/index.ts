@@ -26,6 +26,7 @@ import {
 } from './price_intent.ts'
 import { canonicalOf, getQualifiers } from './lexicon.ts'
 import { resolveItemName, unpricedLineReason, assessAiNameEvidence } from './item_resolution.ts'
+import { conceptOfSpoken, conceptOfSku } from './concepts.ts'
 import { classifyIntent, captureIntentFor } from './intent_router.ts'
 
 // Deno Deploy / Supabase Edge Runtime global declaration
@@ -699,7 +700,7 @@ function stripLeadingQtyUnitFromItemName(
 function buildFastPathFrom(args: {
   segments: RawItemSegment[]
   chosenRaw: string
-  dbCatalogItems: Array<{ id: string, name: string, price: number, unit_id: string, image_url?: string | null }>
+  dbCatalogItems: Array<{ id: string, name: string, price: number, unit_id: string, image_url?: string | null, concept?: string | null }>
   isAssistant: boolean
 }): { eligible: boolean, items: any[], skipReason: string | null } {
   const { segments, chosenRaw, dbCatalogItems, isAssistant } = args
@@ -1141,7 +1142,7 @@ async function processVoiceJob(args: {
       if (level === 'error') console.error(line); else console.warn(line)
     }
 
-    let dbCatalogItems: Array<{ id: string, name: string, price: number, unit_id: string, image_url?: string | null }> = []
+    let dbCatalogItems: Array<{ id: string, name: string, price: number, unit_id: string, image_url?: string | null, concept?: string | null }> = []
     // Surfaced in the trace: an empty catalog is indistinguishable from a BROKEN catalog fetch
     // from the outside, and the difference is everything.
     // A1 (ISSUE-110): Sarvam STT needs nothing but the audio, so it starts here rather than
@@ -1156,7 +1157,7 @@ async function processVoiceJob(args: {
       : Promise.resolve(EMPTY_STT)
 
     let catalogFetchError: string | null = null
-    let catalogQuery = supabase.from('catalog_items').select('id, name, price, unit_id, image_url').eq('active', true)
+    let catalogQuery = supabase.from('catalog_items').select('id, name, price, unit_id, image_url, concept').eq('active', true)
     if (resolvedShopId) catalogQuery = catalogQuery.eq('shop_id', resolvedShopId)
 
     const aliasQuery = supabase
@@ -1924,7 +1925,19 @@ Parse this order.`
       // When the segmenter has a near-exact match on the ADOPTED transcript and the AI
       // named something else, the segmenter wins and the line is flagged either way.
       // See item_resolution.ts / ISSUE-030 for why this is not gated on catalog match.
-      const nameResolution = resolveItemName(aiName, alignedSeg)
+      // ISSUE-126: give the arbitration a notion of what each name IS, so a translation pair
+      // ("चावल" vs "Basmati Rice") is not mistaken for a disagreement. findCatalogItem is the
+      // same lookup used for pricing below, so "stocked" here means genuinely bookable.
+      const segNameForConcept = alignedSeg ? (alignedSeg.itemTokens || []).join(' ').trim() : ''
+      const conceptArbitration = segNameForConcept
+        ? {
+            segConcept: conceptOfSpoken(segNameForConcept) ?? conceptOfSku(segNameForConcept),
+            aiConcept: conceptOfSpoken(aiName) ?? conceptOfSku(aiName),
+            aiNameIsStocked: !!findCatalog(aiName, rawItem.unit || 'PACKET').item,
+          }
+        : undefined
+
+      const nameResolution = resolveItemName(aiName, alignedSeg, undefined, conceptArbitration)
       const rawName = nameResolution.name
       const sttDisagreementReason = nameResolution.disagreementReason
       const segDisagreesWithAi = nameResolution.usedSegmenterOverride

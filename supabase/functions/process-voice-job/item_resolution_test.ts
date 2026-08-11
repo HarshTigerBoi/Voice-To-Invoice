@@ -311,3 +311,61 @@ test('ISSUE-105: corpus regression fixture (8 zero-segment inputs fire, 10 good 
 })
 
 
+
+// ── ISSUE-126: concept-aware arbitration ──────────────────────────────────────
+
+test('ISSUE-126 job 735469d9: same concept + stocked AI name keeps the sellable SKU', () => {
+  // Segmenter matched 'चावल' exactly (0.0) and used to override 'Basmati Rice', turning a
+  // ₹90/KG bookable line into an unpriced review row. Both are concept 'rice'.
+  const r = resolveItemName(
+    'Basmati Rice',
+    { itemTokens: ['चावल'], itemMatchNorm: 0.0 },
+    undefined,
+    { segConcept: 'rice', aiConcept: 'rice', aiNameIsStocked: true }
+  )
+  assert.strictEqual(r.name, 'Basmati Rice')
+  assert.strictEqual(r.usedSegmenterOverride, false)
+  assert.strictEqual(r.disagreementReason, null)
+})
+
+test('ISSUE-030 still holds: different concepts keep the segmenter, even if AI name is stocked', () => {
+  // The exact regression the override exists for. 'अमचूर' is concept 'amchur', 'Angoor' is
+  // 'grapes'. Angoor being stocked must NOT let the misheard word win.
+  const r = resolveItemName(
+    'Angoor',
+    { itemTokens: ['अमचूर'], itemMatchNorm: 0.0 },
+    undefined,
+    { segConcept: 'amchur', aiConcept: 'grapes', aiNameIsStocked: true }
+  )
+  assert.strictEqual(r.name, 'अमचूर')
+  assert.strictEqual(r.usedSegmenterOverride, true)
+  assert.match(r.disagreementReason ?? '', /Angoor/)
+})
+
+test('ISSUE-126: same concept but AI name NOT stocked keeps the segmenter', () => {
+  const r = resolveItemName(
+    'Sona Masoori Rice',
+    { itemTokens: ['चावल'], itemMatchNorm: 0.0 },
+    undefined,
+    { segConcept: 'rice', aiConcept: 'rice', aiNameIsStocked: false }
+  )
+  assert.strictEqual(r.name, 'चावल')
+  assert.strictEqual(r.usedSegmenterOverride, true)
+})
+
+test('ISSUE-126: an unknown concept on either side falls back to prior behaviour', () => {
+  const r = resolveItemName(
+    'Angoor',
+    { itemTokens: ['अमचूर'], itemMatchNorm: 0.0 },
+    undefined,
+    { segConcept: null, aiConcept: 'grapes', aiNameIsStocked: true }
+  )
+  assert.strictEqual(r.name, 'अमचूर')
+  assert.strictEqual(r.usedSegmenterOverride, true)
+})
+
+test('ISSUE-126: omitting concept evidence entirely is byte-identical to before', () => {
+  const r = resolveItemName('Angoor', { itemTokens: ['अमचूर'], itemMatchNorm: 0.0 })
+  assert.strictEqual(r.name, 'अमचूर')
+  assert.strictEqual(r.usedSegmenterOverride, true)
+})

@@ -60,6 +60,19 @@ export const SEGMENTER_OVERRIDE_MAX_NORM = 0.08
  */
 export const NAME_AGREEMENT_MAX_NORM = 0.15
 
+/**
+ * Concept evidence for the segmenter-vs-AI arbitration. Supplied by the caller so this
+ * module stays free of catalog and lexicon imports. See ISSUE-126.
+ */
+export interface ConceptArbitration {
+  /** Base commodity of the segmenter's reading, or null when unknown. */
+  segConcept: string | null
+  /** Base commodity of the AI's reading, or null when unknown. */
+  aiConcept: string | null
+  /** True when the AI's name resolves to a real, priced SKU in this shop's catalog. */
+  aiNameIsStocked: boolean
+}
+
 export interface ItemNameResolution {
   /** The name to actually use downstream. */
   name: string
@@ -86,7 +99,8 @@ export interface ItemNameResolution {
 export function resolveItemName(
   aiName: string,
   seg: Pick<RawItemSegment, 'itemTokens' | 'itemMatchNorm'> | null | undefined,
-  maxNorm: number = SEGMENTER_OVERRIDE_MAX_NORM
+  maxNorm: number = SEGMENTER_OVERRIDE_MAX_NORM,
+  concepts?: ConceptArbitration
 ): ItemNameResolution {
   const trimmedAi = (aiName || '').trim()
   const segName = seg ? (seg.itemTokens || []).join(' ').trim() : ''
@@ -97,6 +111,27 @@ export function resolveItemName(
   const namesDiffer = segIsNearExact && nameDistance > NAME_AGREEMENT_MAX_NORM
 
   if (!namesDiffer) {
+    return { name: trimmedAi, disagreementReason: null, usedSegmenterOverride: false }
+  }
+
+  // ISSUE-126: the two names differ as STRINGS but may denote the SAME commodity, which is
+  // the case phonetics cannot see -- phoneticKey('चावल') is CAVAL and phoneticKey('rice') is
+  // LICI, so a translation pair always looks like a disagreement here.
+  //
+  // Job 735469d9: segmenter matched 'चावल' at 0.0 and overrode the AI's 'Basmati Rice'. Both
+  // are concept 'rice', but only 'Basmati Rice' is a stocked, priced SKU, so the override
+  // turned a bookable ₹90/KG line into an unpriced review-queue row.
+  //
+  // Gated on sameConcept AND aiNameIsStocked so ISSUE-030 is untouched: 'अमचूर' vs 'अंगूर'
+  // are concepts 'amchur' and 'grapes', so they still disagree and the segmenter still wins,
+  // exactly as before -- including when the AI's wrong word happens to be stocked.
+  if (
+    concepts &&
+    concepts.segConcept !== null &&
+    concepts.aiConcept !== null &&
+    concepts.segConcept === concepts.aiConcept &&
+    concepts.aiNameIsStocked
+  ) {
     return { name: trimmedAi, disagreementReason: null, usedSegmenterOverride: false }
   }
 
