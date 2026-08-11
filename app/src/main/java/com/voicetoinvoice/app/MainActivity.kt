@@ -10,9 +10,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.foundation.border
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import com.voicetoinvoice.app.data.local.AppDatabase
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
@@ -426,28 +428,53 @@ fun MainAppScreen(database: AppDatabase) {
         bottomBar = {
             if (currentScreen != Screen.ONBOARDING) {
                 NavigationBar(
-                    modifier = Modifier.clip(
-                        RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)
-                    ),
-                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                    tonalElevation = 8.dp
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp))
+                        .border(
+                            width = 1.dp,
+                            color = Color.White.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
+                        ),
+                    containerColor = Color(0xFF111420),
+                    tonalElevation = 12.dp
                 ) {
                     NavigationBarItem(
                         icon = { Icon(Icons.Default.ShoppingCart, contentDescription = "बेचो") },
-                        label = { Text("बेचो ₹") },
+                        label = { Text("बेचो ₹", style = MaterialTheme.typography.labelMedium) },
                         selected = currentScreen == Screen.HOME,
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Color(0xFF10B981),
+                            selectedTextColor = Color(0xFF10B981),
+                            indicatorColor = Color(0xFF10B981).copy(alpha = 0.18f),
+                            unselectedIconColor = Color(0xFF64748B),
+                            unselectedTextColor = Color(0xFF64748B)
+                        ),
                         onClick = { currentScreen = Screen.HOME }
                     )
                     NavigationBarItem(
                         icon = { Icon(Icons.Default.AddCircle, contentDescription = "माल") },
-                        label = { Text("माल +") },
+                        label = { Text("माल +", style = MaterialTheme.typography.labelMedium) },
                         selected = currentScreen == Screen.STOCK_IN,
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Color(0xFF3B82F6),
+                            selectedTextColor = Color(0xFF3B82F6),
+                            indicatorColor = Color(0xFF3B82F6).copy(alpha = 0.18f),
+                            unselectedIconColor = Color(0xFF64748B),
+                            unselectedTextColor = Color(0xFF64748B)
+                        ),
                         onClick = { currentScreen = Screen.STOCK_IN }
                     )
                     NavigationBarItem(
                         icon = { Icon(Icons.Default.AccountBox, contentDescription = "हिसाब") },
-                        label = { Text("हिसाब 📊") },
+                        label = { Text("हिसाब 📊", style = MaterialTheme.typography.labelMedium) },
                         selected = currentScreen == Screen.CUSTOMER_LIST || currentScreen == Screen.UDHAAR || currentScreen == Screen.SUMMARY,
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Color(0xFFF59E0B),
+                            selectedTextColor = Color(0xFFF59E0B),
+                            indicatorColor = Color(0xFFF59E0B).copy(alpha = 0.18f),
+                            unselectedIconColor = Color(0xFF64748B),
+                            unselectedTextColor = Color(0xFF64748B)
+                        ),
                         onClick = { currentScreen = Screen.CUSTOMER_LIST }
                     )
                 }

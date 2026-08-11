@@ -17,6 +17,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -26,6 +27,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -76,6 +78,7 @@ fun PttMicButton(
     modifier: Modifier = Modifier,
     size: Dp = 140.dp,
     containerColor: Color = MaterialTheme.colorScheme.primary,
+    showLabelBelow: Boolean = true,
     onRecordingStateChange: ((Boolean) -> Unit)? = null
 ) {
     val context = LocalContext.current
@@ -142,6 +145,17 @@ fun PttMicButton(
                 )
             }
 
+            val buttonBrush = remember(isRecording, intent, animatedBgColor) {
+                if (isRecording) {
+                    Brush.linearGradient(listOf(Color(0xFFEF4444), Color(0xFFDC2626)))
+                } else when (intent) {
+                    CaptureIntent.SALE -> Brush.linearGradient(listOf(Color(0xFF10B981), Color(0xFF047857)))
+                    CaptureIntent.CREDIT_SALE -> Brush.linearGradient(listOf(Color(0xFFF59E0B), Color(0xFFB45309)))
+                    CaptureIntent.ASSISTANT -> Brush.linearGradient(listOf(Color(0xFF8B5CF6), Color(0xFF4F46E5)))
+                    else -> Brush.linearGradient(listOf(animatedBgColor, animatedBgColor))
+                }
+            }
+
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
@@ -151,9 +165,10 @@ fun PttMicButton(
                         scaleY = scale
                     }
                     .background(
-                        color = animatedBgColor,
+                        brush = buttonBrush,
                         shape = CircleShape
                     )
+                    .border(2.dp, Color.White.copy(alpha = 0.35f), CircleShape)
                     .pointerInput(intent) {
                     detectTapGestures(
                         onPress = {
@@ -364,13 +379,15 @@ fun PttMicButton(
         }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        if (showLabelBelow) {
+            Spacer(modifier = Modifier.height(8.dp))
 
-        Text(
-            text = if (isRecording) "बोलिए..." else label,
-            fontSize = 15.sp,
-            fontWeight = FontWeight.Bold,
-            color = if (isRecording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
-        )
+            Text(
+                text = if (isRecording) "बोलिए..." else label,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (isRecording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+            )
+        }
     }
 }

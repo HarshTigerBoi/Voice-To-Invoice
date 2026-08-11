@@ -9,7 +9,9 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -35,6 +37,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.voicetoinvoice.app.audio.AudioRecorder
@@ -250,17 +253,36 @@ fun HomeScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
-                title = { Text("Shop Ledger") },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Surface(
+                            shape = CircleShape,
+                            color = Color(0xFF10B981),
+                            modifier = Modifier.size(8.dp)
+                        ) {}
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "Voice Ledger",
+                            style = MaterialTheme.typography.titleLarge.copy(
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                                color = Color.White
+                            )
+                        )
+                    }
+                },
                 actions = {
                     Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        shape = RoundedCornerShape(14.dp),
+                        color = Color(0xFF10B981).copy(alpha = 0.15f),
+                        border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.3f)),
                         modifier = Modifier.padding(end = 8.dp)
                     ) {
                         Text(
                             text = "आज: ₹${todayTotalSales.toInt()}",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                                color = Color(0xFF34D399)
+                            ),
                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
                         )
                     }
@@ -311,107 +333,140 @@ fun HomeScreen(
                 // Business health and activity status chips
                 Row(
                     modifier = Modifier
-                        .padding(vertical = 8.dp)
+                        .padding(vertical = 12.dp)
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp),
+                        .padding(horizontal = 4.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    // Business health at a glance -- full breakdown and every alert live on Reports;
-                    // this is deliberately just a number and the single most urgent alert, so Home
-                    // stays about the mic, not about analytics.
                     healthScoreValue?.let { score ->
                         AssistChip(
                             onClick = onNavigateToReports,
                             label = {
                                 Text(
-                                    if (topAlertCount > 0) "स्कोर $score · $topAlertCount अलर्ट" else "स्कोर $score"
+                                    if (topAlertCount > 0) "Score $score · $topAlertCount alert" else "Score $score",
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
                                 )
-                            }
+                            },
+                            colors = AssistChipDefaults.assistChipColors(
+                                containerColor = Color(0xFF1E293B)
+                            ),
+                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.15f))
                         )
                     } ?: Spacer(Modifier.width(1.dp))
 
-                    // Command Feed entry point -- lives near the mic per the brief's "clear status
-                    // for every command". Only visible once there is something to show, so it
-                    // doesn't clutter a brand-new shop's home screen.
                     if (commandFeedJobs.isNotEmpty()) {
                         AssistChip(
                             onClick = { showCommandFeed = true },
                             label = {
                                 Text(
-                                    if (inFlightCount > 0) "प्रोसेस हो रहा ($inFlightCount)" else "हाल की गतिविधि"
+                                    if (inFlightCount > 0) "Processing ($inFlightCount)" else "Recent Activity",
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
                                 )
                             },
+                            colors = AssistChipDefaults.assistChipColors(
+                                containerColor = Color(0xFF1E293B)
+                            ),
+                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.15f)),
                             leadingIcon = {
                                 if (inFlightCount > 0) {
-                                    CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                    CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color(0xFF60A5FA))
                                 } else {
-                                    Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color(0xFF34D399), modifier = Modifier.size(16.dp))
                                 }
                             }
                         )
                     }
                 }
 
-                Spacer(modifier = Modifier.height(24.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
-                // Main Push-to-Talk (PTT) Mic Buttons: Cash (Green) & Udhaar (Amber)
-                Row(
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
+                // Main Push-to-Talk (PTT) Voice Hub Card
+                Surface(
+                    shape = RoundedCornerShape(26.dp),
+                    color = Color(0xFF131722),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(26.dp))
+                        .padding(vertical = 16.dp, horizontal = 12.dp)
                 ) {
-                    // 1. Cash Sale Mic (Large, Green)
-                    PttMicButton(
-                        intent = CaptureIntent.SALE,
-                        label = "नकद बेचो",
-                        size = 150.dp,
-                        containerColor = LedgerColors.MoneyIn,
-                        db = db,
-                        rollingAudioBuffer = rollingAudioBuffer,
-                        audioRecorder = audioRecorder,
-                        pttBurstCoalescer = pttBurstCoalescer,
-                        pttWindowLedger = pttWindowLedger,
-                        onDeviceRecognizer = onDeviceRecognizer,
-                        backgroundProcessor = backgroundProcessor,
-                        permissionLauncher = permissionLauncher,
-                        onRecordingStateChange = onAnyMicPressed
-                    )
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "⚡ VOICE ACTION HUB",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                                color = Color(0xFF94A3B8),
+                                letterSpacing = 1.2.sp
+                            ),
+                            modifier = Modifier.padding(bottom = 12.dp)
+                        )
 
-                    Spacer(modifier = Modifier.width(24.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            // 1. Cash Sale Mic (Large, Green)
+                            PttMicButton(
+                                intent = CaptureIntent.SALE,
+                                label = "नकद बेचो",
+                                size = 124.dp,
+                                containerColor = LedgerColors.MoneyIn,
+                                db = db,
+                                rollingAudioBuffer = rollingAudioBuffer,
+                                audioRecorder = audioRecorder,
+                                pttBurstCoalescer = pttBurstCoalescer,
+                                pttWindowLedger = pttWindowLedger,
+                                onDeviceRecognizer = onDeviceRecognizer,
+                                backgroundProcessor = backgroundProcessor,
+                                permissionLauncher = permissionLauncher,
+                                onRecordingStateChange = onAnyMicPressed
+                            )
 
-                    // 2. Udhaar Credit Sale Mic (Medium, Amber)
-                    PttMicButton(
-                        intent = CaptureIntent.CREDIT_SALE,
-                        label = "उधार बेचो",
-                        size = 120.dp,
-                        containerColor = LedgerColors.Udhaar,
-                        db = db,
-                        rollingAudioBuffer = rollingAudioBuffer,
-                        audioRecorder = audioRecorder,
-                        pttBurstCoalescer = pttBurstCoalescer,
-                        pttWindowLedger = pttWindowLedger,
-                        onDeviceRecognizer = onDeviceRecognizer,
-                        backgroundProcessor = backgroundProcessor,
-                        permissionLauncher = permissionLauncher,
-                        onRecordingStateChange = onAnyMicPressed
-                    )
+                            // 2. Udhaar Credit Sale Mic (Medium, Amber)
+                            PttMicButton(
+                                intent = CaptureIntent.CREDIT_SALE,
+                                label = "उधार बेचो",
+                                size = 104.dp,
+                                containerColor = LedgerColors.Udhaar,
+                                db = db,
+                                rollingAudioBuffer = rollingAudioBuffer,
+                                audioRecorder = audioRecorder,
+                                pttBurstCoalescer = pttBurstCoalescer,
+                                pttWindowLedger = pttWindowLedger,
+                                onDeviceRecognizer = onDeviceRecognizer,
+                                backgroundProcessor = backgroundProcessor,
+                                permissionLauncher = permissionLauncher,
+                                onRecordingStateChange = onAnyMicPressed
+                            )
+                        }
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(16.dp))
 
                 // Direct Fallback Button: Type Text
-                TextButton(
+                OutlinedButton(
                     onClick = {
                         manualInputText = ""
                         showManualTextDialog = true
-                    }
+                    },
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = Color(0xFF94A3B8)
+                    ),
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.15f))
                 ) {
-                    Icon(Icons.Default.Keyboard, contentDescription = null, modifier = Modifier.size(20.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Type sale manually (Fallback)", style = MaterialTheme.typography.bodyMedium)
+                    Icon(Icons.Default.Keyboard, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("⌨ Type sale manually", style = MaterialTheme.typography.bodyMedium.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium))
                 }
 
-                Spacer(modifier = Modifier.height(24.dp))
+                Spacer(modifier = Modifier.height(20.dp))
 
                 // Quick Manual Stepper Grid
                 ManualStepperComponent(
@@ -422,12 +477,8 @@ fun HomeScreen(
                     }
                 )
 
-                // Reserves the assistant FAB's footprint (64.dp button + 24.dp inset + its
-                // "बिल वाले" caption, placed BottomEnd over every screen from MainActivity).
-                // Without it the FAB sits directly on top of the right-hand stepper card's
-                // "Add ₹" button, so that item cannot be added by tap at all -- the FAB
-                // swallows the press.
-                Spacer(modifier = Modifier.height(88.dp))
+                // Reserves space for Assistant FAB to prevent overlap
+                Spacer(modifier = Modifier.height(100.dp))
             }
 
             // Udhaar customer picker (Fix 2 / ISSUE-039) -- anchored to the bottom so it
