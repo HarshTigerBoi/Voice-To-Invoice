@@ -129,7 +129,8 @@ fun markLineResolved(job: SttJobRecord, lineNo: Int): String {
  *  The catalog currently holds several same-name rows (e.g. Aaloo x3), and showing all of
  *  them in a picker would be actively confusing. */
 fun distinctCatalogByName(catalog: List<CatalogItem>): List<CatalogItem> =
-    catalog.groupBy { it.name.trim().lowercase() }
+    catalog.groupBy { it.name.trim().lowercase() to
+        (if (it.baseUnit.isNotBlank()) it.baseUnit else com.voicetoinvoice.app.domain.lexicon.ItemLexicon.baseUnitOf(it.unitId)) }
         .mapNotNull { (_, rows) -> rows.maxByOrNull { it.updatedAt } }
         .sortedBy { it.name.lowercase() }
 

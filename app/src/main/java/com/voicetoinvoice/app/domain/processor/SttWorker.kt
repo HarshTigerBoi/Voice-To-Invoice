@@ -412,6 +412,11 @@ class SttWorker(
             val itemId = if (itemObj.isNull("item_id")) null else itemObj.optString("item_id", "").ifBlank { null }
             val implausibilityReason = if (itemObj.isNull("implausibility_reason")) null else itemObj.optString("implausibility_reason", "").ifBlank { null }
 
+            val spokenBase = com.voicetoinvoice.app.domain.lexicon.ItemLexicon.baseUnitOf(unit)
+            fun com.voicetoinvoice.app.data.local.entity.CatalogItem.baseOf() =
+                if (baseUnit.isNotBlank()) baseUnit
+                else com.voicetoinvoice.app.domain.lexicon.ItemLexicon.baseUnitOf(unitId)
+
             val isValidRateUpdate = priceIntent == "RATE_UPDATE" &&
                 itemId != null && confidence >= 0.80 && priceAtSale > 0.0 && implausibilityReason == null
             val isCommittableSale = priceIntent != "RATE_UPDATE" &&
@@ -428,14 +433,14 @@ class SttWorker(
                     committedCount++
                 }
                 isStockIntent && isCommittableStock -> {
-                    val matchedCatalog = catalog.find { it.id == itemId }
-                        ?: catalog.find { it.name.equals(itemName, ignoreCase = true) }
+                    val matchedCatalog = catalog.find { it.id == itemId && it.baseOf() == spokenBase }
+                        ?: catalog.find { it.name.equals(itemName, ignoreCase = true) && it.baseOf() == spokenBase }
                         // This shop's own confirmed vocabulary, e.g. it previously confirmed
                         // that "TMTR" means this catalog row even though the name never
                         // matches by substring. The highest-value training signal in the
                         // system (a review-queue confirmation) was previously thrown away;
                         // this is where it gets read back. See ShopLearningRepository.
-                        ?: shopLearning.resolveItemAlias(itemName)?.let { aliasId -> catalog.find { c -> c.id == aliasId } }
+                        ?: shopLearning.resolveItemAlias(itemName)?.let { aliasId -> catalog.find { c -> c.id == aliasId && c.baseOf() == spokenBase } }
                     val resolvedItemId = matchedCatalog?.id ?: itemId ?: "unlisted-$jobId"
                     val resolvedItemName = matchedCatalog?.name ?: itemName
                     val isWaste = effectiveIntent == CaptureIntent.WASTE
@@ -478,14 +483,14 @@ class SttWorker(
                     committedCount++
                 }
                 !isStockIntent && isCommittableSale -> {
-                    val matchedCatalog = catalog.find { it.id == itemId }
-                        ?: catalog.find { it.name.equals(itemName, ignoreCase = true) }
+                    val matchedCatalog = catalog.find { it.id == itemId && it.baseOf() == spokenBase }
+                        ?: catalog.find { it.name.equals(itemName, ignoreCase = true) && it.baseOf() == spokenBase }
                         // This shop's own confirmed vocabulary, e.g. it previously confirmed
                         // that "TMTR" means this catalog row even though the name never
                         // matches by substring. The highest-value training signal in the
                         // system (a review-queue confirmation) was previously thrown away;
                         // this is where it gets read back. See ShopLearningRepository.
-                        ?: shopLearning.resolveItemAlias(itemName)?.let { aliasId -> catalog.find { c -> c.id == aliasId } }
+                        ?: shopLearning.resolveItemAlias(itemName)?.let { aliasId -> catalog.find { c -> c.id == aliasId && c.baseOf() == spokenBase } }
                     val resolvedItemId = matchedCatalog?.id ?: itemId ?: "unlisted-$jobId"
                     val resolvedItemName = matchedCatalog?.name ?: itemName
                     val isCreditSale = effectiveIntent == CaptureIntent.CREDIT_SALE
@@ -602,17 +607,25 @@ class SttWorker(
         var finalStatus: SttJobStatus = SttJobStatus.AUTO_CONFIRMED
         var assistantTier = "none"
 
+        val semanticQuery = com.voicetoinvoice.app.domain.query.LedgerQuery.fromTraceJson(traceJson)
+
         if (cleanTranscript.isBlank()) {
             answer = com.voicetoinvoice.app.domain.voice.ResponseComposer.formatUnrecognized()
             finalStatus = SttJobStatus.FAILED
+        } else if (semanticQuery != null) {
+            val ledgerQueries = com.voicetoinvoice.app.domain.query.LedgerQueries(db)
+            answer = com.voicetoinvoice.app.domain.query.LedgerQueryExecutor(ledgerQueries).execute(semanticQuery)
+            assistantTier = "semantic"
+            finalStatus = SttJobStatus.AUTO_CONFIRMED
         } else {
             val classification = com.voicetoinvoice.app.domain.router.IntentRouter.classify(cleanTranscript, parsedItems)
             when (classification.intent) {
                 com.voicetoinvoice.app.domain.router.AssistantIntent.READ_QUERY -> {
-                    val ledgerQueries = com.voicetoinvoice.app.domain.query.LedgerQueries(db)
-                    answer = com.voicetoinvoice.app.domain.query.QuestionTemplates(ledgerQueries).answerQuestion(cleanTranscript)
-                    assistantTier = "template"
-                    finalStatus = SttJobStatus.AUTO_CONFIRMED
+                    // The template tier is gone (ISSUE-125). A question we could not
+                    // understand gets an honest answer, not a keyword guess.
+                    answer = com.voicetoinvoice.app.domain.voice.ResponseComposer.formatUnrecognized()
+                    assistantTier = "none"
+                    finalStatus = SttJobStatus.PARSED
                 }
                 com.voicetoinvoice.app.domain.router.AssistantIntent.SALE,
                 com.voicetoinvoice.app.domain.router.AssistantIntent.CREDIT_SALE,
@@ -746,6 +759,7 @@ class SttWorker(
         val firstItem = if (parsedItems.length() > 0) parsedItems.optJSONObject(0) else null
         clientTrace.put("outcome", "assistant_answered")
         clientTrace.put("assistant_tier", assistantTier)
+        clientTrace.put("assistant_metric", semanticQuery?.metric?.name ?: "none")
         clientTrace.put("assistant_answer", answer)
 
         db.sttJobDao().updateJob(

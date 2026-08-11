@@ -475,10 +475,28 @@ fun HomeScreen(
                 // place. Only create when genuinely nothing matches.
                 val isStockIntent = job.captureIntent == CaptureIntent.STOCK_IN || job.captureIntent == CaptureIntent.WASTE
                 val isCreditSale = job.captureIntent == CaptureIntent.CREDIT_SALE
-                val byId = resolvedItemId?.let { id -> catalog.find { it.id == id } }
-                val byName = byId ?: catalog.find { it.name.equals(line.itemName, ignoreCase = true) }
+                val spokenBase = com.voicetoinvoice.app.domain.lexicon.ItemLexicon.baseUnitOf(line.unit)
+                fun CatalogItem.baseOf() =
+                    if (baseUnit.isNotBlank()) baseUnit
+                    else com.voicetoinvoice.app.domain.lexicon.ItemLexicon.baseUnitOf(unitId)
+
+                // An explicit pick only counts when it is a price line for the unit that was spoken.
+                val byId   = resolvedItemId?.let { id -> catalog.find { it.id == id && it.baseOf() == spokenBase } }
+                val byName = byId ?: catalog.find {
+                    it.name.equals(line.itemName, ignoreCase = true) && it.baseOf() == spokenBase
+                }
                 val isNewItem = byName == null
-                val item = byName ?: CatalogItem(name = line.itemName, unitId = line.unit, price = rate)
+
+                // A sibling row under a different unit is the template for the new price line: it
+                // already carries the canonicalKey that identity resolution depends on.
+                val sibling = catalog.find { it.name.equals(line.itemName, ignoreCase = true) }
+                val item = byName ?: CatalogItem(
+                    name         = sibling?.name ?: line.itemName,
+                    unitId       = line.unit,
+                    price        = rate,
+                    canonicalKey = sibling?.canonicalKey ?: "",
+                    baseUnit     = spokenBase
+                )
                 val total = line.quantity * rate
 
                 scope.launch(Dispatchers.IO) {

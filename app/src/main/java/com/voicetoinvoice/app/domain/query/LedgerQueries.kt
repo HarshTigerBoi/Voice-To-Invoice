@@ -35,6 +35,13 @@ class LedgerQueries(private val db: AppDatabase) {
         totals.revenue to totals.lineCount
     }
 
+    /** Revenue booked on credit in a window — "आज उधार पर कितना बेचा". Distinct from
+     *  [getTotalReceivables], which is the standing balance across all time. RETURN rows carry
+     *  a negative `total`, so the sum nets returns-against-credit without a special case. */
+    suspend fun getCreditSalesInPeriod(startMs: Long, endMs: Long): Double = withContext(Dispatchers.IO) {
+        db.transactionDao().getTotalByPaymentMode("CREDIT", startMs, endMs)
+    }
+
     /** Gross profit for a window, with its own coverage caveat. See [ProfitCalculator]. */
     suspend fun getProfit(startMs: Long, endMs: Long): ProfitResult = withContext(Dispatchers.IO) {
         ProfitCalculator(db).compute(startMs, endMs)
@@ -92,15 +99,27 @@ class LedgerQueries(private val db: AppDatabase) {
      * table, so two screens could report two different numbers for the same person. That fallback
      * is gone.
      */
-    suspend fun getCustomerBalance(customerNameQuery: String): Double? = withContext(Dispatchers.IO) {
-        val customers = db.customerDao().getActiveCustomersList()
-        if (customers.isEmpty()) return@withContext null
-        val queryKey = PhoneticKey.of(customerNameQuery)
-        val match = customers.minByOrNull { PhoneticKey.normalizedDistance(queryKey, it.phoneticKey) }
-            ?.takeIf { PhoneticKey.normalizedDistance(queryKey, it.phoneticKey) <= 0.34 }
-            ?: return@withContext null
-        CustomerBalance(db).balanceFor(match.id)
-    }
+    suspend fun getCustomerBalance(customerNameQuery: String): Double? =
+        getCustomerBalanceWithName(customerNameQuery)?.second
+
+    /** Resolved customer plus balance, so the answer speaks the customer's real name rather
+     *  than echoing back whatever was heard. Same margin guard as [findCatalogItem]. */
+    suspend fun getCustomerBalanceWithName(customerNameQuery: String): Pair<String, Double>? =
+        withContext(Dispatchers.IO) {
+            val customers = db.customerDao().getActiveCustomersList()
+            if (customers.isEmpty()) return@withContext null
+            val queryKey = PhoneticKey.of(customerNameQuery)
+            if (queryKey.length < MIN_QUERY_PHONES) return@withContext null
+            val ranked = customers
+                .map { it to PhoneticKey.normalizedDistance(queryKey, it.phoneticKey) }
+                .sortedBy { it.second }
+            val best = ranked.firstOrNull() ?: return@withContext null
+            if (best.second > MAX_ENTITY_DISTANCE) return@withContext null
+            val rival = ranked.firstOrNull { !it.first.name.equals(best.first.name, ignoreCase = true) }
+            val margin = if (rival != null) rival.second - best.second else 1.0
+            if (margin < MIN_ENTITY_MARGIN) return@withContext null
+            best.first.name to CustomerBalance(db).balanceFor(best.first.id)
+        }
 
     /** Everything owed to the shop right now. */
     suspend fun getTotalReceivables(): Double = withContext(Dispatchers.IO) {
@@ -133,16 +152,32 @@ class LedgerQueries(private val db: AppDatabase) {
     private suspend fun findCatalogItem(query: String): com.voicetoinvoice.app.data.local.entity.CatalogItem? {
         val catalog = db.catalogDao().getActiveCatalogList()
         if (catalog.isEmpty()) return null
-        // Exact/substring first -- when the shopkeeper says the catalog name outright, honour it.
         catalog.find { it.name.equals(query, ignoreCase = true) }?.let { return it }
-        catalog.find { it.name.contains(query, ignoreCase = true) }?.let { return it }
-
+        if (query.length >= MIN_SUBSTRING_QUERY_LEN) {
+            catalog.find { it.name.contains(query, ignoreCase = true) }?.let { return it }
+        }
         val queryKey = PhoneticKey.of(query)
-        if (queryKey.isBlank()) return null
-        return catalog
+        if (queryKey.length < MIN_QUERY_PHONES) return null
+        val ranked = catalog
             .map { it to PhoneticKey.normalizedDistance(queryKey, PhoneticKey.of(it.name)) }
-            .minByOrNull { it.second }
-            ?.takeIf { it.second <= 0.34 }
-            ?.first
+            .sortedBy { it.second }
+        val best = ranked.firstOrNull() ?: return null
+        if (best.second > MAX_ENTITY_DISTANCE) return null
+        val rival = ranked.firstOrNull { !it.first.name.equals(best.first.name, ignoreCase = true) }
+        val margin = if (rival != null) rival.second - best.second else 1.0
+        if (margin < MIN_ENTITY_MARGIN) return null
+        return best.first
+    }
+
+    companion object {
+        /** Nearest-neighbour ceiling. Unchanged — the ceiling was never the problem. */
+        private const val MAX_ENTITY_DISTANCE = 0.34
+        /** How far clear the winner must be. `पर सामान` matched Baingan at 0.3333 with Lahsun
+         *  0.056 behind it, and `कुल` tied kela and Kheera at 0.25 — both junk, both under the
+         *  ceiling. Measured against 7 genuine item questions the smallest true-positive margin
+         *  is टमाटर→Tamatar at 0.143, so 0.08 clears every real match with room to spare. */
+        private const val MIN_ENTITY_MARGIN = 0.08
+        private const val MIN_QUERY_PHONES = 3
+        private const val MIN_SUBSTRING_QUERY_LEN = 3
     }
 }

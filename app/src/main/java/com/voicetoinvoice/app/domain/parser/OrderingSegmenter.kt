@@ -592,6 +592,22 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
             "haan", "han", "haa", "hai", "ye", "wo", "achha", "theek", "ji", "bas", "aur", "ok", "okay", "hmm", "umm"
         )
 
+        val NEVER_NUMERAL_FRAGMENT: Set<String> = setOf(
+            "आज", "कल", "परसों", "अभी", "अब", "रोज", "कितना", "कितने", "कितनी", "क्या", "कौन", "कब", "कहाँ", "कहां",
+            "उधार", "उधारी", "खाता", "बकाया", "बचा", "बाकी", "सामान", "माल", "कुल", "टोटल", "हिसाब", "स्टॉक",
+            "बेचा", "बेची", "बिका", "बिके", "बिकी", "मुनाफा", "मुनाफ़ा", "कमाई", "खराब",
+            "aaj", "kal", "abhi", "ab", "roz", "kitna", "kitne", "kitni", "kya", "kaun", "kab", "kahan",
+            "udhaar", "udhar", "udhari", "khata", "bakaya", "bacha", "baki", "saman", "samaan", "maal",
+            "kul", "total", "hisaab", "stock", "becha", "bika", "bike", "munafa", "kamai", "kharab"
+        )
+
+        val RUPEE_WORDS: Set<String> = setOf(
+            "rs", "rs.", "₹",
+            "rupay", "rupaye", "rupaya", "rupaiya", "rupaiye",
+            "rupee", "rupees",
+            "रुपये", "रुपया", "रुपए", "रु", "रूपये", "रूपए"
+        )
+
         val HINDI_NUMBER_MAP: Map<String, Double> = mapOf(
             "एक" to 1.0, "ek" to 1.0, "one" to 1.0, "1" to 1.0,
             "दो" to 2.0, "do" to 2.0, "two" to 2.0, "2" to 2.0,
@@ -757,7 +773,21 @@ class OrderingSegmenter(catalogNames: List<String> = emptyList()) {
                     leftLower.matches(Regex("^\\d+(\\.\\d+)?$")) ||
                     UNIT_SET.contains(leftLower) ||
                     DISTANCE_UNIT_TOKENS.contains(leftLower) ||
-                    itemSurfaceSet.contains(leftLower)
+                    RUPEE_WORDS.contains(leftLower) ||          // drift fix: TS had this, Kotlin didn't
+                    itemSurfaceSet.contains(leftLower) ||
+                    NEVER_NUMERAL_FRAGMENT.contains(leftLower) ||
+                    DISCOURSE_PARTICLES.contains(leftLower)
+                ) {
+                    out.add(left)
+                    i++
+                    continue
+                }
+
+                val rightLower = right.lowercase()
+                if (
+                    NEVER_NUMERAL_FRAGMENT.contains(rightLower) ||
+                    DISCOURSE_PARTICLES.contains(rightLower) ||
+                    itemSurfaceSet.contains(rightLower)
                 ) {
                     out.add(left)
                     i++

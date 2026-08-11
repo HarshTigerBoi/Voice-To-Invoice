@@ -104,4 +104,10 @@ test('qualifier namespace & short-key segmenter behavior and identity (§5.1 & �
   assert.strictEqual(canonicalOf('amul milk'), 'Amul Doodh')
 })
 
+test('rejoinFragmentedNumerals does not merge ordinary words into a numeral', () => {
+  const r = segmentTranscript('आज उधार पर कितना सामान बेचा', ['Aaloo', 'Baingan', 'Pyaz', 'Poha', 'Dhaniya'])
+  assert.strictEqual(r.numeralRejoins?.length ?? 0, 0)
+})
+
+
 

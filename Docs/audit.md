@@ -143,6 +143,38 @@
 
 ### 🟢 RESOLVED ISSUES
 
+#### [ISSUE-130] [2026-08-12] "भाव डालें" writes the rate to the wrong unit's price line — item re-asks for its price forever
+- **Symptom**: `Gobhi` spoken in KG asks for a rate on **every** sale, no matter how many times the shopkeeper sets one. Trace `d9c7c975` carries `no_price_for_spoken_unit (item 'Gobhi' has no price line for unit KG)` and `identityResolution.priceRowUnit: null`.
+- **Root Cause**: The write side resolved a catalog item by **name only**; the read side is keyed on **(identity, base unit)**.
+- **Resolution**:
+  1. `HomeScreen.kt:478-499` — Updated pending line confirmation resolution to filter `catalog.find` by base unit matching `ItemLexicon.baseUnitOf(line.unit)`. For new price lines, used sibling row under same name as template to carry `canonicalKey`.
+  2. `PendingConfirmationsSheet.kt:131-135` — Changed `distinctCatalogByName` grouping key from `name` to `(name, baseUnit)` so different unit price lines of the same item are distinct in suggestions.
+  3. `SttWorker.kt:436-443` & `:486-493` — Added `baseOf() == spokenBase` unit filtering to catalog lookups on both stock-in and sale auto-commit paths, preventing cross-unit price mis-resolution.
+- **Verification Date**: NOT YET VERIFIED. Diff reviewed against the plan (2026-08-12) and matches §3.1-§3.3 exactly, including the `shopLearning.resolveItemAlias` fallback being gated on `baseOf() == spokenBase` too — a correct extension of the plan's own invariant, not a deviation. That is a code-correctness check, not a behaviour check: no build has been run and no live voice input has been tested against this change. Per `Docs/catalog_rate_unit_mismatch_plan.md` §6, "resolved" requires, on a fresh device install: (1) an unpriced-unit utterance routes to review, (2) setting the rate creates a new catalog row rather than overwriting a mismatched-unit one, (3) a subsequent same-unit utterance reaches `AUTO_CONFIRMED` with no `no_price_for_spoken_unit` in the trace. None of that has run yet. **Do not treat this as resolved until that trace is quoted.**
+
+#### [ISSUE-127] [2026-08-12] Assistant read-path has no semantic layer — answered wrong question from correct transcript
+- **Symptom**: Job `769cebef-436d-4cff-93b9-4767470786d7` asked "आज उधार पर कितना सामान बेचा", answered "आज Baingan नहीं बिका" (74 kg Baingan, ₹2960).
+- **Root Cause**:
+  1. The model prompt extracted groceries rather than understanding question intent.
+  2. `QuestionTemplates` inferred question topic from phonetic keyword distances, cascading through false matches (`पर सामान` → Baingan @ 0.3333).
+- **Resolution**:
+  1. Deleted `QuestionTemplates.kt` (deleted, not repaired: intent must never be inferred from keyword distances).
+  2. Server-side semantic model call (`callGrokJson` with `ASSISTANT_QUERY_SYSTEM_PROMPT`) produces a `LedgerQuery` (metric + period + verbatim names, no figures).
+  3. Client-side `LedgerQueryExecutor` executes queries directly against Room DAOs, ensuring all spoken numbers originate on-device. Added margin guards on `findCatalogItem` (`MIN_ENTITY_MARGIN = 0.08`) and `getCustomerBalanceWithName`.
+- **Verification Date**: 2026-08-12. Unit tests `LedgerQueryParsingTest` (6 tests) and `EntityBindingTest` (3 tests) pass. Gradle `./gradlew test` passes. Edge function deployed to Supabase project `lyowklxsbfznnqridtgr`.
+
+#### [ISSUE-128] [2026-08-12] Numeral rejoin merges ordinary words into numbers ("आज"+"उधार" -> 74)
+- **Symptom**: `rejoinFragmentedNumerals` merged "आज" + "उधार" into "चौहत्तर" (74) at norm 0.143, fabricating a 74 kg line from a question.
+- **Root Cause**: Left token guard omitted ordinary vocabulary; right token was unchecked.
+- **Resolution**: Added `NEVER_NUMERAL_FRAGMENT` set and right token guards in both `phonetic.ts` (TypeScript) and `OrderingSegmenter.kt` (Kotlin). Added `RUPEE_WORDS` check on Kotlin side to fix drift.
+- **Verification Date**: 2026-08-12. Deno tests (103/103 pass) and Gradle tests pass.
+
+#### [ISSUE-129] [2026-08-12] Assistant captures file fallback review rows on non-booking questions
+- **Symptom**: Unmatched queue accumulated questions like "आज उधार पर कितना सामान बेचा" with fabricated items (job `769cebef`).
+- **Root Cause**: Safety net fallback filed a review row whenever 0 rows were booked, treating an answered question as a booking failure.
+- **Resolution**: Added `assistantAnsweredNothingToBook = isAssistant && !assistantNeedsReview` guard in `process-voice-job/index.ts` to suppress fallback review rows for non-booking assistant questions.
+- **Verification Date**: 2026-08-12. Deployed and bundle verified.
+
 #### [ISSUE-126] [2026-08-11] Concept layer — same commodity, opposite outcomes ("rice" vs "चावल")
 - **Symptom**: Two jobs 13 seconds apart, same commodity, opposite results.
   - Job `ea68312e` "17 kg Rice" → segmenter's best candidate was **Elaichi** (`itemMatchNorm` 0.1667; `LICI` vs `ILAICI` is a two-vowel insertion and vowel edits cost 0.5). Above `SEGMENTER_OVERRIDE_MAX_NORM` (0.08) so the override did not fire, the AI's "Basmati Rice" survived, ₹1530 auto-confirmed. **Correct only by luck** — one threshold away from booking cardamom.

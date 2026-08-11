@@ -621,6 +621,20 @@ export const DISCOURSE_PARTICLES: Set<string> = new Set([
   'haan','han','haa','hai','ye','wo','achha','theek','ji','bas','aur','ok','okay','hmm','umm',
 ])
 
+/** Words that are never half of a fragmented numeral. The rejoin refused only a LEFT token that
+ *  was already a number, unit, rupee word or catalog surface — ordinary vocabulary sailed
+ *  through, and "आज"+"उधार" merged into "चौहत्तर" (74) at norm 0.143, turning a question into a
+ *  74 kg / ₹2960 line. ISSUE-126. Mirrored in OrderingSegmenter.kt — change both. */
+export const NEVER_NUMERAL_FRAGMENT: Set<string> = new Set([
+  'आज','कल','परसों','अभी','अब','रोज','कितना','कितने','कितनी','क्या','कौन','कब','कहाँ','कहां',
+  'उधार','उधारी','खाता','बकाया','बचा','बाकी','सामान','माल','कुल','टोटल','हिसाब','स्टॉक',
+  'बेचा','बेची','बिका','बिके','बिकी','मुनाफा','मुनाफ़ा','कमाई','खराब',
+  'aaj','kal','abhi','ab','roz','kitna','kitne','kitni','kya','kaun','kab','kahan',
+  'udhaar','udhar','udhari','khata','bakaya','bacha','baki','saman','samaan','maal',
+  'kul','total','hisaab','stock','becha','bika','bike','munafa','kamai','kharab',
+])
+
+
 function transitionCost(prev: TokenType | null, curr: TokenType): number {
   if (prev === null) return curr === 'NUM' ? 0.0 : curr === 'ITEM' ? 0.3 : 1.0
   if (prev === 'NUM') return curr === 'UNIT' ? 0.0 : curr === 'ITEM' ? 0.3 : 4.0
@@ -869,7 +883,18 @@ export function rejoinFragmentedNumerals(
       UNIT_SET.includes(leftLower) ||
       DISTANCE_UNIT_TOKENS.includes(leftLower) ||
       RUPEE_WORDS.has(leftLower) ||
-      itemSurfaceSet.has(leftLower)
+      itemSurfaceSet.has(leftLower) ||
+      NEVER_NUMERAL_FRAGMENT.has(leftLower) ||
+      DISCOURSE_PARTICLES.has(leftLower)
+    ) { out.push(left); continue }
+
+    // The RIGHT half was never checked at all. A known word is a word, not the tail of a broken
+    // numeral — this is the half that turned "उधार" into "-हत्तर".
+    const rightLower = right.toLowerCase()
+    if (
+      NEVER_NUMERAL_FRAGMENT.has(rightLower) ||
+      DISCOURSE_PARTICLES.has(rightLower) ||
+      itemSurfaceSet.has(rightLower)
     ) { out.push(left); continue }
 
     const joinedKey = phoneticKey(left + right)

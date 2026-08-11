@@ -47,4 +47,10 @@ object ResponseComposer {
     fun formatActionCompleted(actionName: String): String {
         return "$actionName पूरा हो गया"
     }
+
+    fun formatCreditSales(totalAmount: Double): String {
+        val amountInt = totalAmount.toInt()
+        return if (amountInt > 0) "आज ₹$amountInt का सामान उधार पर बिका"
+        else "आज उधार पर कुछ नहीं बिका"
+    }
 }

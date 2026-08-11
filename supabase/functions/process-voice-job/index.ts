@@ -221,6 +221,11 @@ const MIN_PLAUSIBLE_SALE_VALUE = 5.0
 // it still books to the review queue instead of vanishing. Env-tunable if this proves tight.
 const AI_CHAT_TIMEOUT_MS = Number(Deno.env.get('AI_CHAT_TIMEOUT_MS') || '12000')
 
+/** The assistant is a person mid-task waiting for an answer. A question that fails in 6s and
+ *  says so beats one that hangs for 12s — and with the template tier deleted there is no
+ *  second-best answer to wait for. */
+const ASSISTANT_QUERY_TIMEOUT_MS = Number(Deno.env.get('ASSISTANT_QUERY_TIMEOUT_MS') || '6000')
+
 /** Minimum transcript score for the STT race to consider answering on one provider alone.
  *  5 = one recognised catalog item (3) + an explicit non-default unit (2). */
 const FAST_STT_MIN_SCORE = Number(Deno.env.get('FAST_STT_MIN_SCORE') || '5')
@@ -230,6 +235,46 @@ const DISABLE_STT_RACE = Deno.env.get('DISABLE_STT_RACE') === '1'
  *  drop to ~0.15 once the disagreement rate is established. Costs an AI call, never
  *  latency -- it runs after the response is sent and changes nothing. */
 const INSPECTOR_RATE = Number(Deno.env.get('PARSE_INSPECTOR_RATE') || '1.0')
+
+const ASSISTANT_QUERY_SYSTEM_PROMPT = `You read one sentence spoken by an Indian kirana shopkeeper
+in Hindi, Hinglish or English, and decide what they are asking their own shop ledger.
+
+You NEVER answer the question. You NEVER produce a total, a balance, a quantity, a price or any
+other figure — the app computes every number from its own database. You only say WHAT to look up.
+
+Return "kind": "NOT_A_QUERY" when the shopkeeper is RECORDING something (selling, receiving
+stock, taking payment, writing off, changing a price, cancelling) rather than ASKING about it.
+
+Otherwise return "kind": "QUERY" and choose exactly one metric:
+- SALES_TOTAL       total money sold in a period        ("आज कितना बिका", "total sales today")
+- ITEM_SALES        one named item sold in a period     ("आज कितने आलू बिके")
+- CREDIT_SALES      sold ON CREDIT in a period          ("आज उधार पर कितना बेचा")
+- RECEIVABLES_TOTAL everything customers still owe      ("कुल उधार कितना है")
+- CUSTOMER_BALANCE  what ONE named customer owes        ("रमेश का उधार कितना")
+- STOCK_ON_HAND     how much of a named item is LEFT    ("आलू कितना बचा है")
+- LOW_STOCK         which items are running out
+- STOCK_VALUE       value of all stock on hand
+- PROFIT            profit in a period
+- WASTE_VALUE       value spoiled in a period
+- TOP_ITEM          best seller in a period
+- SLOWEST_ITEM      worst seller in a period
+- UNSUPPORTED       a real question this ledger cannot answer — say so, with a short reason.
+                    NEVER pick a nearby metric to avoid using this.
+
+CREDIT_SALES vs RECEIVABLES_TOTAL is the distinction shopkeepers make constantly and the one you
+must get right: "how much did I SELL on credit today" is CREDIT_SALES (a period's sales),
+"how much credit is OUTSTANDING" is RECEIVABLES_TOTAL (a standing balance). "उधार पर बेचा" is
+always CREDIT_SALES.
+
+"item" and "customer" must be copied EXACTLY as spoken. Do not translate them, do not correct
+them, do not guess a catalog name — the app matches them against the real catalog itself.
+
+Set confidence below 0.6 when you are genuinely unsure. A low confidence makes the app ask the
+shopkeeper to repeat, which is always better than confidently looking up the wrong thing.
+
+Output ONLY valid JSON in exactly this shape:
+{"kind":"QUERY","metric":"...","period":{"kind":"TODAY","n":null},"item":null,"customer":null,
+ "confidence":0.0,"unsupported_reason":null,"booking_intent":null}`
 
 
 
@@ -352,23 +397,21 @@ function itemsMatchCanonical(freshItems: any[], memoItems: MemoItemShape[]): boo
   return canonicalSignature(toMemoShape(freshItems)) === canonicalSignature(memoItems)
 }
 
-/** Walks the Grok chat model chain exactly as the inline call used to -- extracted so
- *  the canary re-verification path (below) can issue the identical call without
- *  duplicating the request-building/parsing/fallback logic. */
-async function callGrokChatInterpretation(
+async function callGrokJson(
   xaiApiKey: string,
   systemPrompt: string,
   userPrompt: string,
   getKnownGood: () => string | null,
   setKnownGood: (m: string) => void,
-): Promise<{ items: any[]; error: string | null; model: string | null }> {
-  let items: any[] = []
+  timeoutMs: number = AI_CHAT_TIMEOUT_MS,
+): Promise<{ json: any | null; error: string | null; model: string | null }> {
+  let json: any = null
   let error: string | null = null
   let model: string | null = null
 
   for (const m of modelChain(XAI_CHAT_MODELS, getKnownGood())) {
     const chatController = new AbortController()
-    const chatTimeoutId = setTimeout(() => chatController.abort(), AI_CHAT_TIMEOUT_MS)
+    const chatTimeoutId = setTimeout(() => chatController.abort(), timeoutMs)
     try {
       const grokResp = await fetch('https://api.x.ai/v1/chat/completions', {
         method: 'POST',
@@ -399,10 +442,7 @@ async function callGrokChatInterpretation(
         const cleanContent = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
         const match = cleanContent.match(/\{[\s\S]*\}/)
         if (match) {
-          const parsedJson = JSON.parse(match[0])
-          if (Array.isArray(parsedJson.parsed_items)) {
-            items = parsedJson.parsed_items
-          }
+          json = JSON.parse(match[0])
         }
         setKnownGood(m)
         model = m
@@ -419,12 +459,26 @@ async function callGrokChatInterpretation(
       console.warn(`Grok chat model "${m}" unavailable, trying next: ${error}`)
     } catch (aiErr: any) {
       clearTimeout(chatTimeoutId)
-      error = aiErr?.name === 'AbortError' ? `AI Timeout (${AI_CHAT_TIMEOUT_MS}ms limit)` : (aiErr?.message || String(aiErr))
+      error = aiErr?.name === 'AbortError' ? `AI Timeout (${timeoutMs}ms limit)` : (aiErr?.message || String(aiErr))
       console.error('Grok AI multi-item interpretation error:', error)
       break
     }
   }
-  return { items, error, model }
+  return { json, error, model }
+}
+
+/** Walks the Grok chat model chain exactly as the inline call used to -- extracted so
+ *  the canary re-verification path (below) can issue the identical call without
+ *  duplicating the request-building/parsing/fallback logic. */
+async function callGrokChatInterpretation(
+  xaiApiKey: string,
+  systemPrompt: string,
+  userPrompt: string,
+  getKnownGood: () => string | null,
+  setKnownGood: (m: string) => void,
+): Promise<{ items: any[]; error: string | null; model: string | null }> {
+  const r = await callGrokJson(xaiApiKey, systemPrompt, userPrompt, getKnownGood, setKnownGood)
+  return { items: Array.isArray(r.json?.parsed_items) ? r.json.parsed_items : [], error: r.error, model: r.model }
 }
 
 // -----------------------------------------------------------------------------
@@ -1459,6 +1513,22 @@ async function processVoiceJob(args: {
 
     console.log(`Segmented transcript: "${transcript}" (Grok: "${rawGrokTranscript}", Sarvam: "${rawSarvamTranscript}", score ${bestScore})`)
 
+    let semanticQuery: any = null
+    let semanticQueryError: string | null = null
+    let semanticQueryModel: string | null = null
+    if (isAssistant && xaiApiKey && chosenRaw.trim()) {
+      const sq = await callGrokJson(
+        xaiApiKey, ASSISTANT_QUERY_SYSTEM_PROMPT,
+        `Shopkeeper said: "${chosenRaw}"`,
+        () => knownGoodChatModel, (m) => { knownGoodChatModel = m },
+        ASSISTANT_QUERY_TIMEOUT_MS,
+      )
+      semanticQuery = sq.json
+      semanticQueryError = sq.error
+      semanticQueryModel = sq.model
+    }
+    const isAnsweredQuestion = semanticQuery?.kind === 'QUERY'
+
     // Step 4: Multi-item interpretation via Grok AI using Phonetic-Aware Shopkeeper System Prompt
     const catalogContextStr = fullCatalogList.join(', ')
 
@@ -1467,7 +1537,7 @@ async function processVoiceJob(args: {
     let aiModelUsed: string | null = null
     let parseSource: 'grok_ai' | 'memory' | 'segmenter_fallback' | 'segmenter_fast_path' | 'forced_ai_fallback' = 'grok_ai'
 
-    const hasAiInput = !!((rawGrokTranscript || rawSarvamTranscript || transcript) && xaiApiKey)
+    const hasAiInput = !!((rawGrokTranscript || rawSarvamTranscript || transcript) && xaiApiKey) && !isAnsweredQuestion
 
     /**
      * Decides whether this utterance can be booked from the deterministic segmenter alone,
@@ -2420,6 +2490,18 @@ Parse this order.`
         bookedServerSide: shouldBookSale || shouldBookRateUpdate,
         routedToReview: assistantNeedsReview,
       } : null,
+      step_2c_semantic_query: {
+        attempted: isAssistant && !!xaiApiKey,
+        query: semanticQuery,
+        error: semanticQueryError,
+        model: semanticQueryModel,
+        skippedItemInterpretation: isAnsweredQuestion,
+        deterministicIntent: assistantClassification?.intent ?? null,
+        deterministicConfidence: assistantClassification?.confidence ?? null,
+        agreesWithDeterministic: semanticQuery?.kind === 'QUERY'
+          ? assistantClassification?.intent === 'READ_QUERY'
+          : semanticQuery?.booking_intent === assistantClassification?.intent,
+      },
       step_2_stt_proxy_response: {
         rawTranscript: chosenRaw,
         normalizedTranscript: normalizeTranscript(chosenRaw, fullCatalogList),
@@ -2725,7 +2807,12 @@ Parse this order.`
     // Step 5.3: Widen safety net guard -- if no transactions and no unmatched_queue rows were written,
     // write a fallback unmatched_queue row so every job leaves a reviewable record.
     const committedCount = committedSaleEntries.length
-    if (committedCount === 0 && unmatchedRowsWritten === 0) {
+    // An ASSISTANT capture that books nothing is the correct outcome for a question, not a
+    // failure to book. Filing a fallback row put the shopkeeper's own questions in the review
+    // queue with a fabricated line ("आज उधार पर कितना सामान बेचा" -> Baingan 74 KG ₹2960,
+    // job 769cebef). ISSUE-127.
+    const assistantAnsweredNothingToBook = isAssistant && !assistantNeedsReview
+    if (committedCount === 0 && unmatchedRowsWritten === 0 && !assistantAnsweredNothingToBook) {
       const firstFallbackItem = finalParsedItems[0] || null
       const { error: uqErr } = await supabase.from('unmatched_queue').upsert([{
         job_id: jobId,
