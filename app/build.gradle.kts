@@ -11,6 +11,20 @@ plugins {
 android {
     namespace = "com.voicetoinvoice.app"
     compileSdk = 36
+    signingConfigs {
+        // A fixed, repo-committed debug key -- not the machine-local ~/.android/debug.keystore
+        // AGP falls back to otherwise, which is randomly generated per machine and per CI
+        // runner. Every previous APK (laptop-built and CI-built alike) was signed with a
+        // different one of those ephemeral keys, so each install "conflicted with an existing
+        // package" instead of updating it (ISSUE-125). All debug/perf builds now share this
+        // identity, so upgrades install cleanly everywhere.
+        getByName("debug") {
+            storeFile = file("shared-debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
     defaultConfig {
         applicationId = "com.voicetoinvoice.app"
         minSdk = 26

@@ -143,6 +143,17 @@
 
 ### 🟢 RESOLVED ISSUES
 
+#### [ISSUE-125] [2026-08-11] Debug APK installs conflict with existing install ("package conflicts with an existing package")
+- **Symptom**: A CI-built APK (`apk-5`, `chore/ship-pipeline` build 5) refused to install over the shopkeeper-test phone's existing `VoiceToInvoice_v139.apk`, reported by the user as an install conflict. Uploaded `v139` for comparison.
+- **Root Cause**: `app/build.gradle.kts` had no explicit `signingConfigs.debug` block, so both the `debug` and `perf` (debug-signed) build types fell back to AGP's implicit default: the machine-local `~/.android/debug.keystore`, auto-generated with a **random** keypair the first time it's needed on that machine. `git log --all --diff-filter=A` confirmed no keystore file was ever committed to the repo, contradicting `CLAUDE.md`'s existing (aspirational, not actually implemented) claim that debug builds "are signed with the debug keystore already committed to the build config." Consequence: `v139` (built on the dev laptop via `tools/vti-ship.ps1`) was signed with the laptop's local keystore; `.github/workflows/build-apk.yml`'s `ubuntu-latest` runner is a fresh VM per run with no keystore caching, so it very likely generated a **different** random debug key on every single CI run too — meaning `apk-3`, `apk-4`, and `apk-5` were probably also mutually incompatible with each other, not just with the laptop build. Android refuses to install an update whose signing certificate doesn't match the currently-installed app of the same `applicationId`.
+- **Resolution**:
+  1. Generated a fixed debug keystore (`keytool -genkeypair`, alias `androiddebugkey`, `CN=Android Debug,O=Android,C=US`, 10000-day validity) and committed it at `app/shared-debug.keystore`.
+  2. Added an explicit `signingConfigs { getByName("debug") { storeFile = file("shared-debug.keystore"); ... } }` block to `app/build.gradle.kts`, so every build — CI and any future local build — signs with this one repo-committed identity instead of whatever key happens to already exist at `~/.android/debug.keystore` on that particular machine.
+- **Not fixed by this change, and cannot be from a cloud session**: the app already installed on the shopkeeper-test phone (`v139`, and CI `apk-3`/`apk-4`/`apk-5`) is signed with a keystore this fix does not have access to. Those installs must be **manually uninstalled once** before the next release (`apk-6`+, first build to carry this fix) will install. After that one-time uninstall, every future CI build shares the same signing identity and will install as a normal update.
+- **Verification Date**: 2026-08-11.
+  - **Verified**: no keystore file present anywhere in `git log --all` history (hard evidence for the root cause).
+  - **NOT verified**: whether `apk-3`/`apk-4`/`apk-5` are in fact mutually distinct signing certs (plausible from the ephemeral-runner argument, not extracted byte-for-byte — `apksigner` was not available in the diagnosing session to confirm). NOT verified: that the phone install succeeds after this fix ships and the old app is removed — pending the next `/ship` build and a real install attempt.
+
 #### [ISSUE-121] [2026-08-10] WS-K: Expenses & Net Profit
 - **Symptom**: Every profit calculation displayed in the app was gross profit only, silently ignoring expenses such as rent, electricity, salary, transport, supplies, and tea.
 - **Root Cause**: No entity, DAO, or UI existed for tracking expenses, and `ProfitCalculator` had no concept of expenses or net profit.
