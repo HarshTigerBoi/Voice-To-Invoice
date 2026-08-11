@@ -147,17 +147,126 @@ resolving to a specific brand. Same class of defect as ISSUE-109.
   with the candidates named in the reason string; picking one is still the existing
   manual flow.
 
-## Verification
+## Status as of this handoff
 
-Per CLAUDE.md: verify by effect, not by build. After deploy, re-record both utterances
-and query `stt_job_logs` for rows created after the deploy:
+Stage 1 and Stage 1b are **implemented, unit-tested, committed, and pushed** to
+`chore/ship-pipeline`. Nothing left in this section is design work — it is deploy +
+verify only. Relevant commits, in order:
+
+- `039a773` — unrelated (icon/nav test, ignore)
+- `16d77f0` — unrelated (ISSUE-125 signing fix, ignore)
+- `0149679` — Stage 1: `concepts.ts`, migration `20260811000000_add_catalog_concept.sql`
+  (already applied live), catalog backfill (already applied live), `resolveItemName`
+  concept arbitration in `item_resolution.ts`
+- `0c0f7c2` — Stage 1b: ambiguity gate wired into `index.ts`
+
+`app/**` is untouched by any of this. **Do not rebuild or reinstall the APK for this
+plan** — it is a server-only change (Supabase edge function). The next voice recording
+on the phone hits the updated function automatically once deployed; no `/ship` run
+needed.
+
+## Remaining work — execute this exactly
+
+### Step 1 — sync the branch
+
+```powershell
+git fetch origin chore/ship-pipeline
+git checkout chore/ship-pipeline
+git pull origin chore/ship-pipeline
+git log --oneline -1
+```
+
+Confirm HEAD is `0c0f7c2` or later. If it is not, stop — the deploy in step 2 would
+ship stale code.
+
+### Step 2 — deploy
+
+```powershell
+npx supabase functions deploy process-voice-job --project-ref lyowklxsbfznnqridtgr
+```
+
+If this fails with an auth error, run `npx supabase login` first (opens a browser) —
+this requires a human at the keyboard, do not attempt to work around it.
+
+### Step 3 — confirm the deploy is not stale or partial
+
+CLAUDE.md is explicit that this project has a history of incomplete deploys going live
+silently. Do not skip this step.
+
+```powershell
+npx supabase functions download process-voice-job --project-ref lyowklxsbfznnqridtgr --project-id lyowklxsbfznnqridtgr
+```
+
+(or use the Supabase MCP `get_edge_function` tool if available in your session)
+
+Grep the fetched bundle for every one of these markers — all four must be present:
+
+```
+ISSUE-126
+resolveConceptToSkus
+ambiguousConceptReason
+conceptOfSpoken(rawName) ?? conceptOfSku(rawName)
+```
+
+If any marker is missing, the deploy did not actually ship the current code. Re-run
+step 2 and re-check before proceeding — do not proceed to step 4 on a bundle you have
+not confirmed.
+
+### Step 4 — verify by effect, not by build
+
+Per CLAUDE.md's diagnosis discipline, "BUILD SUCCESSFUL" / "deploy succeeded" proves
+nothing. Record these two utterances into the app on the test phone (existing install,
+no reinstall needed):
+
+1. **"सत्रह किलो चावल"** (17 kg rice)
+2. **"पांच किलो दूध"** (5 kg milk)
+
+Then query, using the Supabase MCP `execute_sql` tool against project
+`lyowklxsbfznnqridtgr`:
 
 ```sql
 SELECT job_id, status, raw_transcript, parsed_item_name, parsed_qty, parsed_total,
-       length(diagnostic_trace_json) AS trace_len, created_at
-FROM stt_job_logs ORDER BY created_at DESC LIMIT 5;
+       diagnostic_trace_json, created_at
+FROM stt_job_logs
+WHERE created_at > now() - interval '30 minutes'
+ORDER BY created_at DESC LIMIT 10;
 ```
 
-Expected: "सत्रह किलो चावल" → `parsed_item_name` = `Basmati Rice`, priced ₹90/KG,
-auto-confirmed. "पांच किलो दूध" → ambiguous, routed to review naming all three milk
-SKUs, NOT silently booked as Amul Gold.
+**Expected for "सत्रह किलो चावल"**: `parsed_item_name` = `Basmati Rice`,
+`parsed_total` = 1530 (17 × ₹90), status `AUTO_CONFIRMED`. In
+`diagnostic_trace_json.step_6_final_outcome[0]`: `matchedCatalogId` non-null,
+`itemName` = `"Basmati Rice"`.
+
+**Expected for "पांच किलो दूध"**: status is **NOT** `AUTO_CONFIRMED` (`PARSED` or
+similar). `diagnostic_trace_json` contains an `implausibility_reason` matching
+`'milk' matches 3 items in your catalog — pick one: Amul Gold Milk ₹34, Amul Taaza
+Milk ₹27, Saras Milk ₹30` (exact SKU list/prices from `ambiguousConceptReason` in
+`concepts.ts`). `parsed_total` must be `0` — it must NOT show ₹34 or any other milk
+price, which would mean it silently picked one.
+
+If either expectation is not met, this is not verified — say so plainly per CLAUDE.md's
+verification-honesty rule, quote the actual trace, and do not mark it resolved.
+
+### Step 5 — update Docs/audit.md
+
+In the `[ISSUE-126]` entry (search for that string — there are two related entries,
+Stage 1 and Stage 1b, both need updating):
+
+1. Change the **Status** line from `EDGE FUNCTION NOT DEPLOYED, NEVER EXERCISED ON A
+   LIVE RECORDING` to `DEPLOYED <today's date>, VERIFIED <today's date>`.
+2. Add a bullet under **Verification Date** quoting the two actual `job_id`s from step
+   4 and the exact `implausibility_reason` string returned for the milk job — not a
+   paraphrase, the literal string from the query result.
+3. If step 4's expectations were NOT met, do not edit the Status line — instead add a
+   new dated entry describing exactly what the trace showed instead, per CLAUDE.md's
+   "state plainly what you verified vs. what's still unverified."
+
+Commit this doc update on `chore/ship-pipeline` with a message referencing ISSUE-126,
+per CLAUDE.md's rule that a commit and its audit entry must never diverge.
+
+## Deviations
+
+If anything here doesn't match what you find in the code or the live project (a
+constant, a file path, a query result shape), stop and say so — quoting this doc's line
+and what you actually see — rather than silently adjusting and proceeding. Per
+CLAUDE.md: "Ambiguity → stop and ask... Silent deviation is worse than pausing."
