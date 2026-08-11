@@ -26,7 +26,7 @@ import {
 } from './price_intent.ts'
 import { canonicalOf, getQualifiers } from './lexicon.ts'
 import { resolveItemName, unpricedLineReason, assessAiNameEvidence } from './item_resolution.ts'
-import { conceptOfSpoken, conceptOfSku } from './concepts.ts'
+import { conceptOfSpoken, conceptOfSku, resolveConceptToSkus, ambiguousConceptReason } from './concepts.ts'
 import { classifyIntent, captureIntentFor } from './intent_router.ts'
 
 // Deno Deploy / Supabase Edge Runtime global declaration
@@ -2137,6 +2137,25 @@ Parse this order.`
       if (noPriceForUnit) {
         const noPriceReason = `no_price_for_spoken_unit (item '${canonicalOf(rawName)}' has no price line for unit ${unit})`
         implausibility = implausibility ? `${implausibility} | ${noPriceReason}` : noPriceReason
+      }
+
+      // ISSUE-126 Stage 1b: an item whose CONCEPT resolves to more than one stocked SKU in
+      // this shop must never auto-confirm on either engine's silent pick -- neither the
+      // segmenter's alias-forced guess (दूध -> Amul Gold Milk today, via the seeded
+      // term_aliases row) nor the AI's ungrounded one (Saras Milk, zero evidence in job
+      // b6ebbef5) is grounds to charge a specific brand's price. Route to review naming
+      // every real candidate instead. Deliberately independent of `matched`/isCatalogMatched
+      // -- this must catch the case where the alias mechanism ALREADY produced a confident
+      // exact-distance "match" for the wrong reason. See Docs/concept_layer_plan.md.
+      const finalNameConcept = conceptOfSpoken(rawName) ?? conceptOfSku(rawName)
+      const conceptResolution = resolveConceptToSkus(
+        finalNameConcept,
+        chosenRaw,
+        dbCatalogItems.map(ci => ({ id: ci.id, name: ci.name, price: ci.price, unit_id: ci.unit_id, concept: ci.concept ?? null }))
+      )
+      if (conceptResolution.kind === 'AMBIGUOUS') {
+        const ambigReason = ambiguousConceptReason(conceptResolution.concept!, conceptResolution.candidates)
+        implausibility = implausibility ? `${implausibility} | ${ambigReason}` : ambigReason
       }
 
       // The reason the shopkeeper actually reads on the review card. See ISSUE-030.

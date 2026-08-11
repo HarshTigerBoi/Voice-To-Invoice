@@ -179,3 +179,33 @@ test('unknown words yield null rather than a wrong concept', () => {
   assert.strictEqual(conceptOfSpoken('zzzqqq'), null)
   assert.strictEqual(conceptOfSpoken(''), null)
 })
+
+// ── Stage 1b: what index.ts actually does with an ambiguous concept ──────────────
+// index.ts computes finalNameConcept + resolveConceptToSkus itself (not exported as one
+// function), so these tests exercise the exact same two calls with the exact shapes
+// index.ts builds, proving the wiring produces AMBIGUOUS for both real job transcripts.
+
+test('Stage 1b: दूध (job b6ebbef5) is ambiguous regardless of which brand either engine guessed', () => {
+  // Segmenter's alias-forced pick was 'Amul Gold Milk'; AI's ungrounded guess was 'Saras Milk'.
+  // Both must independently classify as ambiguous once resolveItemName hands either name over.
+  for (const rawName of ['Amul Gold Milk', 'Saras Milk', 'दूध']) {
+    const concept = conceptOfSpoken(rawName) ?? conceptOfSku(rawName)
+    const r = resolveConceptToSkus(concept, 'पांच किलो दूध', catalogWithConcepts)
+    assert.strictEqual(r.kind, 'AMBIGUOUS', `rawName="${rawName}" should be AMBIGUOUS, concept=${concept}`)
+  }
+})
+
+test('Stage 1b: सत्रह किलो चावल (job 735469d9) is UNIQUE, not blocked', () => {
+  for (const rawName of ['Basmati Rice', 'चावल']) {
+    const concept = conceptOfSpoken(rawName) ?? conceptOfSku(rawName)
+    const r = resolveConceptToSkus(concept, 'सत्रह किलो चावल', catalogWithConcepts)
+    assert.strictEqual(r.kind, 'UNIQUE')
+    assert.strictEqual(r.sku?.name, 'Basmati Rice')
+  }
+})
+
+test('Stage 1b: an unambiguous single-SKU concept (sugar) is never blocked', () => {
+  const concept = conceptOfSpoken('चीनी') ?? conceptOfSku('चीनी')
+  const r = resolveConceptToSkus(concept, 'दो किलो चीनी', catalogWithConcepts)
+  assert.strictEqual(r.kind, 'UNIQUE')
+})
