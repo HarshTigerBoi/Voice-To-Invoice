@@ -10,7 +10,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import com.voicetoinvoice.app.data.local.AppDatabase
 import com.voicetoinvoice.app.data.local.entity.CatalogItem
@@ -423,7 +425,13 @@ fun MainAppScreen(database: AppDatabase) {
     Scaffold(
         bottomBar = {
             if (currentScreen != Screen.ONBOARDING) {
-                NavigationBar {
+                NavigationBar(
+                    modifier = Modifier.clip(
+                        RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)
+                    ),
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    tonalElevation = 8.dp
+                ) {
                     NavigationBarItem(
                         icon = { Icon(Icons.Default.ShoppingCart, contentDescription = "बेचो") },
                         label = { Text("बेचो ₹") },
