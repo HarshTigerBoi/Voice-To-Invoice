@@ -4,6 +4,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -28,13 +32,17 @@ fun ManualStepperComponent(
 
             LazyVerticalGrid(
                 columns = GridCells.Adaptive(minSize = 108.dp),
-                modifier = Modifier.heightIn(max = 320.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                modifier = Modifier.heightIn(max = 2000.dp),
+                userScrollEnabled = false,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 items(topItems) { item ->
                     var qty by remember { mutableStateOf(1.0) }
-                    Card(elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)) {
+                    Card(
+                        shape = RoundedCornerShape(16.dp),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                    ) {
                         Column(
                             modifier = Modifier.padding(8.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
@@ -58,9 +66,19 @@ fun ManualStepperComponent(
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(onClick = { if (qty > 0.5) qty -= 0.5 }) { Text("-") }
-                                Text("${qty}", style = MaterialTheme.typography.bodyMedium)
-                                IconButton(onClick = { qty += 0.5 }) { Text("+") }
+                                FilledTonalIconButton(
+                                    onClick = { if (qty > 0.5) qty -= 0.5 },
+                                    modifier = Modifier.size(36.dp)
+                                ) { Icon(Icons.Default.Remove, contentDescription = "घटाएं", modifier = Modifier.size(18.dp)) }
+                                Text(
+                                    "$qty",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    modifier = Modifier.padding(horizontal = 10.dp)
+                                )
+                                FilledTonalIconButton(
+                                    onClick = { qty += 0.5 },
+                                    modifier = Modifier.size(36.dp)
+                                ) { Icon(Icons.Default.Add, contentDescription = "बढ़ाएं", modifier = Modifier.size(18.dp)) }
                             }
                             Button(
                                 onClick = { onAddSale(item, qty) },

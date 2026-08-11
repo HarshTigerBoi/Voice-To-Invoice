@@ -12,7 +12,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Edit
@@ -20,6 +23,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Receipt
 import androidx.compose.material3.*
@@ -248,20 +252,39 @@ fun HomeScreen(
             TopAppBar(
                 title = { Text("Shop Ledger") },
                 actions = {
-                    IconButton(onClick = { showPendingSheet = true }) {
-                        Icon(Icons.Default.List, contentDescription = "समीक्षा (Pending Review)")
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        modifier = Modifier.padding(end = 8.dp)
+                    ) {
+                        Text(
+                            text = "आज: ₹${todayTotalSales.toInt()}",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                        )
                     }
-                    IconButton(onClick = onNavigateToSummary) {
-                        Icon(Icons.Default.Receipt, contentDescription = "Summary")
+                    var menuExpanded by remember { mutableStateOf(false) }
+                    IconButton(onClick = { menuExpanded = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "और विकल्प")
                     }
-                    IconButton(onClick = onNavigateToLogs) {
-                        Icon(Icons.Default.Info, contentDescription = "Voice Processing Logs")
+                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                        DropdownMenuItem(
+                            text = { Text("समीक्षा (Pending Review)") },
+                            leadingIcon = { Icon(Icons.Default.List, contentDescription = null) },
+                            onClick = { menuExpanded = false; showPendingSheet = true }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Summary") },
+                            leadingIcon = { Icon(Icons.Default.Receipt, contentDescription = null) },
+                            onClick = { menuExpanded = false; onNavigateToSummary() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Voice Processing Logs") },
+                            leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
+                            onClick = { menuExpanded = false; onNavigateToLogs() }
+                        )
                     }
-                    Text(
-                        text = "Today: ₹${todayTotalSales.toInt()}",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.padding(end = 16.dp)
-                    )
                 }
             )
         }
@@ -272,14 +295,64 @@ fun HomeScreen(
                 .padding(padding)
         ) {
             Column(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // Fix 4+5 (gap_analysis_and_fix_plan.md): this row used to overlap the
-                // PendingConfirmationsBar banner and was the only way to reach Summary from
-                // the tab bar. Udhaar/Suppliers/Prices/Summary/Logs now live as quick-link
-                // icons in the हिसाब tab's top bar instead -- see CustomerListScreen.
-                Spacer(modifier = Modifier.weight(0.5f))
+                // Floating Pending Sales Pill Badge
+                PendingConfirmationsBar(
+                    pendingCount = pendingLineCount,
+                    onClick = { showPendingSheet = true },
+                    modifier = Modifier.padding(top = 16.dp)
+                )
+
+                // Business health and activity status chips
+                Row(
+                    modifier = Modifier
+                        .padding(vertical = 8.dp)
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    // Business health at a glance -- full breakdown and every alert live on Reports;
+                    // this is deliberately just a number and the single most urgent alert, so Home
+                    // stays about the mic, not about analytics.
+                    healthScoreValue?.let { score ->
+                        AssistChip(
+                            onClick = onNavigateToReports,
+                            label = {
+                                Text(
+                                    if (topAlertCount > 0) "स्कोर $score · $topAlertCount अलर्ट" else "स्कोर $score"
+                                )
+                            }
+                        )
+                    } ?: Spacer(Modifier.width(1.dp))
+
+                    // Command Feed entry point -- lives near the mic per the brief's "clear status
+                    // for every command". Only visible once there is something to show, so it
+                    // doesn't clutter a brand-new shop's home screen.
+                    if (commandFeedJobs.isNotEmpty()) {
+                        AssistChip(
+                            onClick = { showCommandFeed = true },
+                            label = {
+                                Text(
+                                    if (inFlightCount > 0) "प्रोसेस हो रहा ($inFlightCount)" else "हाल की गतिविधि"
+                                )
+                            },
+                            leadingIcon = {
+                                if (inFlightCount > 0) {
+                                    CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                } else {
+                                    Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
 
                 // Main Push-to-Talk (PTT) Mic Buttons: Cash (Green) & Udhaar (Amber)
                 Row(
@@ -324,21 +397,21 @@ fun HomeScreen(
                     )
                 }
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(16.dp))
 
-                    // Direct Fallback Button: Type Text
-                    TextButton(
-                        onClick = {
-                            manualInputText = ""
-                            showManualTextDialog = true
-                        }
-                    ) {
-                        Icon(Icons.Default.Keyboard, contentDescription = null, modifier = Modifier.size(20.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("Type sale manually (Fallback)", style = MaterialTheme.typography.bodyMedium)
+                // Direct Fallback Button: Type Text
+                TextButton(
+                    onClick = {
+                        manualInputText = ""
+                        showManualTextDialog = true
                     }
+                ) {
+                    Icon(Icons.Default.Keyboard, contentDescription = null, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Type sale manually (Fallback)", style = MaterialTheme.typography.bodyMedium)
+                }
 
-                Spacer(modifier = Modifier.weight(0.5f))
+                Spacer(modifier = Modifier.height(24.dp))
 
                 // Quick Manual Stepper Grid
                 ManualStepperComponent(
@@ -354,65 +427,7 @@ fun HomeScreen(
                 // Without it the FAB sits directly on top of the right-hand stepper card's
                 // "Add ₹" button, so that item cannot be added by tap at all -- the FAB
                 // swallows the press.
-                Spacer(modifier = Modifier.height(96.dp))
-            }
-
-            // Floating Pending Sales Pill Badge
-            PendingConfirmationsBar(
-                pendingCount = pendingLineCount,
-                onClick = { showPendingSheet = true },
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 16.dp)
-            )
-
-            // Both status badges anchor to the TOP, not the bottom: the mic area's enclosing Box
-            // fills the whole screen, and the Quick Manual Stepper section below the mics grows
-            // with the catalog -- a bottom-anchored badge collided with its cards on a real
-            // device (a 150dp stepper grid reaching within 96dp of the screen bottom). The top,
-            // just below PendingConfirmationsBar, has no such variable-height content beneath it.
-            Row(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = if (pendingLineCount > 0) 72.dp else 16.dp)
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                // Business health at a glance -- full breakdown and every alert live on Reports;
-                // this is deliberately just a number and the single most urgent alert, so Home
-                // stays about the mic, not about analytics.
-                healthScoreValue?.let { score ->
-                    AssistChip(
-                        onClick = onNavigateToReports,
-                        label = {
-                            Text(
-                                if (topAlertCount > 0) "स्कोर $score · $topAlertCount अलर्ट" else "स्कोर $score"
-                            )
-                        }
-                    )
-                } ?: Spacer(Modifier.width(1.dp))
-
-                // Command Feed entry point -- lives near the mic per the brief's "clear status
-                // for every command". Only visible once there is something to show, so it
-                // doesn't clutter a brand-new shop's home screen.
-                if (commandFeedJobs.isNotEmpty()) {
-                    AssistChip(
-                        onClick = { showCommandFeed = true },
-                        label = {
-                            Text(
-                                if (inFlightCount > 0) "प्रोसेस हो रहा ($inFlightCount)" else "हाल की गतिविधि"
-                            )
-                        },
-                        leadingIcon = {
-                            if (inFlightCount > 0) {
-                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                            } else {
-                                Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
-                            }
-                        }
-                    )
-                }
+                Spacer(modifier = Modifier.height(88.dp))
             }
 
             // Udhaar customer picker (Fix 2 / ISSUE-039) -- anchored to the bottom so it
