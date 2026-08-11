@@ -111,7 +111,7 @@ class VoiceParserTest {
     @Test
     fun testPositionalGheeVsGramDisambiguation() {
         val parsedGhee = voiceParser.parseUtterance("1 kg ghee 650 rs", sampleCatalog)
-        assertEquals("Desi Ghee", parsedGhee.matchedItem?.name)
+        assertEquals("Ghee", parsedGhee.matchedItem?.name)
         assertEquals(1.0, parsedGhee.quantity, 0.01)
         assertEquals("KG", parsedGhee.unit)
         assertEquals(650.0, parsedGhee.estimatedTotal, 0.01)

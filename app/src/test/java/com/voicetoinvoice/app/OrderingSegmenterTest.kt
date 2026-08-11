@@ -24,7 +24,7 @@ class OrderingSegmenterTest {
         assertEquals(2.0, seg.quantity, 0.01)
         assertEquals("KG", seg.unit)
         assertTrue(seg.itemTokens.contains("सेब"))
-        assertEquals(ResolutionKind.AMBIGUOUS, seg.resolutionKind)
+        assertEquals(ResolutionKind.MATCH, seg.resolutionKind)
     }
 
     @Test

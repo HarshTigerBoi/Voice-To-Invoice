@@ -30,3 +30,9 @@ Web app/_extracted/
 hs_err_pid*.log
 replay_pid*.log
 
+# Temporary scratch files and markers
+scratch/
+CLAUDE_FS_MARKER.txt
+
+
+
